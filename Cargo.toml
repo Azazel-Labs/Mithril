@@ -8,8 +8,32 @@ description = "Pure-Rust 3D asset interchange: glTF/GLB reading and writing, mes
 keywords = ["gltf", "glb", "meshopt", "3d", "mesh"]
 categories = ["graphics", "game-development", "parser-implementations", "encoding"]
 
+[features]
+default = ["stl", "ply", "vox", "obj", "3ds"]
+# Every format reader.
+all-formats = ["stl", "ply", "vox", "obj", "3ds", "fbx", "3mf", "usd"]
+stl = []
+ply = []
+vox = []
+obj = []
+3ds = []
+fbx = ["dep:fbxcel", "dep:base64"]
+3mf = ["dep:zip", "dep:quick-xml"]
+usd = ["dep:openusd", "dep:openusd-schemas", "dep:zip"]
+
 [dependencies]
+serde_json = "1"
 thiserror = "2"
+fbxcel = { version = "0.9", features = ["tree", "writer"], optional = true }
+base64 = { version = "0.22", optional = true }
+zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
+quick-xml = { version = "0.41", optional = true }
+openusd = { version = "0.8", optional = true }
+openusd-schemas = { version = "0.8", features = ["geom", "shade"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [lints.clippy]
 # A style suggestion (`as_chunks`) for fixed-size `chunks_exact`; the codec loops stay as

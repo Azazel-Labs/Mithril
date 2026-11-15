@@ -10,6 +10,31 @@ Early. What exists today:
 - **`meshopt`**: the `EXT_meshopt_compression` bitstreams. It has meshoptimizer's attribute
   (v0) and triangle encoders, the octahedral filter's encoder, and decoders for every mode
   (attributes, triangles, indices) and filter (octahedral, quaternion, exponential).
+- **`formats`**: readers for STL (binary and ASCII), PLY, MagicaVoxel `.vox`, OBJ with MTL
+  materials and textures, FBX (binary and ASCII), 3DS, 3MF and USD (`.usda`, `.usdc`,
+  `.usdz`). Each produces a `mesh::Mesh`, with textures embedded. `formats::load` dispatches
+  on the extension.
+- **`mesh`**: that triangle-list model (primitives, materials, images), written out as a
+  plain GLB by `mesh::to_glb`.
+- **`assets`**: the `Assets` trait readers use to find referenced files and turn texture
+  bytes into embeddable images. `Folder` searches a pack's folder tree. By default only PNG
+  and JPEG embed; override `Assets::image` to convert TGA, DDS, PSD and others.
+
+### Cargo features
+
+| Feature | Format | Extra dependencies |
+| --- | --- | --- |
+| `stl` (default) | STL | none |
+| `ply` (default) | PLY | none |
+| `vox` (default) | MagicaVoxel | none |
+| `obj` (default) | OBJ + MTL | none |
+| `3ds` (default) | 3DS | none |
+| `fbx` | FBX | `fbxcel`, `base64` |
+| `3mf` | 3MF | `zip`, `quick-xml` |
+| `usd` | USD | `openusd`, `openusd-schemas`, `zip` |
+
+`all-formats` turns them all on. Asking `formats::load` for a format whose feature is off
+returns an error that names the feature.
 
 ## Planned scope
 
@@ -23,8 +48,6 @@ Early. What exists today:
 - **Scene**: `EXT_mesh_gpu_instancing`, and animations read and written.
 - **Writer**: a builder with plain output (any viewer, Blender) or compact output
   (quantized and meshopt-compressed).
-- **Format readers**, each behind a cargo feature: STL, PLY, VOX, OBJ, FBX (binary and
-  ASCII), 3DS, 3MF and USD.
 - **Validation** of glTF documents.
 - **Texture slots** (`KHR_texture_basisu`/KTX2), so a cook step can swap textures without
   touching geometry.
