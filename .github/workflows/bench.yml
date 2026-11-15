@@ -30,6 +30,9 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history, so a short hash or a branch works as the baseline.
+          fetch-depth: ${{ inputs.baseline != '' && '0' || '1' }}
       - name: Toolchain
         run: rustup toolchain install || rustup show
       - uses: Swatinem/rust-cache@v2
@@ -37,15 +40,17 @@ jobs:
           workspaces: bench
       - name: Baseline
         if: inputs.baseline != ''
+        env:
+          BASE: ${{ inputs.baseline }}
         run: |
-          git fetch --no-tags origin "${{ inputs.baseline }}"
-          git worktree add baseline FETCH_HEAD
+          rev=$(git rev-parse --verify --quiet "$BASE^{commit}" || git rev-parse --verify "origin/$BASE^{commit}")
+          git worktree add baseline "$rev"
           # A different version, so Cargo can hold both copies of the crate in one build.
           sed -i 's/^version = .*/version = "0.0.0-base"/' baseline/Cargo.toml
           sed -i 's/^baseline = \[\]/baseline = ["dep:mithril_base"]/' bench/Cargo.toml
           sed -i '/^mithril = /a mithril_base = { package = "mithril", path = "../baseline", default-features = false, features = ["minimal"], optional = true }' bench/Cargo.toml
           echo "FEATURES=--features baseline" >> "$GITHUB_ENV"
-          echo "Baseline: \`$(git -C baseline rev-parse --short HEAD)\` (\`${{ inputs.baseline }}\`), as \"mithril @ base\"" >> "$GITHUB_STEP_SUMMARY"
+          echo "Baseline: \`$(git -C baseline rev-parse --short HEAD)\` (\`$BASE\`), as \"mithril @ base\"" >> "$GITHUB_STEP_SUMMARY"
       - name: Build
         run: cargo build --release --manifest-path bench/Cargo.toml $FEATURES
       - name: Machine
