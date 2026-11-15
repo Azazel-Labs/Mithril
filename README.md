@@ -24,16 +24,17 @@ Early. What exists today:
 
 | Feature | Format | Extra dependencies |
 | --- | --- | --- |
-| `stl` (default) | STL | none |
-| `ply` (default) | PLY | none |
-| `vox` (default) | MagicaVoxel | none |
-| `obj` (default) | OBJ + MTL | none |
-| `3ds` (default) | 3DS | none |
+| `stl` | STL | none |
+| `ply` | PLY | none |
+| `vox` | MagicaVoxel | none |
+| `obj` | OBJ + MTL | none |
+| `3ds` | 3DS | none |
 | `fbx` | FBX | `fbxcel`, `base64` |
 | `3mf` | 3MF | `zip`, `quick-xml` |
 | `usd` | USD | `openusd`, `openusd-schemas`, `zip` |
 
-`all-formats` turns them all on. Asking `formats::load` for a format whose feature is off
+Every reader is on by default. `minimal` is the five with no dependencies, for
+`default-features = false, features = ["minimal"]`. Asking `formats::load` for a format whose feature is off
 returns an error that names the feature.
 
 ## Planned scope

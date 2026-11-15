@@ -9,9 +9,9 @@ keywords = ["gltf", "glb", "meshopt", "3d", "mesh"]
 categories = ["graphics", "game-development", "parser-implementations", "encoding"]
 
 [features]
-default = ["stl", "ply", "vox", "obj", "3ds"]
-# Every format reader.
-all-formats = ["stl", "ply", "vox", "obj", "3ds", "fbx", "3mf", "usd"]
+default = ["minimal", "fbx", "3mf", "usd"]
+# The readers with no dependencies: `default-features = false, features = ["minimal"]`.
+minimal = ["stl", "ply", "vox", "obj", "3ds"]
 stl = []
 ply = []
 vox = []
