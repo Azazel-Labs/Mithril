@@ -1,0 +1,17 @@
+[package]
+name = "mithril"
+version = "0.1.0"
+edition = "2021"
+license = "MIT-0"
+rust-version = "1.88"
+description = "Pure-Rust 3D asset interchange: glTF/GLB reading and writing, meshopt compression, and readers for common mesh formats"
+keywords = ["gltf", "glb", "meshopt", "3d", "mesh"]
+categories = ["graphics", "game-development", "parser-implementations", "encoding"]
+
+[dependencies]
+thiserror = "2"
+
+[lints.clippy]
+# A style suggestion (`as_chunks`) for fixed-size `chunks_exact`; the codec loops stay as
+# written, matching meshoptimizer's structure.
+chunks_exact_to_as_chunks = "allow"
