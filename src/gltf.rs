@@ -603,7 +603,7 @@ fn element_size(acc: &Value) -> Option<usize> {
 }
 
 /// Decodes one compressed buffer view into `out`, its uncompressed length.
-fn decode_view(ext: &Map<String, Value>, src: &[u8], out: &mut [u8]) -> Result<()> {
+pub(crate) fn decode_view(ext: &Map<String, Value>, src: &[u8], out: &mut [u8]) -> Result<()> {
     let count = get_usize(ext, "count")?;
     let stride = get_usize(ext, "byteStride")?;
     ensure!(
@@ -687,7 +687,7 @@ fn embed_images_into(
 }
 
 /// Points an object's `buffer`/`byteOffset` at its buffer's new home; returns the new buffer.
-fn rehome(obj: &mut Map<String, Value>, home: &[(usize, usize)]) -> Result<(usize, usize)> {
+pub(crate) fn rehome(obj: &mut Map<String, Value>, home: &[(usize, usize)]) -> Result<(usize, usize)> {
     let b = get_usize(obj, "buffer")?;
     let &(nb, base) = home.get(b).with_context(|| format!("missing buffer {b}"))?;
     let off = obj.get("byteOffset").and_then(Value::as_u64).map_or(0, usize_of);
@@ -700,14 +700,14 @@ fn rehome(obj: &mut Map<String, Value>, home: &[(usize, usize)]) -> Result<(usiz
 }
 
 /// A buffer view's meshopt extension, if it has one.
-fn meshopt_of(v: &Value) -> Option<(&'static str, &Map<String, Value>)> {
+pub(crate) fn meshopt_of(v: &Value) -> Option<(&'static str, &Map<String, Value>)> {
     let exts = v.get("extensions")?.as_object()?;
     MESHOPT_EXTENSIONS
         .iter()
         .find_map(|&n| Some((n, exts.get(n)?.as_object()?)))
 }
 
-fn is_fallback(b: &Value) -> bool {
+pub(crate) fn is_fallback(b: &Value) -> bool {
     MESHOPT_EXTENSIONS.iter().any(|n| {
         b.pointer(&format!("/extensions/{n}/fallback"))
             .and_then(Value::as_bool)
@@ -759,7 +759,7 @@ fn unlist_extensions(json: &mut Map<String, Value>, names: &[&str]) {
     }
 }
 
-fn require_extension(json: &mut Map<String, Value>, name: &str) {
+pub(crate) fn require_extension(json: &mut Map<String, Value>, name: &str) {
     for key in ["extensionsUsed", "extensionsRequired"] {
         let list = json.entry(key).or_insert_with(|| json!([]));
         if let Some(list) = list.as_array_mut()
@@ -869,7 +869,7 @@ pub(crate) fn percent_decode(s: &str) -> String {
 }
 
 /// An image's MIME type from its first bytes.
-fn sniff_mime(b: &[u8]) -> Option<&'static str> {
+pub(crate) fn sniff_mime(b: &[u8]) -> Option<&'static str> {
     Some(match b {
         [0x89, b'P', b'N', b'G', ..] => "image/png",
         [0xff, 0xd8, 0xff, ..] => "image/jpeg",
@@ -879,7 +879,7 @@ fn sniff_mime(b: &[u8]) -> Option<&'static str> {
     })
 }
 
-fn mime_from_name(name: &str) -> Option<&'static str> {
+pub(crate) fn mime_from_name(name: &str) -> Option<&'static str> {
     let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
     Some(match ext.as_str() {
         "png" => "image/png",

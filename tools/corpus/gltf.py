@@ -300,6 +300,7 @@ sp_val = g.view(b"".join(struct.pack("<3f", *v) for v in moved.values()))
 base_pos = g.acc(CUBE_POS, minmax=True)
 g.j["accessors"][base_pos]["sparse"] = {"count": 2, "indices": {"bufferView": sp_idx, "componentType": U16},
                                         "values": {"bufferView": sp_val}}
+g.j["accessors"][base_pos]["max"] = [1, 1, 2]  # min and max cover the sparse values (3.6.2.3)
 quad = [[3, 0, 0], [4, 0, 0], [4, 1, 0], [3, 1, 0]]
 zi = g.view(struct.pack("<4B", 0, 1, 2, 3))
 zv = g.view(b"".join(struct.pack("<3f", *v) for v in quad))
@@ -349,7 +350,8 @@ g = G()
 pos = g.acc([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], minmax=True)
 g.node(mesh=g.mesh([{"attributes": {"POSITION": pos}, "indices": g.acc([0, 1, 2, 0, 2, 9], U8, "SCALAR", target=34963)}]))
 case(FMT, "index_out_of_range", {"q.glb": g.glb()},
-     {"spec": SPEC + ": a triangle naming a vertex that doesn't exist is dropped", "source": SRC, "triangles": 1})
+     {"spec": SPEC + ": a triangle naming a vertex that doesn't exist is dropped", "source": SRC, "triangles": 1,
+      "facts": {"triangles": 2}, "validator_errors": ["ACCESSOR_INDEX_OOB"]})
 
 # --- nodes and scenes -------------------------------------------------------------------------
 
@@ -538,10 +540,12 @@ case(FMT, "texture_missing", {"cube.glb": g.glb()},
       "materials": [{"textured": False}]})
 
 # EXT_texture_webp with a PNG fallback: the PNG is used.
+# A complete 1x1 lossless WebP, so the file validates; readers that don't embed WebP skip it.
+WEBP_1X1 = bytes.fromhex("524946461a000000574542505650384c0d0000002f00000010071011118888fe0700")
 g = G()
 g.use("EXT_texture_webp")
 textured(g, {"bufferView": g.view(png(RED)), "mimeType": "image/png"})
-g.add("images", {"bufferView": g.view(b"RIFF\0\0\0\0WEBPVP8 "), "mimeType": "image/webp"})
+g.add("images", {"bufferView": g.view(WEBP_1X1), "mimeType": "image/webp"})
 g.j["textures"][0]["extensions"] = {"EXT_texture_webp": {"source": 1}}
 case(FMT, "texture_webp_fallback", {"cube.glb": g.glb()},
      {"spec": "EXT_texture_webp: the PNG fallback source when WebP can't be embedded", "source": SRC, **CUBE,

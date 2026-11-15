@@ -12,6 +12,8 @@ description = "Load speed and peak memory of Mithril's readers against the leadi
 # Bench another commit's Mithril alongside this one. The workflow checks it out and adds the
 # `mithril_base` dependency; see bench.yml.
 baseline = []
+# The baseline commit has the Document API (set by the workflow).
+base-document = []
 
 [dependencies]
 mithril = { path = "..", default-features = false, features = ["minimal"] }

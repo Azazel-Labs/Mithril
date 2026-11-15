@@ -1,8 +1,11 @@
 //! Pure-Rust 3D asset interchange, with glTF as the hub.
 //!
 //! - [`formats`]: readers for STL, PLY, `MagicaVoxel`, OBJ, FBX, 3DS, 3MF, USD and glTF, each behind a
-//!   cargo feature, producing a [`Mesh`](mesh::Mesh).
-//! - [`mesh`]: that triangle-list model, written out as a GLB.
+//!   cargo feature, producing a [`Document`](document::Document).
+//! - [`document`]: that common form, a glTF 2.0 document (JSON and buffers) written out as a GLB
+//!   as it is, flattened into a posed [`Mesh`](mesh::Mesh) on demand, and pruned to what a
+//!   [`Keep`](document::Keep) asks for.
+//! - [`mesh`]: the flat triangle-list model, written out as a GLB.
 //! - [`assets`]: how readers find the textures and material libraries a model refers to.
 //! - [`gltf`]: GLB packing, and meshopt compression added to or decoded away from a GLB.
 //! - [`meshopt`]: the `EXT_meshopt_compression` and `KHR_meshopt_compression` bitstreams.
@@ -34,8 +37,11 @@ macro_rules! invalid {
 }
 
 pub mod assets;
+pub mod document;
+mod flatten;
 pub mod formats;
 pub mod gltf;
+mod keep;
 pub mod mesh;
 pub mod meshopt;
 mod num;

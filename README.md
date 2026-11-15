@@ -17,20 +17,30 @@ Early. What exists today:
   model's folder. `cargo run --example meshopt -- sample out.glb` writes a small test file.
 - **`formats`**: readers for STL (binary and ASCII), PLY, MagicaVoxel `.vox`, OBJ with MTL
   materials and textures, FBX (binary and ASCII), 3DS, 3MF, USD (`.usda`, `.usdc`,
-  `.usdz`) and glTF 2.0 (`.gltf`, `.glb`, meshopt-compressed or not). Each produces a
-  `mesh::Mesh`, with textures embedded. `formats::load` reads a file and `formats::load_bytes`
-  a model already in memory; both dispatch on the extension.
+  `.usdz`) and glTF 2.0 (`.gltf`, `.glb`, meshopt- or Draco-compressed or not).
+  `formats::load` reads a file and `formats::load_bytes` a model already in memory; both
+  dispatch on the extension and return a `document::Document`.
+- **`document`**: the common form, a glTF 2.0 document (its JSON and its buffers' bytes).
+  glTF passes through untouched: nothing is decoded, and `Document::to_glb` writes the
+  buffers back as they are, compression included, with images embedded. The other formats
+  are converted into it. `Document::flatten(Pose)` derives a flat, posed triangle
+  `mesh::Mesh` (transforms, instances, skins and morphs baked in), and `Document::counts`
+  counts triangles, points and lines from the JSON alone. A `Keep` passed to the load says
+  what to keep: everything by default, or for instance `Keep { animations: false,
+  ..Keep::ALL }` for static meshes that still carry their skins.
 - **Conformance corpus**: 489 cases under `tests/corpus`, each a file and the GLB it must
   become. They cover every format above and the variants exporters really write: OBJ's face
   forms and MTL dialects, both PLY byte orders, every FBX version and axis system, and USD's
   three encodings and its composition, and glTF's accessor types, node hierarchy, skins and
   extensions. Most are generated against the specifications; the
-  rest are Blender 5.2 exports. See [tests/corpus/README.md](tests/corpus/README.md).
+  rest are Blender 5.2 exports. See [tests/corpus/README.md](tests/corpus/README.md). Every
+  GLB the conformance tests write passes the Khronos glTF validator (`tools/validate`), which
+  CI runs.
 - **Benchmarks**: `bench/` races Mithril's readers against tobj, stl_io, ply-rs and gltf on load
   time and peak heap. Run it on a clean GitHub runner with `gh workflow run bench.yml` (or
   from the Actions tab); the tables land in the run summary.
-- **`mesh`**: that triangle-list model (primitives, materials, images), written out as a
-  plain GLB by `mesh::to_glb`.
+- **`mesh`**: the flat triangle-list model `flatten` produces (primitives, materials,
+  images), written out as a plain GLB by `mesh::to_glb`.
 - **`assets`**: the `Assets` trait readers use to find and read referenced files (MTL
   libraries, textures, glTF buffers, USD layers) and turn texture bytes into embeddable
   images. `Folder` searches a pack's folder tree; `Memory` holds files by path, for models
@@ -66,10 +76,12 @@ mithril = { version = "0.1", default-features = false, features = ["stl", "ply",
 ```
 
 ```rust
-use mithril::{assets::Memory, formats};
+use mithril::{assets::Memory, document::{Keep, Pose}, formats};
 
 let assets = Memory::new().with("scene.bin", bin).with("albedo.png", png);
-let loaded = formats::load_bytes(&gltf, "scene.gltf", "gltf", &assets)?;
+let doc = formats::load_bytes(&gltf, "scene.gltf", "gltf", &assets, Keep::ALL)?;
+let glb = doc.to_glb()?; // the scene, losslessly
+let mesh = doc.flatten(Pose::Rest)?; // or flat triangles
 ```
 
 ### Minimum Rust
@@ -79,8 +91,10 @@ Rust 1.88, with any features but `usd`. The `usd` feature, and so the default bu
 
 ## Planned scope
 
-- **glTF document**: a lossless JSON document, so unknown extensions and extras survive a
-  round trip. Typed views over meshes, accessors, nodes, skins and animations.
+- **Lossless conversion**: FBX, USD, OBJ, 3MF, VOX, PLY, STL and 3DS converted into the
+  document with their hierarchy, skins, animations and full materials (glTF already is),
+  units and axes recorded in extras, and readers that skip what `Keep` drops. glTF 1.0.
+- **Typed views** over the document's meshes, accessors, nodes, skins and animations.
 - **Accessors**: typed access through the document (the mesh reader already reads every
   component type, normalized and sparse).
 - **Compression**: meshopt v1 encoding and filter encoders beyond octahedral, and

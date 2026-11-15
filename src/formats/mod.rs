@@ -1,8 +1,9 @@
 //! Model formats read natively: STL (binary and ASCII), PLY (ASCII and binary), `MagicaVoxel`
 //! `.vox`, OBJ (with its MTL materials and textures), FBX (binary and ASCII), 3DS, 3MF, USD and
 //! glTF (`.gltf` and `.glb`).
-//! Each becomes a [`Mesh`]; textures are embedded so the mesh stands on its own. Each format is
-//! behind a cargo feature of its name (`3ds` and `3mf` for those two).
+//! Each becomes a [`Document`]: glTF as it is, the others converted; textures are embedded so the
+//! document stands on its own. Each format is behind a cargo feature of its name (`3ds` and
+//! `3mf` for those two). A [`Keep`] says what to keep; by default, everything.
 //!
 //! [`load_bytes`] reads a model already in memory, with the files it refers to found through
 //! [`Assets`] (such as [`Memory`](crate::assets::Memory)). [`load`] reads a file, and needs the
@@ -16,6 +17,7 @@ use serde_json::{Map, Value, json};
 
 use crate::Result;
 use crate::assets::Assets;
+use crate::document::{Document, Keep};
 use crate::mesh::Mesh;
 
 #[cfg(feature = "fbx")]
@@ -50,39 +52,36 @@ pub const EXTENSIONS: &[&str] = &[
     "stl", "ply", "vox", "obj", "fbx", "3ds", "3mf", "usd", "usda", "usdc", "usdz", "gltf", "glb",
 ];
 
-/// A model read from a file.
-#[derive(Debug, Default)]
-pub struct Loaded {
-    /// The geometry; `None` for files with nothing to draw (a PLY point cloud, a USD layer of
-    /// overrides).
-    pub mesh: Option<Mesh>,
-    /// Facts worth recording: `triangles`, and per format `points`, `vertices`, `voxels`,
-    /// `voxel_size`, `models`, `objects`, `colors`, `application`.
-    pub facts: Map<String, Value>,
-}
-
-/// Reads the model at `path`, whose format is named by `ext` (lowercase, without the dot).
-#[cfg(feature = "fs")]
+/// Reads the model at `path`, whose format is named by `ext` (lowercase, without the dot),
+/// keeping what `keep` says.
 ///
 /// # Errors
 ///
 /// When the file can't be read, `ext` names no reader (or one whose feature is off), or the
 /// model doesn't parse.
-pub fn load(path: &Path, ext: &str, assets: &dyn Assets) -> Result<Loaded> {
-    read(Input::file(path), ext, assets)
+#[cfg(feature = "fs")]
+pub fn load(path: &Path, ext: &str, assets: &dyn Assets, keep: Keep) -> Result<Document<'static>> {
+    read(Input::file(path), ext, assets, keep).map(Document::into_owned)
 }
 
 /// Reads a model already in memory, whose format is named by `ext` (lowercase, without the
-/// dot). `name` is the model's path among `assets`: the files it refers to (MTL libraries,
-/// textures, glTF buffers, USD layers) are found from its folder and read through
-/// [`Assets::read`]. A model that refers to nothing reads with any name and an empty
-/// [`Memory`](crate::assets::Memory).
+/// dot), keeping what `keep` says. `name` is the model's path among `assets`: the files it
+/// refers to (MTL libraries, textures, glTF buffers, USD layers) are found from its folder and
+/// read through [`Assets::read`]. A model that refers to nothing reads with any name and an
+/// empty [`Memory`](crate::assets::Memory). The document may borrow from `bytes` and `assets`
+/// (a GLB's binary chunk is used in place); [`Document::into_owned`] makes it outlive them.
 ///
 /// # Errors
 ///
 /// When `ext` names no reader (or one whose feature is off) or the model doesn't parse.
-pub fn load_bytes(bytes: &[u8], name: &str, ext: &str, assets: &dyn Assets) -> Result<Loaded> {
-    read(Input::memory(bytes, name), ext, assets)
+pub fn load_bytes<'a>(
+    bytes: &'a [u8],
+    name: &'a str,
+    ext: &str,
+    assets: &'a dyn Assets,
+    keep: Keep,
+) -> Result<Document<'a>> {
+    read(Input::memory(bytes, name), ext, assets, keep)
 }
 
 /// A model to read: its path (or, in memory, its name), and where its bytes are.
@@ -207,22 +206,48 @@ impl<'a> Input<'a> {
     }
 }
 
-fn read(input: Input<'_>, ext: &str, assets: &dyn Assets) -> Result<Loaded> {
-    let counted = |m: Mesh| {
-        let mut facts = Map::new();
-        facts.insert("triangles".into(), json!(m.triangles()));
-        Loaded { mesh: Some(m), facts }
-    };
-    let _ = (&counted, input, assets);
+fn read<'a>(input: Input<'a>, ext: &str, assets: &'a dyn Assets, keep: Keep) -> Result<Document<'a>> {
+    let mut doc = convert(input, ext, assets)?;
+    doc.prune(keep);
+    if matches!(ext, "gltf" | "glb") {
+        let c = doc.counts();
+        for (key, n) in [("triangles", c.triangles), ("points", c.points), ("lines", c.lines)] {
+            if n > 0 || key == "triangles" {
+                doc.facts.insert(key.into(), json!(n));
+            }
+        }
+    }
+    Ok(doc)
+}
+
+/// The document for a reader's mesh and facts.
+#[allow(dead_code, reason = "used by the readers this build has")]
+fn of_mesh(mesh: Option<Mesh>, facts: Map<String, Value>) -> Document<'static> {
+    match mesh {
+        Some(m) => Document::from_mesh(m, facts),
+        None => Document::empty(facts),
+    }
+}
+
+/// `mesh` with its triangles counted.
+#[allow(dead_code, reason = "used by the readers this build has")]
+fn counted(mesh: Mesh) -> Document<'static> {
+    let mut facts = Map::new();
+    facts.insert("triangles".into(), json!(mesh.triangles()));
+    Document::from_mesh(mesh, facts)
+}
+
+fn convert<'a>(input: Input<'a>, ext: &str, assets: &'a dyn Assets) -> Result<Document<'a>> {
+    let _ = (input, assets);
     match ext {
         #[cfg(feature = "stl")]
         "stl" => stl::stl(input).map(counted),
         #[cfg(feature = "ply")]
-        "ply" => ply::ply(input, assets).map(|(mesh, facts)| Loaded { mesh, facts }),
+        "ply" => ply::ply(input, assets).map(|(mesh, facts)| of_mesh(mesh, facts)),
         #[cfg(feature = "vox")]
-        "vox" => vox::vox(&input.read()?).map(|(mesh, facts)| Loaded { mesh, facts }),
+        "vox" => vox::vox(&input.read()?).map(|(mesh, facts)| of_mesh(mesh, facts)),
         #[cfg(feature = "3mf")]
-        "3mf" => threemf::load(input).map(|(mesh, facts)| Loaded { mesh, facts }),
+        "3mf" => threemf::load(input).map(|(mesh, facts)| of_mesh(mesh, facts)),
         #[cfg(feature = "3ds")]
         "3ds" => {
             let mut mesh = tds::load(input, assets)?;
@@ -230,7 +255,9 @@ fn read(input: Input<'_>, ext: &str, assets: &dyn Assets) -> Result<Loaded> {
             Ok(counted(mesh))
         }
         #[cfg(feature = "usd")]
-        "usd" | "usda" | "usdc" | "usdz" => Ok(usd::load(input, assets)?.map_or_else(Loaded::default, counted)),
+        "usd" | "usda" | "usdc" | "usdz" => {
+            Ok(usd::load(input, assets)?.map_or_else(|| Document::empty(Map::new()), counted))
+        }
         #[cfg(feature = "obj")]
         "obj" => Ok(counted(colors_and_textures(
             obj::obj(input, assets)?,
@@ -245,12 +272,7 @@ fn read(input: Input<'_>, ext: &str, assets: &dyn Assets) -> Result<Loaded> {
             Ok(counted(mesh))
         }
         #[cfg(feature = "gltf")]
-        "gltf" | "glb" => gltf::load(input, assets).map(|(mesh, mut facts)| {
-            if let Some(m) = &mesh {
-                facts.insert("triangles".into(), json!(m.triangles()));
-            }
-            Loaded { mesh, facts }
-        }),
+        "gltf" | "glb" => gltf::load(input, assets),
         e if EXTENSIONS.contains(&e) => bail!("built without the `{}` feature", feature_for(e)),
         _ => bail!("not a model format handled here: .{ext}"),
     }
@@ -326,7 +348,7 @@ mod tests {
     /// memory, with every file under `root` as a [`Memory`], to check the two agree.
     #[allow(dead_code)]
     fn load_in(path: &Path, ext: &str, root: &Path) -> (Option<Mesh>, Map<String, Value>) {
-        let loaded = load(path, ext, &Folder::new(root)).unwrap();
+        let loaded = load(path, ext, &Folder::new(root), Keep::ALL).unwrap();
         let mut memory = Memory::new();
         let mut dirs = vec![root.to_path_buf()];
         while let Some(dir) = dirs.pop() {
@@ -342,14 +364,14 @@ mod tests {
         }
         let name = path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
         let bytes = std::fs::read(path).unwrap();
-        let in_memory = super::load_bytes(&bytes, &name, ext, &memory).unwrap();
-        let glb = |m: &Option<Mesh>| m.as_ref().map(|m| to_glb(m).unwrap());
+        let in_memory = super::load_bytes(&bytes, &name, ext, &memory, Keep::ALL).unwrap();
         assert!(
-            glb(&loaded.mesh) == glb(&in_memory.mesh),
+            loaded.to_glb().unwrap() == in_memory.to_glb().unwrap(),
             "{name} reads differently from memory"
         );
         assert_eq!(loaded.facts, in_memory.facts, "{name} reads differently from memory");
-        (loaded.mesh, loaded.facts)
+        let mesh = loaded.flatten(crate::document::Pose::Rest).unwrap();
+        (mesh, loaded.facts)
     }
 
     #[allow(dead_code)]
@@ -382,7 +404,11 @@ vt 0 1
 
     #[test]
     fn missing_feature_and_unknown_extension() {
-        let err = |ext| load(Path::new("x"), ext, &Folder::new(".")).unwrap_err().to_string();
+        let err = |ext| {
+            load(Path::new("x"), ext, &Folder::new("."), Keep::ALL)
+                .unwrap_err()
+                .to_string()
+        };
         assert!(err("dae").contains("not a model format"));
         #[cfg(not(feature = "usd"))]
         assert!(err("usdz").contains("without the `usd` feature"));

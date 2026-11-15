@@ -498,6 +498,7 @@ name = "mithril"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "bytemuck",
  "draco-core",
  "fbxcel",
  "gltf",

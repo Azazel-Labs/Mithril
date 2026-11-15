@@ -294,17 +294,41 @@ fn inputs(dir: &Path, sizes: &[String]) -> Vec<Input> {
 type Load = fn(&Input) -> (Box<dyn std::any::Any>, usize);
 
 fn mithril(input: &Input) -> (Box<dyn std::any::Any>, usize) {
+    use mithril::document::{Keep, Pose};
     let dir = input.path.parent().unwrap();
-    let loaded = mithril::formats::load(&input.path, input.ext, &mithril::assets::Folder::new(dir)).unwrap();
-    let mesh = loaded.mesh.unwrap();
-    let n = mesh.triangles();
-    (Box::new(mesh), n)
+    let doc = mithril::formats::load(&input.path, input.ext, &mithril::assets::Folder::new(dir), Keep::ALL).unwrap();
+    // A GLB is already the document, its arrays left in the file: the triangles drawn, decoded,
+    // are the like-for-like result (the gltf crate decodes them). The other formats' document
+    // holds their arrays, as their competitors' results do.
+    if input.ext == "glb" {
+        let mesh = doc.flatten(Pose::Rest).unwrap().unwrap();
+        let n = mesh.triangles();
+        return (Box::new((doc, mesh)), n);
+    }
+    let n = doc.triangles();
+    (Box::new(doc), n)
 }
 
 /// The name the baseline commit's Mithril goes by in the tables.
 const BASELINE: &str = "mithril @ base";
 
-#[cfg(feature = "baseline")]
+#[cfg(all(feature = "baseline", feature = "base-document"))]
+fn mithril_base(input: &Input) -> (Box<dyn std::any::Any>, usize) {
+    use mithril_base::document::{Keep, Pose};
+    let dir = input.path.parent().unwrap();
+    let doc =
+        mithril_base::formats::load(&input.path, input.ext, &mithril_base::assets::Folder::new(dir), Keep::ALL)
+            .unwrap();
+    if input.ext == "glb" {
+        let mesh = doc.flatten(Pose::Rest).unwrap().unwrap();
+        let n = mesh.triangles();
+        return (Box::new((doc, mesh)), n);
+    }
+    let n = doc.triangles();
+    (Box::new(doc), n)
+}
+
+#[cfg(all(feature = "baseline", not(feature = "base-document")))]
 fn mithril_base(input: &Input) -> (Box<dyn std::any::Any>, usize) {
     let dir = input.path.parent().unwrap();
     let loaded =

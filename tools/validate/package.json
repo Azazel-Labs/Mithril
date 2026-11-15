@@ -1,0 +1,9 @@
+{
+  "name": "mithril-validate",
+  "private": true,
+  "description": "Runs the Khronos glTF validator over every GLB the conformance tests write",
+  "type": "module",
+  "dependencies": {
+    "gltf-validator": "2.0.0-dev.3.10"
+  }
+}

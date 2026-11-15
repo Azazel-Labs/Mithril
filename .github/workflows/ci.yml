@@ -1,7 +1,8 @@
 name: CI
 
 # Formatting, clippy across the feature sets Hoard and wasm builds use, the tests (with the
-# conformance corpus), and the minimum Rust versions the README promises.
+# conformance corpus, whose GLBs go through the Khronos validator), and the minimum Rust
+# versions the README promises.
 
 on:
   push:
@@ -54,6 +55,9 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets
+      # Every GLB the conformance tests wrote must pass the Khronos validator.
+      - run: npm ci --prefix tools/validate
+      - run: node tools/validate/validate.mjs target/tmp/conformance
       - run: cargo test --no-default-features --features minimal
 
   wasm:

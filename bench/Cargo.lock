@@ -303,6 +303,7 @@ dependencies = [
 name = "mithril"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "serde_json",
  "thiserror",
 ]

@@ -18,7 +18,9 @@ mod glb;
 use std::path::{Path, PathBuf};
 
 use mithril::assets::{Folder, Memory};
+use mithril::document::{Document, Keep, Pose};
 use mithril::formats::{self, EXTENSIONS};
+use mithril::mesh::Mesh;
 use serde_json::{Map, Value};
 
 fn corpus() -> PathBuf {
@@ -130,8 +132,8 @@ fn relative(p: &Path, root: &Path) -> String {
 }
 
 /// Reads the case from memory, with every file in its folder as an asset, and checks it reads as it did from its
-/// file: the same GLB and facts, or an error where that failed.
-fn same_from_memory(case: &Case, ext: &str, from_file: &mithril::Result<formats::Loaded>) -> Result<(), String> {
+/// file: the same document and facts, or an error where that failed.
+fn same_from_memory(case: &Case, ext: &str, from_file: &mithril::Result<Loaded>) -> Result<(), String> {
     let mut memory = Memory::new();
     let mut dirs = vec![case.dir.clone()];
     while let Some(dir) = dirs.pop() {
@@ -144,10 +146,11 @@ fn same_from_memory(case: &Case, ext: &str, from_file: &mithril::Result<formats:
         }
     }
     let bytes = std::fs::read(&case.file).unwrap();
-    let from_memory = formats::load_bytes(&bytes, &relative(&case.file, &case.dir), ext, &memory);
-    let glb = |m: &Option<mithril::mesh::Mesh>| m.as_ref().map(|m| mithril::mesh::to_glb(m).unwrap());
+    let name = relative(&case.file, &case.dir);
+    let from_memory = formats::load_bytes(&bytes, &name, ext, &memory, Keep::ALL).and_then(flattened);
+    let glb = |d: &Document<'_>| d.to_glb().ok();
     match (from_file, &from_memory) {
-        (Ok(a), Ok(b)) if glb(&a.mesh) == glb(&b.mesh) && a.facts == b.facts => Ok(()),
+        (Ok(a), Ok(b)) if glb(&a.0) == glb(&b.0) && a.0.facts == b.0.facts => Ok(()),
         (Ok(_), Ok(_)) => Err("reads differently from memory".into()),
         (Err(_), Err(_)) => Ok(()),
         (Ok(_), Err(err)) => Err(format!("fails to load from memory: {err}")),
@@ -155,12 +158,34 @@ fn same_from_memory(case: &Case, ext: &str, from_file: &mithril::Result<formats:
     }
 }
 
+/// A case's document and the mesh it flattens to.
+type Loaded<'a> = (Document<'a>, Option<Mesh>);
+
+fn flattened(doc: Document<'_>) -> mithril::Result<Loaded<'_>> {
+    let mesh = doc.flatten(Pose::Rest)?;
+    Ok((doc, mesh))
+}
+
+/// Writes the case's document as a GLB under `target/conformance/`, for the Khronos validator.
+fn keep_glb(case: &Case, doc: &Document<'_>) -> Result<(), String> {
+    let rel = relative(&case.dir, &corpus());
+    let out = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("conformance")
+        .join(format!("{rel}.glb"));
+    std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+    let glb = doc
+        .to_glb()
+        .map_err(|err| format!("the document doesn't write as GLB: {err}"))?;
+    std::fs::write(out, glb).unwrap();
+    Ok(())
+}
+
 /// Runs one case, returning what's wrong with it.
 fn run(case: &Case) -> Result<(), String> {
     let e = &case.expect;
     let ext = ext_of(&case.file);
     let tol = e.get("tolerance").and_then(Value::as_f64).unwrap_or(1e-4) as f32;
-    let loaded = formats::load(&case.file, &ext, &Folder::new(&case.dir));
+    let loaded = formats::load(&case.file, &ext, &Folder::new(&case.dir), Keep::ALL).and_then(flattened);
     same_from_memory(case, &ext, &loaded)?;
     if let Some(want) = e.get("error").and_then(Value::as_str) {
         return match loaded {
@@ -169,21 +194,22 @@ fn run(case: &Case) -> Result<(), String> {
             Ok(_) => Err(format!("loaded, expected an error containing {want:?}")),
         };
     }
-    let loaded = loaded.map_err(|err| format!("failed to load: {err}"))?;
+    let (doc, mesh) = loaded.map_err(|err| format!("failed to load: {err}"))?;
+    keep_glb(case, &doc)?;
     if let Some(Value::Object(want)) = e.get("facts") {
         for (k, v) in want {
-            if loaded.facts.get(k) != Some(v) {
-                return Err(format!("fact {k} is {:?}, expected {v}", loaded.facts.get(k)));
+            if doc.facts.get(k) != Some(v) {
+                return Err(format!("fact {k} is {:?}, expected {v}", doc.facts.get(k)));
             }
         }
     }
     if e.get("no_mesh").and_then(Value::as_bool) == Some(true) {
-        return match loaded.mesh {
+        return match mesh {
             None => Ok(()),
             Some(_) => Err("produced a mesh, expected none".into()),
         };
     }
-    let mesh = loaded.mesh.ok_or("produced no mesh")?;
+    let mesh = mesh.ok_or("produced no mesh")?;
     let bytes = mithril::mesh::to_glb(&mesh).map_err(|err| format!("to_glb failed: {err}"))?;
     let g = glb::validate(&bytes).map_err(|err| format!("invalid GLB: {err}"))?;
     if g.triangles() != mesh.triangles() {
@@ -193,8 +219,13 @@ fn run(case: &Case) -> Result<(), String> {
             mesh.triangles()
         ));
     }
-    if let Some(t) = loaded.facts.get("triangles")
-        && t.as_u64() != Some(g.triangles() as u64)
+    // glTF's count is what the JSON declares, without reading indices: drawing drops triangles
+    // that name a missing vertex, so it's an upper bound there and exact elsewhere.
+    let declared = matches!(ext.as_str(), "gltf" | "glb");
+    if let Some(t) = doc.facts.get("triangles")
+        && !t
+            .as_u64()
+            .is_some_and(|t| t == g.triangles() as u64 || (declared && t > g.triangles() as u64))
     {
         return Err(format!("fact triangles {t} != GLB triangles {}", g.triangles()));
     }

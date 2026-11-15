@@ -49,7 +49,9 @@ jobs:
           sed -i 's/^version = .*/version = "0.0.0-base"/' baseline/Cargo.toml
           sed -i 's/^baseline = \[\]/baseline = ["dep:mithril_base"]/' bench/Cargo.toml
           sed -i '/^mithril = /a mithril_base = { package = "mithril", path = "../baseline", default-features = false, features = ["minimal"], optional = true }' bench/Cargo.toml
-          echo "FEATURES=--features baseline" >> "$GITHUB_ENV"
+          # The baseline's API: a Document (and a `Keep`) from the lossless rewrite on, a `Loaded` before.
+          if [ -f baseline/src/document.rs ]; then features=baseline,base-document; else features=baseline; fi
+          echo "FEATURES=--features $features" >> "$GITHUB_ENV"
           echo "Baseline: \`$(git -C baseline rev-parse --short HEAD)\` (\`$BASE\`), as \"mithril @ base\"" >> "$GITHUB_STEP_SUMMARY"
       - name: Build
         run: cargo build --release --manifest-path bench/Cargo.toml $FEATURES

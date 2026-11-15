@@ -1,197 +1,124 @@
-//! glTF 2.0, `.gltf` and `.glb`, read into a [`Mesh`]. glTF's space is the mesh's (Y up,
-//! metres), so geometry comes over as it is, placed by the scene's node transforms.
+//! glTF 2.0, `.gltf` and `.glb`, read as the [`Document`] it already is. Nothing is decoded:
+//! extensions (known or not), extras, and meshopt or Draco compression pass through as they are.
 //!
-//! - The default scene is drawn (else scene 0; with no scenes, every root node; with no nodes,
-//!   every mesh). Node transforms are baked into the vertices; a mirroring transform flips the
-//!   winding back. `EXT_mesh_gpu_instancing` instances are baked the same way.
-//! - Skinned meshes take the pose the nodes are in (linear blend skinning); morph targets take
-//!   the node's or mesh's default weights.
-//! - Triangles, strips and fans; points and lines are counted, not drawn.
-//! - `POSITION`, `NORMAL`, the color texture's `TEXCOORD_n` (its `KHR_texture_transform`
-//!   baked in) and `COLOR_0`, in any component type `KHR_mesh_quantization` allows, sparse
-//!   accessors included. Without `NORMAL` a primitive keeps no normals: glTF shades it flat.
-//! - Materials: base color, metallic and roughness factors, emissive, double-sidedness, and
-//!   the color and normal textures (`KHR_materials_pbrSpecularGlossiness` as its diffuse).
-//! - Meshopt compression is decoded first. Draco (`KHR_draco_mesh_compression`) is refused.
-//!
-//! A GLB file isn't read whole: accessors are read from the file a block at a time, so the peak
-//! is little more than the mesh. A GLB in memory is read in place. External buffers must sit
-//! inside the model's folder; for a model in memory they come from [`Assets::read`].
+//! - A GLB file isn't read whole: its binary chunk stays in the file, read as needed. A GLB in
+//!   memory is used in place.
+//! - External buffers must sit inside the model's folder; for a model in memory they come from
+//!   [`Assets::read`]. A meshopt fallback buffer that isn't there holds nothing: views on it
+//!   decode from their compressed data.
+//! - Images named by URI (a data URI, or a file found as buffers are) move into a buffer, so the
+//!   document stands on its own. One that isn't found keeps its URI.
 
 use std::borrow::Cow;
 #[cfg(feature = "fs")]
 use std::fs::File;
 #[cfg(feature = "fs")]
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::path::{Component, Path};
 
 use serde_json::{Map, Value, json};
 
 use super::Input;
 use crate::assets::Assets;
+#[cfg(feature = "fs")]
+use crate::document::FileSpan;
+use crate::document::{Blob, Document};
 use crate::gltf as container;
-use crate::mesh::{Image, MAX_TRIANGLES, Material, Mesh, Prim};
-use crate::num::{f32_of, u32_of, usize_of};
+use crate::num::usize_of;
 use crate::{Context as _, Result};
-
-/// How much of a buffer is read at once.
-const BLOCK: usize = 256 * 1024;
 
 /// How much of the file the first read takes.
 #[cfg(feature = "fs")]
 const HEAD: usize = 64 * 1024;
 
-/// The most vertices an accessor without data (all zeros) may claim.
-const MAX_VERTICES: usize = 3 * MAX_TRIANGLES;
-
-/// Reads the glTF or GLB at `path`, as its mesh (`None` when it draws no triangles) and facts.
-pub(crate) fn load(input: Input<'_>, assets: &dyn Assets) -> Result<(Option<Mesh>, Map<String, Value>)> {
-    let mut r = Reader::open(input, assets)?;
-    let mesh = r.mesh()?;
-    let mut facts = Map::new();
-    if r.points > 0 {
-        facts.insert("points".into(), json!(r.points));
-    }
-    if r.lines > 0 {
-        facts.insert("lines".into(), json!(r.lines));
-    }
-    Ok((mesh, facts))
-}
-
-/// Where a buffer's bytes are.
-enum Buf<'a> {
-    /// A stretch of a file: the GLB's binary chunk, or an external `.bin`.
-    #[cfg(feature = "fs")]
-    File {
-        file: File,
-        base: u64,
-        len: u64,
-        /// Where the file's cursor is, relative to `base`, to skip needless seeks.
-        at: u64,
-    },
-    Mem(Cow<'a, [u8]>),
-}
-
-impl Buf<'_> {
-    fn len(&self) -> u64 {
-        match self {
-            #[cfg(feature = "fs")]
-            Buf::File { len, .. } => *len,
-            Buf::Mem(v) => v.len() as u64,
+/// Reads the glTF or GLB `input`.
+pub(crate) fn load<'a>(input: Input<'a>, assets: &'a dyn Assets) -> Result<Document<'a>> {
+    let (json, mut bin) = match input.bytes() {
+        Some(b) if b.starts_with(b"glTF") => glb_in_memory(Cow::Borrowed(b))?,
+        Some(b) => (gltf_json(b)?, None),
+        #[cfg(feature = "fs")]
+        None => open_file(input.path)?,
+        #[cfg(not(feature = "fs"))]
+        None => unreachable!("a model without its bytes needs the `fs` feature"),
+    };
+    let version = json
+        .get("asset")
+        .and_then(|a| a.get("version"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    ensure!(
+        version.starts_with("2."),
+        "glTF version {version:?} isn't 2.x (glTF 1.0 isn't read)"
+    );
+    let mut doc = Document {
+        json,
+        buffers: Vec::new(),
+        facts: Map::new(),
+    };
+    let n = doc.json.get("buffers").and_then(Value::as_array).map_or(0, Vec::len);
+    for i in 0..n {
+        let b = &mut doc.json["buffers"][i];
+        let declared = b.get("byteLength").and_then(Value::as_u64).unwrap_or(0);
+        let fallback = container::is_fallback(b);
+        let blob = match b.get("uri").and_then(Value::as_str) {
+            Some(uri) if uri.starts_with("data:") => Blob::Bytes(Cow::Owned(container::data_uri(uri)?.1)),
+            Some(uri) => match external(input, assets, uri) {
+                Ok(blob) => blob,
+                Err(_) if fallback => Blob::Missing(declared),
+                Err(e) => return Err(e),
+            },
+            None if i == 0 && bin.is_some() => bin.take().expect("checked"),
+            None if fallback => Blob::Missing(declared),
+            None => bail!("glTF buffer {i} has no data"),
+        };
+        ensure!(
+            blob.len() >= declared,
+            "glTF buffer {i} holds {} bytes but declares {declared}",
+            blob.len()
+        );
+        if let Some(b) = b.as_object_mut() {
+            b.remove("uri");
         }
+        doc.buffers.push(blob);
     }
+    embed_images(&mut doc, input, assets);
+    Ok(doc)
+}
 
-    fn read_at(&mut self, off: u64, out: &mut [u8]) -> Result<()> {
-        let end = off
-            .checked_add(out.len() as u64)
-            .filter(|&e| e <= self.len())
-            .context("glTF data runs past the end of its buffer")?;
-        match self {
-            #[cfg(feature = "fs")]
-            Buf::File { file, base, at, .. } => {
-                if *at != off {
-                    file.seek(SeekFrom::Start(*base + off))?;
-                }
-                file.read_exact(out)?;
-                *at = end;
-            }
-            Buf::Mem(v) => out.copy_from_slice(&v[usize_of(off)..usize_of(end)]),
-        }
-        Ok(())
+/// Moves each image named by URI into a buffer of its own, when it's found and its type known.
+fn embed_images(doc: &mut Document<'_>, input: Input<'_>, assets: &dyn Assets) {
+    let n = doc.json.get("images").and_then(Value::as_array).map_or(0, Vec::len);
+    for i in 0..n {
+        let img = &doc.json["images"][i];
+        let Some(uri) = img.get("uri").and_then(Value::as_str) else {
+            continue;
+        };
+        let found = if uri.starts_with("data:") {
+            container::data_uri(uri).ok()
+        } else {
+            let name = container::percent_decode(uri);
+            read_external(input, assets, uri)
+                .ok()
+                .map(|b| (container::mime_from_name(&name).map(str::to_owned), b.into_owned()))
+        };
+        let Some((named, bytes)) = found else { continue };
+        let Some(mime) = container::sniff_mime(&bytes)
+            .map(str::to_owned)
+            .or_else(|| img.get("mimeType").and_then(Value::as_str).map(str::to_owned))
+            .or(named)
+        else {
+            continue;
+        };
+        let len = bytes.len();
+        let buffer = doc.push_buffer(bytes);
+        let view = doc.push_view(json!({ "buffer": buffer, "byteLength": len }));
+        let img = doc.json["images"][i]
+            .as_object_mut()
+            .expect("an image with a uri is an object");
+        img.remove("uri");
+        img.insert("bufferView".into(), json!(view));
+        img.insert("mimeType".into(), json!(mime));
     }
-}
-
-/// An accessor, resolved.
-#[derive(Clone)]
-struct Acc {
-    view: Option<usize>,
-    offset: u64,
-    count: usize,
-    ctype: u64,
-    /// Components per element.
-    n: usize,
-    normalized: bool,
-    sparse: Option<Value>,
-    /// Elements decoded from Draco, tightly packed, in place of a buffer view.
-    decoded: Option<Arc<[u8]>>,
-}
-
-impl Acc {
-    fn csize(&self) -> usize {
-        match self.ctype {
-            5120 | 5121 => 1,
-            5122 | 5123 => 2,
-            _ => 4,
-        }
-    }
-
-    fn esize(&self) -> usize {
-        self.csize() * self.n
-    }
-}
-
-/// A 4x4 matrix, column-major as glTF writes it.
-type M4 = [f64; 16];
-
-const IDENTITY: M4 = [
-    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-];
-
-/// Where one mesh is drawn: its transforms (several for instances), morph weights and skin.
-struct Use {
-    mesh: usize,
-    weights: Vec<f32>,
-    skin: Option<usize>,
-    transforms: Vec<M4>,
-}
-
-struct Reader<'a> {
-    json: Map<String, Value>,
-    /// The GLB's binary chunk, until buffer 0 claims it.
-    bin: Option<Buf<'a>>,
-    bufs: Vec<Option<Buf<'a>>>,
-    input: Input<'a>,
-    assets: &'a dyn Assets,
-    scratch: Vec<u8>,
-    /// glTF material → mesh material.
-    materials: Vec<Option<usize>>,
-    /// The material for primitives that name none.
-    default_material: Option<usize>,
-    /// glTF image → mesh image, once tried: `None` until then, `Some(None)` if it didn't embed.
-    #[allow(clippy::option_option, reason = "untried and tried-but-failed are both cached")]
-    images: Vec<Option<Option<usize>>>,
-    /// Every node's world transform, for joints.
-    world: Vec<M4>,
-    /// Triangles still allowed.
-    budget: usize,
-    points: usize,
-    lines: usize,
-    /// The current primitive's Draco-decoded accessors: (accessor, elements, component type,
-    /// components).
-    draco: Vec<(usize, Arc<[u8]>, u64, usize)>,
-}
-
-fn list<'v>(obj: &'v Map<String, Value>, key: &str) -> &'v [Value] {
-    obj.get(key).and_then(Value::as_array).map_or(&[], Vec::as_slice)
-}
-
-fn index(v: &Value, key: &str) -> Option<usize> {
-    v.get(key)?.as_u64().map(usize_of)
-}
-
-fn floats<const N: usize>(v: Option<&Value>, default: [f64; N]) -> [f64; N] {
-    let mut out = default;
-    if let Some(a) = v.and_then(Value::as_array).filter(|a| a.len() == N) {
-        for (o, x) in out.iter_mut().zip(a) {
-            *o = x.as_f64().unwrap_or(*o);
-        }
-    }
-    out
-}
-
-fn f32s<const N: usize>(v: Option<&Value>, default: [f32; N]) -> [f32; N] {
-    floats(v, default.map(f64::from)).map(f32_of)
 }
 
 /// `rel` when it's a plain relative path that stays inside the model's folder.
@@ -207,20 +134,34 @@ fn checked(rel: &str) -> Result<&str> {
     Ok(rel)
 }
 
+/// An external buffer: from the model's folder, left in its file, or for a model in memory from
+/// its assets.
+fn external<'a>(input: Input<'a>, assets: &'a dyn Assets, uri: &str) -> Result<Blob<'a>> {
+    #[cfg(feature = "fs")]
+    if input.bytes().is_none() {
+        let rel = container::percent_decode(uri);
+        let p = input.dir().join(checked(&rel)?);
+        let file = File::open(&p).map_err(|e| invalid!("glTF buffer {rel:?}: {e}"))?;
+        let len = file.metadata()?.len();
+        return Ok(Blob::File(FileSpan::new(file, 0, len, 0)));
+    }
+    read_external(input, assets, uri).map(Blob::Bytes)
+}
+
 /// An external file the model names by URI, whole: from the model's folder, or for a model in
 /// memory from its assets.
-fn external<'a>(input: Input<'a>, assets: &'a dyn Assets, uri: &str) -> Result<Cow<'a, [u8]>> {
+fn read_external<'a>(input: Input<'a>, assets: &'a dyn Assets, uri: &str) -> Result<Cow<'a, [u8]>> {
     let rel = container::percent_decode(uri);
     let p = input.dir().join(checked(&rel)?);
     #[cfg(feature = "fs")]
     if input.bytes().is_none() {
         return Ok(Cow::Owned(
-            std::fs::read(&p).map_err(|e| invalid!("glTF buffer {rel:?}: {e}"))?,
+            std::fs::read(&p).map_err(|e| invalid!("glTF file {rel:?}: {e}"))?,
         ));
     }
     assets
         .read(&p)
-        .with_context(|| format!("glTF buffer {rel:?} isn't among the assets"))
+        .with_context(|| format!("glTF file {rel:?} isn't among the assets"))
 }
 
 /// Where a GLB's binary chunk is: offset and length.
@@ -256,7 +197,7 @@ fn glb_layout(
 
 /// A GLB in memory, as its JSON and binary chunk: borrowed bytes sliced, owned ones moved out
 /// without a copy.
-fn glb_in_memory(bytes: Cow<'_, [u8]>) -> Result<(Map<String, Value>, Option<Buf<'_>>)> {
+fn glb_in_memory(bytes: Cow<'_, [u8]>) -> Result<(Map<String, Value>, Option<Blob<'_>>)> {
     let total = bytes.len() as u64;
     let (json, bin) = glb_layout(total, |off, len| {
         bytes
@@ -266,7 +207,7 @@ fn glb_in_memory(bytes: Cow<'_, [u8]>) -> Result<(Map<String, Value>, Option<Buf
     })?;
     let bin = bin.map(|(base, len)| {
         let (base, end) = (usize_of(base), usize_of(base + len));
-        Buf::Mem(match bytes {
+        Blob::Bytes(match bytes {
             Cow::Borrowed(b) => Cow::Borrowed(&b[base..end]),
             Cow::Owned(mut v) => {
                 v.truncate(end);
@@ -287,9 +228,10 @@ fn gltf_json(bytes: &[u8]) -> Result<Map<String, Value>> {
     }
 }
 
-/// The JSON and binary chunk of a glTF or GLB file, read in pieces.
+/// The JSON and binary chunk of a glTF or GLB file, read in pieces: the binary chunk stays in
+/// the file.
 #[cfg(feature = "fs")]
-fn open_file(path: &Path) -> Result<(Map<String, Value>, Option<Buf<'static>>)> {
+fn open_file(path: &Path) -> Result<(Map<String, Value>, Option<Blob<'static>>)> {
     let mut file = File::open(path)?;
     let total = file.metadata()?.len();
     // One read for the header, the JSON and the binary chunk's header in the usual case,
@@ -316,1371 +258,98 @@ fn open_file(path: &Path) -> Result<(Map<String, Value>, Option<Buf<'static>>)> 
         Ok(b)
     })?;
     drop(head);
-    let bin = bin.map(|(base, len)| Buf::File {
-        file,
-        base,
-        len,
-        at: pos.wrapping_sub(base),
-    });
+    let bin = bin.map(|(base, len)| Blob::File(FileSpan::new(file, base, len, pos.wrapping_sub(base))));
     Ok((json, bin))
 }
 
-impl<'a> Reader<'a> {
-    fn open(input: Input<'a>, assets: &'a dyn Assets) -> Result<Self> {
-        let (mut json, mut bin) = match input.bytes() {
-            Some(b) if b.starts_with(b"glTF") => glb_in_memory(Cow::Borrowed(b))?,
-            Some(b) => (gltf_json(b)?, None),
-            #[cfg(feature = "fs")]
-            None => open_file(input.path)?,
-            #[cfg(not(feature = "fs"))]
-            None => unreachable!("a model without its bytes needs the `fs` feature"),
-        };
-        let version = json
-            .get("asset")
-            .and_then(|a| a.get("version"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        ensure!(
-            version.starts_with("2."),
-            "glTF version {version:?} isn't 2.x (glTF 1.0 isn't read)"
-        );
-        let required = |name: &str| {
-            list(&json, "extensionsRequired")
-                .iter()
-                .chain(list(&json, "extensionsUsed"))
-                .any(|e| e.as_str() == Some(name))
-        };
-        #[cfg(not(feature = "draco"))]
-        ensure!(
-            !list(&json, "extensionsRequired")
-                .iter()
-                .any(|e| e.as_str() == Some("KHR_draco_mesh_compression")),
-            "glTF uses Draco compression, which needs Mithril's `draco` feature"
-        );
-        let meshopt = container::MESHOPT_EXTENSIONS.iter().any(|e| required(e))
-            || list(&json, "bufferViews").iter().any(|v| {
-                v.get("extensions")
-                    .and_then(Value::as_object)
-                    .is_some_and(|x| container::MESHOPT_EXTENSIONS.iter().any(|e| x.contains_key(*e)))
-            });
-        if meshopt {
-            drop(bin);
-            let bytes = input.read()?;
-            let plain = if bytes.starts_with(b"glTF") {
-                container::decompress(&bytes)?
-            } else {
-                container::pack_glb_decompressed(&bytes, |uri| external(input, assets, uri).map(Cow::into_owned))?
-            };
-            drop(bytes);
-            (json, bin) = glb_in_memory(Cow::Owned(plain))?;
-        }
-        let n = |key| list(&json, key).len();
-        Ok(Self {
-            bufs: (0..n("buffers")).map(|_| None).collect(),
-            materials: vec![None; n("materials")],
-            images: vec![None; n("images")],
-            json,
-            bin,
-            input,
-            assets,
-            scratch: Vec::new(),
-            default_material: None,
-            world: Vec::new(),
-            budget: MAX_TRIANGLES,
-            points: 0,
-            lines: 0,
-            draco: Vec::new(),
-        })
-    }
-
-    fn get(&self, key: &str, i: usize) -> Result<&Value> {
-        list(&self.json, key)
-            .get(i)
-            .with_context(|| format!("glTF {key}[{i}] doesn't exist"))
-    }
-
-    fn buf(&mut self, i: usize) -> Result<&mut Buf<'a>> {
-        ensure!(i < self.bufs.len(), "glTF buffers[{i}] doesn't exist");
-        if self.bufs[i].is_none() {
-            let b = self.get("buffers", i)?.clone();
-            let declared = b.get("byteLength").and_then(Value::as_u64).unwrap_or(0);
-            let buf = match b.get("uri").and_then(Value::as_str) {
-                Some(uri) if uri.starts_with("data:") => Buf::Mem(Cow::Owned(container::data_uri(uri)?.1)),
-                #[cfg(feature = "fs")]
-                Some(uri) if self.input.bytes().is_none() => {
-                    let rel = container::percent_decode(uri);
-                    let p = self.input.dir().join(checked(&rel)?);
-                    let file = File::open(&p).map_err(|e| invalid!("glTF buffer {rel:?}: {e}"))?;
-                    let len = file.metadata()?.len();
-                    Buf::File {
-                        file,
-                        base: 0,
-                        len,
-                        at: u64::MAX,
-                    }
-                }
-                Some(uri) => Buf::Mem(external(self.input, self.assets, uri)?),
-                None if i == 0 && self.bin.is_some() => self.bin.take().unwrap(),
-                None => bail!("glTF buffer {i} has no data"),
-            };
-            ensure!(
-                buf.len() >= declared,
-                "glTF buffer {i} holds {} bytes but declares {declared}",
-                buf.len()
-            );
-            self.bufs[i] = Some(buf);
-        }
-        Ok(self.bufs[i].as_mut().unwrap())
-    }
-
-    /// A buffer view as (buffer, offset, length, stride).
-    fn view(&self, i: usize) -> Result<(usize, u64, u64, Option<usize>)> {
-        let v = self.get("bufferViews", i)?;
-        let buffer = index(v, "buffer").context("glTF buffer view has no buffer")?;
-        let offset = v.get("byteOffset").and_then(Value::as_u64).unwrap_or(0);
-        let len = v
-            .get("byteLength")
-            .and_then(Value::as_u64)
-            .context("glTF buffer view has no byteLength")?;
-        Ok((buffer, offset, len, index(v, "byteStride")))
-    }
-
-    /// A buffer view's bytes.
-    fn view_bytes(&mut self, i: usize) -> Result<Vec<u8>> {
-        let (buffer, offset, len, _) = self.view(i)?;
-        let b = self.buf(buffer)?;
-        ensure!(
-            offset.saturating_add(len) <= b.len(),
-            "glTF buffer view runs past its buffer"
-        );
-        let mut out = vec![0; usize::try_from(len).context("glTF buffer view is too big to hold")?];
-        b.read_at(offset, &mut out)?;
-        Ok(out)
-    }
-
-    fn acc(&self, i: usize) -> Result<Acc> {
-        if let Some((_, bytes, ctype, n)) = self.draco.iter().find(|d| d.0 == i) {
-            let count = bytes.len() / (n * 4);
-            return Ok(Acc {
-                view: None,
-                offset: 0,
-                count,
-                ctype: *ctype,
-                n: *n,
-                normalized: false,
-                sparse: None,
-                decoded: Some(bytes.clone()),
-            });
-        }
-        let a = self.get("accessors", i)?;
-        let ctype = a.get("componentType").and_then(Value::as_u64).unwrap_or(0);
-        ensure!(
-            matches!(ctype, 5120..=5123 | 5125 | 5126),
-            "glTF accessor {i} has component type {ctype}"
-        );
-        let n = match a.get("type").and_then(Value::as_str) {
-            Some("SCALAR") => 1,
-            Some("VEC2") => 2,
-            Some("VEC3") => 3,
-            Some("VEC4") => 4,
-            Some("MAT4") => 16,
-            t => bail!("glTF accessor {i} has type {t:?}, not one read here"),
-        };
-        Ok(Acc {
-            view: index(a, "bufferView"),
-            offset: a.get("byteOffset").and_then(Value::as_u64).unwrap_or(0),
-            count: index(a, "count").context("glTF accessor has no count")?,
-            ctype,
-            n,
-            normalized: a.get("normalized").and_then(Value::as_bool).unwrap_or(false),
-            sparse: a.get("sparse").cloned(),
-            decoded: None,
-        })
-    }
-
-    /// Calls `f(first, bytes, stride)` over an accessor's elements a block at a time: element
-    /// `first + j` is at `bytes[j * stride..]`. Nothing for an accessor without a buffer view.
-    fn blocks(&mut self, a: &Acc, mut f: impl FnMut(usize, &[u8], usize)) -> Result<()> {
-        if let Some(bytes) = &a.decoded {
-            f(0, bytes, a.esize());
-            return Ok(());
-        }
-        let Some(view) = a.view else {
-            ensure!(a.count <= MAX_VERTICES, "glTF accessor counts {} elements", a.count);
-            return Ok(());
-        };
-        if a.count == 0 {
-            return Ok(());
-        }
-        let (buffer, voff, vlen, stride) = self.view(view)?;
-        let esize = a.esize();
-        let stride = stride.filter(|&s| s > 0).unwrap_or(esize);
-        ensure!(
-            stride >= esize,
-            "glTF buffer view stride {stride} is under an element's {esize} bytes"
-        );
-        let span = (a.count as u64 - 1)
-            .checked_mul(stride as u64)
-            .and_then(|s| s.checked_add(a.offset + esize as u64))
-            .filter(|&s| s <= vlen)
-            .with_context(|| format!("glTF accessor's {} elements run past their buffer view", a.count))?;
-        let start = voff + a.offset;
-        let mut scratch = std::mem::take(&mut self.scratch);
-        let b = self.buf(buffer)?;
-        ensure!(start + span <= b.len(), "glTF buffer view runs past its buffer");
-        #[cfg_attr(not(feature = "fs"), allow(irrefutable_let_patterns))]
-        if let Buf::Mem(v) = b {
-            f(0, &v[usize_of(start)..usize_of(start + span)], stride);
-            self.scratch = scratch;
-            return Ok(());
-        }
-        let per = (BLOCK / stride).max(1);
-        let mut i = 0;
-        while i < a.count {
-            let k = per.min(a.count - i);
-            let len = (k - 1) * stride + esize;
-            if scratch.len() < len {
-                scratch.resize(len, 0);
-            }
-            b.read_at(start + (i * stride) as u64, &mut scratch[..len])?;
-            f(i, &scratch[..len], stride);
-            i += k;
-        }
-        self.scratch = scratch;
-        Ok(())
-    }
-
-    /// An accessor's elements as floats, components past the accessor's from `fill`, integer
-    /// components normalized when the accessor says so.
-    fn read<const N: usize>(&mut self, i: usize, fill: [f32; N]) -> Result<Vec<[f32; N]>> {
-        let a = self.acc(i)?;
-        self.read_acc(&a, fill)
-    }
-
-    fn read_acc<const N: usize>(&mut self, a: &Acc, fill: [f32; N]) -> Result<Vec<[f32; N]>> {
-        let mut zero = fill;
-        for z in zero.iter_mut().take(a.n) {
-            *z = 0.0;
-        }
-        if a.view.is_none() {
-            ensure!(a.count <= MAX_VERTICES, "glTF accessor counts {} elements", a.count);
-        }
-        let mut out = Vec::new();
-        out.try_reserve_exact(a.count)
-            .map_err(|_| invalid!("glTF accessor counts {} elements", a.count))?;
-        out.resize(a.count, zero);
-        let m = a.n.min(N);
-        let cs = a.csize();
-        let (ctype, normalized) = (a.ctype, a.normalized);
-        self.blocks(a, |first, bytes, stride| {
-            let out = &mut out[first..];
-            if ctype == 5126 && m == N && stride == 4 * N {
-                // Tightly packed floats (what nearly every exporter writes): one flat loop.
-                for (o, b) in out.as_flattened_mut().iter_mut().zip(bytes.chunks_exact(4)) {
-                    *o = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                }
-                return;
-            }
-            match (ctype, normalized) {
-                (5126, _) => put(out, bytes, stride, cs, m, |b| {
-                    f32::from_le_bytes([b[0], b[1], b[2], b[3]])
-                }),
-                (5121, true) => put(out, bytes, stride, cs, m, |b| f32::from(b[0]) / 255.0),
-                (5121, false) => put(out, bytes, stride, cs, m, |b| f32::from(b[0])),
-                (5120, true) => put(out, bytes, stride, cs, m, |b| {
-                    (f32::from(b[0].cast_signed()) / 127.0).max(-1.0)
-                }),
-                (5120, false) => put(out, bytes, stride, cs, m, |b| f32::from(b[0].cast_signed())),
-                (5123, true) => put(out, bytes, stride, cs, m, |b| {
-                    f32::from(u16::from_le_bytes([b[0], b[1]])) / 65535.0
-                }),
-                (5123, false) => put(out, bytes, stride, cs, m, |b| {
-                    f32::from(u16::from_le_bytes([b[0], b[1]]))
-                }),
-                (5122, true) => put(out, bytes, stride, cs, m, |b| {
-                    (f32::from(i16::from_le_bytes([b[0], b[1]])) / 32767.0).max(-1.0)
-                }),
-                (5122, false) => put(out, bytes, stride, cs, m, |b| {
-                    f32::from(i16::from_le_bytes([b[0], b[1]]))
-                }),
-                #[allow(
-                    clippy::cast_precision_loss,
-                    reason = "past 2^24 an f32 attribute rounds, as in any viewer"
-                )]
-                _ => put(out, bytes, stride, cs, m, |b| {
-                    u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32
-                }),
-            }
-        })?;
-        if let Some(s) = a.sparse.clone() {
-            let (at, values) = self.sparse(a, &s)?;
-            let values = self.read_acc(&values, fill)?;
-            for (k, v) in at.into_iter().zip(values) {
-                if let Some(o) = out.get_mut(k as usize) {
-                    *o = v;
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// An index accessor's values.
-    fn read_indices(&mut self, i: usize) -> Result<Vec<u32>> {
-        let a = self.acc(i)?;
-        ensure!(
-            a.n == 1 && matches!(a.ctype, 5121 | 5123 | 5125),
-            "glTF index accessor {i} isn't unsigned integer scalars"
-        );
-        self.read_u32s(&a)
-    }
-
-    fn read_u32s(&mut self, a: &Acc) -> Result<Vec<u32>> {
-        let mut out = Vec::new();
-        out.try_reserve_exact(a.count)
-            .map_err(|_| invalid!("glTF accessor counts {} elements", a.count))?;
-        out.resize(a.count, 0u32);
-        let ctype = a.ctype;
-        self.blocks(a, |first, bytes, stride| {
-            let out = &mut out[first..];
-            match ctype {
-                5121 => {
-                    for (o, e) in out.iter_mut().zip(bytes.chunks(stride)) {
-                        *o = u32::from(e[0]);
-                    }
-                }
-                5123 if stride == 2 => {
-                    for (o, e) in out.iter_mut().zip(bytes.chunks_exact(2)) {
-                        *o = u32::from(u16::from_le_bytes([e[0], e[1]]));
-                    }
-                }
-                5125 if stride == 4 => {
-                    for (o, e) in out.iter_mut().zip(bytes.chunks_exact(4)) {
-                        *o = u32::from_le_bytes([e[0], e[1], e[2], e[3]]);
-                    }
-                }
-                5123 => {
-                    for (o, e) in out.iter_mut().zip(bytes.chunks(stride)) {
-                        *o = u32::from(u16::from_le_bytes([e[0], e[1]]));
-                    }
-                }
-                _ => {
-                    for (o, e) in out.iter_mut().zip(bytes.chunks(stride)) {
-                        *o = u32::from_le_bytes([e[0], e[1], e[2], e[3]]);
-                    }
-                }
-            }
-        })?;
-        if let Some(s) = a.sparse.clone() {
-            let (at, values) = self.sparse(a, &s)?;
-            let values = self.read_u32s(&values)?;
-            for (k, v) in at.into_iter().zip(values) {
-                if let Some(o) = out.get_mut(k as usize) {
-                    *o = v;
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// A sparse accessor's indices, and an accessor for its values.
-    fn sparse(&mut self, a: &Acc, s: &Value) -> Result<(Vec<u32>, Acc)> {
-        let count = index(s, "count").context("glTF sparse accessor has no count")?;
-        ensure!(
-            count <= a.count,
-            "glTF sparse accessor replaces more elements than it has"
-        );
-        let part = |key: &str| -> Result<(usize, u64)> {
-            let p = s
-                .get(key)
-                .with_context(|| format!("glTF sparse accessor has no {key}"))?;
-            Ok((
-                index(p, "bufferView").with_context(|| format!("glTF sparse {key} has no bufferView"))?,
-                p.get("byteOffset").and_then(Value::as_u64).unwrap_or(0),
-            ))
-        };
-        let (iv, ioff) = part("indices")?;
-        let ictype = s["indices"].get("componentType").and_then(Value::as_u64).unwrap_or(0);
-        ensure!(
-            matches!(ictype, 5121 | 5123 | 5125),
-            "glTF sparse indices' component type {ictype}"
-        );
-        let idx = Acc {
-            view: Some(iv),
-            offset: ioff,
-            count,
-            ctype: ictype,
-            n: 1,
-            normalized: false,
-            sparse: None,
-            decoded: None,
-        };
-        let at = self.read_u32s(&idx)?;
-        let (vv, voff) = part("values")?;
-        let values = Acc {
-            view: Some(vv),
-            offset: voff,
-            sparse: None,
-            decoded: None,
-            count,
-            ..a.clone()
-        };
-        Ok((at, values))
-    }
-
-    /// The scene's meshes, where they are drawn.
-    fn uses(&mut self) -> Result<Vec<Use>> {
-        let nodes = list(&self.json, "nodes").to_vec();
-        let mut world = vec![None::<M4>; nodes.len()];
-        // Parents first: every node reachable from a root takes its parent's transform.
-        let mut child = vec![false; nodes.len()];
-        for n in &nodes {
-            for c in list_of(n, "children") {
-                if let Some(f) = child.get_mut(c) {
-                    *f = true;
-                }
-            }
-        }
-        let mut stack: Vec<(usize, M4)> = (0..nodes.len()).filter(|&i| !child[i]).map(|i| (i, IDENTITY)).collect();
-        while let Some((i, parent)) = stack.pop() {
-            if world[i].is_some() {
-                continue;
-            }
-            let m = mul(&parent, &local(&nodes[i]));
-            world[i] = Some(m);
-            for c in list_of(&nodes[i], "children") {
-                if c < nodes.len() && world[c].is_none() {
-                    stack.push((c, m));
-                }
-            }
-        }
-
-        let scenes = list(&self.json, "scenes");
-        let roots: Vec<usize> = if scenes.is_empty() {
-            if nodes.is_empty() {
-                // No nodes at all: every mesh, as it is.
-                return Ok((0..list(&self.json, "meshes").len())
-                    .map(|mesh| Use {
-                        mesh,
-                        weights: Vec::new(),
-                        skin: None,
-                        transforms: vec![IDENTITY],
-                    })
-                    .collect());
-            }
-            (0..nodes.len()).filter(|&i| !child[i]).collect()
-        } else {
-            let s = self.json.get("scene").and_then(Value::as_u64).map_or(0, usize_of);
-            list_of(scenes.get(s).context("glTF default scene doesn't exist")?, "nodes")
-        };
-
-        let mut seen = vec![false; nodes.len()];
-        let mut order = Vec::new();
-        let mut stack: Vec<usize> = roots.into_iter().rev().collect();
-        while let Some(i) = stack.pop() {
-            if i >= nodes.len() || seen[i] {
-                continue;
-            }
-            seen[i] = true;
-            order.push(i);
-            stack.extend(list_of(&nodes[i], "children").into_iter().rev());
-        }
-
-        let mut uses: Vec<Use> = Vec::new();
-        for i in order {
-            let n = &nodes[i];
-            let Some(mesh) = index(n, "mesh") else { continue };
-            let skin = index(n, "skin");
-            let weights: Vec<f32> = n
-                .get("weights")
-                .or_else(|| list(&self.json, "meshes").get(mesh).and_then(|m| m.get("weights")))
-                .and_then(Value::as_array)
-                .map(|w| w.iter().map(|x| f32_of(x.as_f64().unwrap_or(0.0))).collect())
-                .unwrap_or_default();
-            let w = world[i].unwrap_or(IDENTITY);
-            let transforms = if skin.is_some() {
-                // A skinned mesh is placed by its joints, not its node.
-                vec![IDENTITY]
-            } else {
-                self.instances(n, &w)?
-            };
-            let same = uses.iter_mut().find(|u| {
-                u.mesh == mesh
-                    && u.skin == skin
-                    && u.weights
-                        .iter()
-                        .map(|x| x.to_bits())
-                        .eq(weights.iter().map(|x| x.to_bits()))
-            });
-            match same {
-                Some(_) if skin.is_some() => {}
-                Some(u) => u.transforms.extend(transforms),
-                None => uses.push(Use {
-                    mesh,
-                    weights,
-                    skin,
-                    transforms,
-                }),
-            }
-        }
-        // Joints need every node's transform, in the scene or not.
-        self.world = world.into_iter().map(|w| w.unwrap_or(IDENTITY)).collect();
-        Ok(uses)
-    }
-
-    /// A node's transforms: its own, or one per `EXT_mesh_gpu_instancing` instance.
-    fn instances(&mut self, node: &Value, world: &M4) -> Result<Vec<M4>> {
-        let Some(attrs) = node
-            .get("extensions")
-            .and_then(|e| e.get("EXT_mesh_gpu_instancing"))
-            .and_then(|e| e.get("attributes"))
-        else {
-            return Ok(vec![*world]);
-        };
-        let get = |k: &str| index(attrs, k);
-        let t = get("TRANSLATION").map(|a| self.read(a, [0.0; 3])).transpose()?;
-        let r = get("ROTATION")
-            .map(|a| self.read(a, [0.0, 0.0, 0.0, 1.0]))
-            .transpose()?;
-        let s = get("SCALE").map(|a| self.read(a, [1.0; 3])).transpose()?;
-        let count = [
-            t.as_ref().map(Vec::len),
-            r.as_ref().map(Vec::len),
-            s.as_ref().map(Vec::len),
-        ]
-        .into_iter()
-        .flatten()
-        .min()
-        .unwrap_or(0);
-        ensure!(count <= MAX_TRIANGLES, "glTF node has {count} instances");
-        Ok((0..count)
-            .map(|k| {
-                let t = t.as_ref().map_or([0.0; 3], |v| v[k].map(f64::from));
-                let r = r.as_ref().map_or([0.0, 0.0, 0.0, 1.0], |v| v[k].map(f64::from));
-                let s = s.as_ref().map_or([1.0; 3], |v| v[k].map(f64::from));
-                mul(world, &trs(t, r, s))
-            })
-            .collect())
-    }
-}
-
-/// `node[key]` as indices.
-fn list_of(v: &Value, key: &str) -> Vec<usize> {
-    v.get(key)
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_u64).map(usize_of).collect())
-        .unwrap_or_default()
-}
-
-/// Writes `m` components of each element in `bytes` into `out`.
-#[inline]
-fn put<const N: usize>(
-    out: &mut [[f32; N]],
-    bytes: &[u8],
-    stride: usize,
-    csize: usize,
-    m: usize,
-    conv: impl Fn(&[u8]) -> f32,
-) {
-    if m == N {
-        // Every component given (the usual case): a loop the compiler unrolls.
-        for (o, e) in out.iter_mut().zip(bytes.chunks(stride)) {
-            if e.len() >= N * csize {
-                *o = std::array::from_fn(|c| conv(&e[c * csize..]));
-            }
-        }
-        return;
-    }
-    for (o, e) in out.iter_mut().zip(bytes.chunks(stride)) {
-        for (c, x) in o.iter_mut().enumerate().take(m) {
-            *x = conv(&e[c * csize..]);
-        }
-    }
-}
-
-fn mul(a: &M4, b: &M4) -> M4 {
-    let mut r = [0.0; 16];
-    for c in 0..4 {
-        for row in 0..4 {
-            r[c * 4 + row] = (0..4).map(|k| a[k * 4 + row] * b[c * 4 + k]).sum();
-        }
-    }
-    r
-}
-
-/// Translation, rotation (a quaternion x y z w) and scale as one matrix.
-fn trs(t: [f64; 3], q: [f64; 4], s: [f64; 3]) -> M4 {
-    let len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
-    let [x, y, z, w] = if len > 0.0 {
-        q.map(|c| c / len)
-    } else {
-        [0.0, 0.0, 0.0, 1.0]
-    };
-    let r = [
-        [
-            1.0 - 2.0 * (y * y + z * z),
-            2.0 * (x * y - z * w),
-            2.0 * (x * z + y * w),
-        ],
-        [
-            2.0 * (x * y + z * w),
-            1.0 - 2.0 * (x * x + z * z),
-            2.0 * (y * z - x * w),
-        ],
-        [
-            2.0 * (x * z - y * w),
-            2.0 * (y * z + x * w),
-            1.0 - 2.0 * (x * x + y * y),
-        ],
-    ];
-    let mut m = IDENTITY;
-    for col in 0..3 {
-        for row in 0..3 {
-            m[col * 4 + row] = r[row][col] * s[col];
-        }
-    }
-    m[12..15].copy_from_slice(&t);
-    m
-}
-
-/// A node's own transform.
-fn local(node: &Value) -> M4 {
-    if let Some(m) = node.get("matrix").and_then(Value::as_array).filter(|m| m.len() == 16) {
-        let mut out = IDENTITY;
-        for (o, x) in out.iter_mut().zip(m) {
-            *o = x.as_f64().unwrap_or(*o);
-        }
-        return out;
-    }
-    trs(
-        floats(node.get("translation"), [0.0; 3]),
-        floats(node.get("rotation"), [0.0, 0.0, 0.0, 1.0]),
-        floats(node.get("scale"), [1.0; 3]),
-    )
-}
-
-/// The upper 3x3's determinant.
-fn det3(m: &M4) -> f64 {
-    m[0] * (m[5] * m[10] - m[9] * m[6]) - m[4] * (m[1] * m[10] - m[9] * m[2]) + m[8] * (m[1] * m[6] - m[5] * m[2])
-}
-
-/// The matrix normals go through: the upper 3x3's cofactors (its inverse transpose, scaled),
-/// signed so a mirror doesn't turn normals inward. Row-major.
-fn normal_matrix(m: &M4) -> [[f64; 3]; 3] {
-    let a = |r: usize, c: usize| m[c * 4 + r];
-    let sign = if det3(m) < 0.0 { -1.0 } else { 1.0 };
-    let mut n = [[0.0; 3]; 3];
-    for (r, row) in n.iter_mut().enumerate() {
-        for (c, x) in row.iter_mut().enumerate() {
-            let (r1, r2) = ((r + 1) % 3, (r + 2) % 3);
-            let (c1, c2) = ((c + 1) % 3, (c + 2) % 3);
-            *x = sign * (a(r1, c1) * a(r2, c2) - a(r1, c2) * a(r2, c1));
-        }
-    }
-    n
-}
-
-fn apply_point(m: &M4, p: [f32; 3]) -> [f32; 3] {
-    let [x, y, z] = p.map(f64::from);
-    [0, 1, 2].map(|r| f32_of(m[r] * x + m[4 + r] * y + m[8 + r] * z + m[12 + r]))
-}
-
-fn apply_normal(n: &[[f64; 3]; 3], v: [f32; 3]) -> [f32; 3] {
-    let [x, y, z] = v.map(f64::from);
-    let o = [0, 1, 2].map(|r| n[r][0] * x + n[r][1] * y + n[r][2] * z);
-    let len = (o[0] * o[0] + o[1] * o[1] + o[2] * o[2]).sqrt();
-    if len > 0.0 {
-        o.map(|c| f32_of(c / len))
-    } else {
-        [0.0, 0.0, 1.0]
-    }
-}
-
-fn normalize(v: &mut [f32; 3]) {
-    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    if len > 0.0 {
-        for c in v.iter_mut() {
-            *c /= len;
-        }
-    } else {
-        *v = [0.0, 0.0, 1.0];
-    }
-}
-
-/// One primitive's geometry before it is placed.
-struct Geometry {
-    positions: Vec<[f32; 3]>,
-    normals: Vec<[f32; 3]>,
-    uvs: Vec<[f32; 2]>,
-    colors: Vec<[f32; 4]>,
-    indices: Vec<u32>,
-}
-
-/// Triangle lists from a primitive's indices, by mode (4 triangles, 5 strip, 6 fan), per the
-/// glTF 2.0 specification's section 3.7.2.1.
-fn triangles(mode: u64, idx: Vec<u32>) -> Vec<u32> {
-    match mode {
-        5 => {
-            let n = idx.len().saturating_sub(2);
-            let mut out = Vec::with_capacity(n * 3);
-            for i in 0..n {
-                if i % 2 == 0 {
-                    out.extend_from_slice(&[idx[i], idx[i + 1], idx[i + 2]]);
-                } else {
-                    out.extend_from_slice(&[idx[i], idx[i + 2], idx[i + 1]]);
-                }
-            }
-            out
-        }
-        6 => {
-            let n = idx.len().saturating_sub(2);
-            let mut out = Vec::with_capacity(n * 3);
-            for i in 0..n {
-                out.extend_from_slice(&[idx[i + 1], idx[i + 2], idx[0]]);
-            }
-            out
-        }
-        _ => {
-            let mut idx = idx;
-            idx.truncate(idx.len() / 3 * 3);
-            idx
-        }
-    }
-}
-
-impl Reader<'_> {
-    fn mesh(&mut self) -> Result<Option<Mesh>> {
-        let uses = self.uses()?;
-        let mut mesh = Mesh::default();
-        for u in &uses {
-            let m = self.get("meshes", u.mesh)?.clone();
-            for p in list_of_values(&m, "primitives") {
-                self.primitive(&p, u, &mut mesh)?;
-            }
-        }
-        Ok((mesh.triangles() > 0).then_some(mesh))
-    }
-
-    fn primitive(&mut self, p: &Value, u: &Use, mesh: &mut Mesh) -> Result<()> {
-        let mode = p.get("mode").and_then(Value::as_u64).unwrap_or(4);
-        let attrs = p.get("attributes").cloned().unwrap_or(Value::Null);
-        let Some(pos) = index(&attrs, "POSITION") else {
-            return Ok(());
-        };
-        if !matches!(mode, 4..=6) {
-            let n = match index(p, "indices") {
-                Some(i) => self.acc(i)?.count,
-                None => self.acc(pos)?.count,
-            };
-            match mode {
-                0 => self.points += n * u.transforms.len(),
-                1 => self.lines += n / 2 * u.transforms.len(),
-                2 => self.lines += n * u.transforms.len(),
-                3 => self.lines += n.saturating_sub(1) * u.transforms.len(),
-                _ => {}
-            }
-            return Ok(());
-        }
-
-        self.draco.clear();
-        if let Some(ext) = p.get("extensions").and_then(|e| e.get("KHR_draco_mesh_compression")) {
-            #[cfg(feature = "draco")]
-            self.decode_draco(ext, &attrs, index(p, "indices"))?;
-            #[cfg(not(feature = "draco"))]
-            {
-                // Files may carry uncompressed data beside the Draco stream, for readers without it.
-                let _ = ext;
-                ensure!(
-                    self.acc(pos)?.view.is_some(),
-                    "glTF uses Draco compression, which needs Mithril's `draco` feature"
-                );
-            }
-        }
-
-        // Check the triangle count before reading any vertices.
-        let corners = match index(p, "indices") {
-            Some(i) => self.acc(i)?.count,
-            None => self.acc(pos)?.count,
-        };
-        let tris = if mode == 4 {
-            corners / 3
-        } else {
-            corners.saturating_sub(2)
-        };
-        let total = tris.saturating_mul(u.transforms.len());
-        ensure!(total <= self.budget, "too many triangles to convert");
-
-        let mut positions = self.read(pos, [0.0; 3])?;
-        let n = positions.len();
-        let idx = match index(p, "indices") {
-            Some(i) => self.read_indices(i)?,
-            None => (0..u32_of(n)).collect(),
-        };
-        let mut indices = triangles(mode, idx);
-        if indices.iter().copied().max().is_some_and(|m| m as usize >= n) {
-            // Drop triangles that name vertices that don't exist.
-            let mut w = 0;
-            for t in 0..indices.len() / 3 {
-                let tri = [indices[t * 3], indices[t * 3 + 1], indices[t * 3 + 2]];
-                if tri.iter().all(|&i| (i as usize) < n) {
-                    indices[w..w + 3].copy_from_slice(&tri);
-                    w += 3;
-                }
-            }
-            indices.truncate(w);
-        }
-        if indices.is_empty() {
-            return Ok(());
-        }
-
-        let material = index(p, "material");
-        let (set, uv_matrix) = self.uv_set(material);
-        let attr = |name: &str| index(&attrs, name);
-        let mut normals = match attr("NORMAL") {
-            Some(a) => self.read(a, [0.0; 3])?,
-            None => Vec::new(),
-        };
-        let mut uvs = match attr(&format!("TEXCOORD_{set}")) {
-            Some(a) => self.read(a, [0.0; 2])?,
-            None => Vec::new(),
-        };
-        let colors = match attr("COLOR_0") {
-            Some(a) => self.read(a, [0.0, 0.0, 0.0, 1.0])?,
-            None => Vec::new(),
-        };
-        // Attributes that don't match the positions are dropped rather than trusted.
-        if normals.len() != n {
-            normals = Vec::new();
-        }
-        if uvs.len() != n {
-            uvs = Vec::new();
-        }
-        let colors = if colors.len() == n { colors } else { Vec::new() };
-        if let Some(t) = uv_matrix {
-            for uv in &mut uvs {
-                let [u0, v0] = *uv;
-                *uv = [t[0] * u0 + t[1] * v0 + t[2], t[3] * u0 + t[4] * v0 + t[5]];
-            }
-        }
-
-        // Morph targets at their default weights.
-        for (k, target) in list_of_values(p, "targets").iter().enumerate() {
-            let w = u.weights.get(k).copied().unwrap_or(0.0);
-            if w == 0.0 {
-                continue;
-            }
-            if let Some(a) = index(target, "POSITION") {
-                for (v, d) in positions.iter_mut().zip(self.read(a, [0.0; 3])?) {
-                    for c in 0..3 {
-                        v[c] += w * d[c];
-                    }
-                }
-            }
-            if !normals.is_empty()
-                && let Some(a) = index(target, "NORMAL")
-            {
-                for (v, d) in normals.iter_mut().zip(self.read(a, [0.0; 3])?) {
-                    for c in 0..3 {
-                        v[c] += w * d[c];
-                    }
-                }
-            }
-        }
-        if let Some(skin) = u.skin {
-            self.skin(skin, &attrs, &mut positions, &mut normals)?;
-        } else if !u.weights.is_empty() {
-            normals.iter_mut().for_each(normalize);
-        }
-
-        let g = Geometry {
-            positions,
-            normals,
-            uvs,
-            colors,
-            indices,
-        };
-        let material = self.material(material, mesh);
-        self.budget -= g.indices.len() / 3 * u.transforms.len();
-        mesh.prims.push(place(g, &u.transforms, material));
-        Ok(())
-    }
-
-    /// Decodes a primitive's Draco stream, so its indices and the attributes it compresses read
-    /// from the decoded values instead of their buffer views. Positions and other quantized
-    /// attributes come out dequantized; integer attributes are normalized here when their
-    /// accessor says so.
-    #[cfg(feature = "draco")]
-    fn decode_draco(&mut self, ext: &Value, attrs: &Value, indices: Option<usize>) -> Result<()> {
-        use draco_core::decode_limits::DecodeLimits;
-        use draco_core::decoder_buffer::DecoderBuffer;
-        use draco_core::draco_types::DataType;
-        use draco_core::mesh_decoder::MeshDecoder;
-
-        let view = index(ext, "bufferView").context("glTF Draco primitive has no bufferView")?;
-        let bytes = self.view_bytes(view)?;
-        let limits = DecodeLimits::default()
-            .with_max_faces(self.budget as u64)
-            .with_max_points(MAX_VERTICES as u64);
-        let mut buffer = DecoderBuffer::new(&bytes).with_limits(limits);
-        let mut dm = draco_core::mesh::Mesh::new();
-        MeshDecoder::new()
-            .decode(&mut buffer, &mut dm)
-            .map_err(|e| invalid!("glTF Draco data doesn't decode: {e}"))?;
-        drop(bytes);
-
-        if let Some(i) = indices {
-            let mut out = Vec::with_capacity(dm.num_faces() * 12);
-            for face in dm.faces() {
-                for p in face {
-                    out.extend_from_slice(&p.0.to_le_bytes());
-                }
-            }
-            self.draco.push((i, out.into(), 5125, 1));
-        }
-        let points = dm.num_points();
-        let mut decoded = Vec::new();
-        for (name, id) in ext.get("attributes").and_then(Value::as_object).into_iter().flatten() {
-            let (Some(acc), Some(id)) = (index(attrs, name), id.as_u64().and_then(|v| u32::try_from(v).ok())) else {
-                continue;
-            };
-            let attribute = dm
-                .attribute_by_unique_id(id)
-                .with_context(|| format!("glTF Draco stream has no attribute {id} for {name}"))?;
-            let a = self.acc(acc)?;
-            let mut values = attribute.read_f32s(points, a.n);
-            if a.normalized || attribute.normalized() {
-                let max = match attribute.data_type() {
-                    DataType::Uint8 => Some((255.0, 0.0)),
-                    DataType::Int8 => Some((127.0, -1.0)),
-                    DataType::Uint16 => Some((65535.0, 0.0)),
-                    DataType::Int16 => Some((32767.0, -1.0)),
-                    _ => None,
-                };
-                if let Some((max, floor)) = max {
-                    for v in &mut values {
-                        *v = (*v / max).max(floor);
-                    }
-                }
-            }
-            let mut out = Vec::with_capacity(values.len() * 4);
-            for v in values {
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-            decoded.push((acc, out.into(), 5126, a.n));
-        }
-        self.draco.extend(decoded);
-        Ok(())
-    }
-
-    /// Poses a skinned primitive: each vertex goes through its joints' matrices, blended by
-    /// weight.
-    fn skin(&mut self, skin: usize, attrs: &Value, positions: &mut [[f32; 3]], normals: &mut [[f32; 3]]) -> Result<()> {
-        let s = self.get("skins", skin)?.clone();
-        let joints = list_of(&s, "joints");
-        let ibm = match index(&s, "inverseBindMatrices") {
-            Some(a) => self.read(a, IDENTITY.map(f32_of))?,
-            None => Vec::new(),
-        };
-        let mats: Vec<M4> = joints
-            .iter()
-            .enumerate()
-            .map(|(k, &j)| {
-                let w = self.world.get(j).copied().unwrap_or(IDENTITY);
-                let b = ibm.get(k).map_or(IDENTITY, |m| m.map(f64::from));
-                mul(&w, &b)
-            })
-            .collect();
-        let (Some(ja), Some(wa)) = (index(attrs, "JOINTS_0"), index(attrs, "WEIGHTS_0")) else {
-            return Ok(());
-        };
-        // Joint indices are integers, read as floats exactly.
-        let ji = self.read(ja, [0.0; 4])?;
-        let wi = self.read(wa, [0.0; 4])?;
-        if ji.len() != positions.len() || wi.len() != positions.len() {
-            return Ok(());
-        }
-        for (v, (j, w)) in ji.iter().zip(&wi).enumerate() {
-            let sum: f32 = w.iter().sum();
-            if sum <= 0.0 {
-                continue;
-            }
-            let mut m = [0.0; 16];
-            for k in 0..4 {
-                if w[k] == 0.0 {
-                    continue;
-                }
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss,
-                    reason = "joint indices are small whole numbers; `as` saturates bad ones and `get` refuses them"
-                )]
-                let jm = mats.get(j[k] as usize).unwrap_or(&IDENTITY);
-                let f = f64::from(w[k] / sum);
-                for (o, x) in m.iter_mut().zip(jm) {
-                    *o += f * x;
-                }
-            }
-            positions[v] = apply_point(&m, positions[v]);
-            if let Some(nv) = normals.get_mut(v) {
-                *nv = apply_normal(&normal_matrix(&m), *nv);
-            }
-        }
-        Ok(())
-    }
-
-    /// The texture coordinate set a material's color texture reads, and its
-    /// `KHR_texture_transform` as a 2x3 matrix (row-major).
-    fn uv_set(&self, material: Option<usize>) -> (u64, Option<[f32; 6]>) {
-        let Some(info) = material
-            .and_then(|m| list(&self.json, "materials").get(m))
-            .and_then(color_texture)
-        else {
-            return (0, None);
-        };
-        let mut set = info.get("texCoord").and_then(Value::as_u64).unwrap_or(0);
-        let Some(t) = info.get("extensions").and_then(|e| e.get("KHR_texture_transform")) else {
-            return (set, None);
-        };
-        if let Some(s) = t.get("texCoord").and_then(Value::as_u64) {
-            set = s;
-        }
-        let [ox, oy] = f32s(t.get("offset"), [0.0; 2]);
-        let [sx, sy] = f32s(t.get("scale"), [1.0; 2]);
-        let r = f32_of(t.get("rotation").and_then(Value::as_f64).unwrap_or(0.0));
-        let (sin, cos) = r.sin_cos();
-        // translation * rotation * scale, as the extension defines them.
-        (set, Some([cos * sx, sin * sy, ox, -sin * sx, cos * sy, oy]))
-    }
-
-    /// The mesh material for glTF material `i` (or glTF's default material).
-    fn material(&mut self, i: Option<usize>, mesh: &mut Mesh) -> usize {
-        let slot = match i {
-            Some(i) if i < self.materials.len() => self.materials[i],
-            _ => self.default_material,
-        };
-        if let Some(s) = slot {
-            return s;
-        }
-        let mut m = Material {
-            name: String::new(),
-            color: [1.0; 4],
-            color_image: None,
-            normal_image: None,
-            emissive: [0.0; 3],
-            metallic: 1.0,
-            roughness: 1.0,
-            double_sided: false,
-        };
-        let def = i.and_then(|i| list(&self.json, "materials").get(i)).cloned();
-        if let Some(d) = &def {
-            d.get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .clone_into(&mut m.name);
-            let sg = d
-                .get("extensions")
-                .and_then(|e| e.get("KHR_materials_pbrSpecularGlossiness"));
-            match (d.get("pbrMetallicRoughness"), sg) {
-                (None, Some(sg)) => {
-                    m.color = f32s(sg.get("diffuseFactor"), [1.0; 4]);
-                    m.metallic = 0.0;
-                    m.roughness = 1.0 - f32_of(sg.get("glossinessFactor").and_then(Value::as_f64).unwrap_or(1.0));
-                }
-                (pbr, _) => {
-                    let pbr = pbr.cloned().unwrap_or(Value::Null);
-                    m.color = f32s(pbr.get("baseColorFactor"), [1.0; 4]);
-                    m.metallic = f32_of(pbr.get("metallicFactor").and_then(Value::as_f64).unwrap_or(1.0));
-                    m.roughness = f32_of(pbr.get("roughnessFactor").and_then(Value::as_f64).unwrap_or(1.0));
-                }
-            }
-            m.emissive = f32s(d.get("emissiveFactor"), [0.0; 3]);
-            m.double_sided = d.get("doubleSided").and_then(Value::as_bool).unwrap_or(false);
-            if d.get("alphaMode").and_then(Value::as_str).unwrap_or("OPAQUE") == "OPAQUE" {
-                m.color[3] = 1.0;
-            }
-            if let Some(t) = color_texture(d).and_then(|t| index(t, "index")) {
-                m.color_image = self.texture(t, mesh);
-            }
-            if let Some(t) = d.get("normalTexture").and_then(|t| index(t, "index")) {
-                m.normal_image = self.texture(t, mesh);
-            }
-        }
-        mesh.materials.push(m);
-        let s = mesh.materials.len() - 1;
-        match i {
-            Some(i) if i < self.materials.len() => self.materials[i] = Some(s),
-            _ => self.default_material = Some(s),
-        }
-        s
-    }
-
-    /// The mesh image for glTF texture `t`: its source, or failing that one an extension
-    /// names (`EXT_texture_webp`, `KHR_texture_basisu`, ...), if an image can be made of it.
-    fn texture(&mut self, t: usize, mesh: &mut Mesh) -> Option<usize> {
-        let tex = list(&self.json, "textures").get(t)?.clone();
-        let mut sources: Vec<usize> = index(&tex, "source").into_iter().collect();
-        if let Some(ext) = tex.get("extensions").and_then(Value::as_object) {
-            sources.extend(ext.values().filter_map(|e| index(e, "source")));
-        }
-        sources.into_iter().find_map(|s| self.image(s, mesh))
-    }
-
-    fn image(&mut self, s: usize, mesh: &mut Mesh) -> Option<usize> {
-        if let Some(done) = *self.images.get(s)? {
-            return done;
-        }
-        let img = list(&self.json, "images").get(s)?.clone();
-        let mime = img.get("mimeType").and_then(Value::as_str);
-        let named = |mime: Option<&str>| {
-            PathBuf::from(match mime {
-                Some("image/jpeg") => "image.jpg",
-                Some("image/webp") => "image.webp",
-                Some("image/ktx2") => "image.ktx2",
-                _ => "image.png",
-            })
-        };
-        let image: Option<Image> = if let Some(v) = index(&img, "bufferView") {
-            self.view_bytes(v)
-                .ok()
-                .and_then(|b| self.assets.image(&b, &named(mime)))
-        } else {
-            match img.get("uri").and_then(Value::as_str) {
-                Some(uri) if uri.starts_with("data:") => container::data_uri(uri)
-                    .ok()
-                    .and_then(|(m, b)| self.assets.image(&b, &named(m.as_deref().or(mime)))),
-                Some(uri) => self
-                    .assets
-                    .find(&container::percent_decode(uri), self.input.dir())
-                    .and_then(|p| self.assets.load_image(&p)),
-                None => None,
-            }
-        };
-        let out = image.map(|i| {
-            mesh.images.push(i);
-            mesh.images.len() - 1
-        });
-        self.images[s] = Some(out);
-        out
-    }
-}
-
-/// A material's color texture info: `baseColorTexture`, or the specular-glossiness diffuse.
-fn color_texture(m: &Value) -> Option<&Value> {
-    m.get("pbrMetallicRoughness")
-        .and_then(|p| p.get("baseColorTexture"))
-        .or_else(|| {
-            m.get("extensions")?
-                .get("KHR_materials_pbrSpecularGlossiness")?
-                .get("diffuseTexture")
-        })
-}
-
-fn list_of_values(v: &Value, key: &str) -> Vec<Value> {
-    v.get(key).and_then(Value::as_array).cloned().unwrap_or_default()
-}
-
-/// A primitive's geometry at each of `transforms`, as one primitive.
-#[allow(clippy::float_cmp_const, reason = "only the exact identity may skip the transform")]
-fn place(g: Geometry, transforms: &[M4], material: usize) -> Prim {
-    if let [t] = transforms
-        && *t == IDENTITY
-    {
-        return Prim {
-            positions: g.positions,
-            normals: g.normals,
-            uvs: g.uvs,
-            colors: g.colors,
-            indices: g.indices,
-            material,
-        };
-    }
-    let n = g.positions.len();
-    let k = transforms.len();
-    let mut p = Prim {
-        positions: Vec::with_capacity(n * k),
-        normals: Vec::with_capacity(g.normals.len() * k),
-        uvs: Vec::with_capacity(g.uvs.len() * k),
-        colors: Vec::with_capacity(g.colors.len() * k),
-        indices: Vec::with_capacity(g.indices.len() * k),
-        material,
-    };
-    for t in transforms {
-        let base = u32_of(p.positions.len());
-        p.positions.extend(g.positions.iter().map(|&v| apply_point(t, v)));
-        let nm = normal_matrix(t);
-        p.normals.extend(g.normals.iter().map(|&v| apply_normal(&nm, v)));
-        p.uvs.extend_from_slice(&g.uvs);
-        p.colors.extend_from_slice(&g.colors);
-        let flip = det3(t) < 0.0;
-        for tri in g.indices.chunks_exact(3) {
-            let [a, b, c] = [tri[0] + base, tri[1] + base, tri[2] + base];
-            p.indices.extend_from_slice(&if flip { [a, c, b] } else { [a, b, c] });
-        }
-    }
-    p
-}
-
 #[cfg(all(test, feature = "fs"))]
-#[allow(clippy::cast_precision_loss, reason = "test grids are small")]
 mod tests {
-    use crate::assets::Folder;
-    use crate::mesh::{Material, Mesh, Prim, to_glb};
+    use std::path::{Path, PathBuf};
 
-    /// A bumpy grid with normals, UVs and colors, in two materials.
-    fn grid(n: u32) -> Mesh {
-        let mut prims = Vec::new();
-        for m in 0..2u32 {
-            let mut p = Prim {
-                material: m as usize,
-                ..Prim::default()
-            };
-            for y in 0..=n {
-                for x in 0..=n {
-                    let (u, v) = (x as f32 / n as f32, y as f32 / n as f32);
-                    p.positions.push([u + m as f32, (u * 7.0).sin() * 0.1, v]);
-                    p.normals.push([0.0, 1.0, 0.0]);
-                    p.uvs.push([u, v]);
-                    p.colors.push([u, v, 0.5, 1.0]);
-                }
-            }
-            for y in 0..n {
-                for x in 0..n {
-                    let i = y * (n + 1) + x;
-                    p.indices
-                        .extend_from_slice(&[i, i + n + 1, i + 1, i + 1, i + n + 1, i + n + 2]);
-                }
-            }
-            prims.push(p);
-        }
-        let mut red = Material::plain("Red", [1.0, 0.0, 0.0, 1.0]);
-        red.metallic = 0.5;
-        red.roughness = 0.25;
-        red.emissive = [0.1, 0.2, 0.3];
-        red.double_sided = true;
-        Mesh {
-            prims,
-            materials: vec![red, Material::plain("Blue", [0.0, 0.0, 1.0, 0.5])],
-            images: Vec::new(),
-        }
+    use serde_json::Value;
+
+    use crate::assets::Folder;
+    use crate::document::{Document, Keep};
+
+    /// A GLB's JSON and binary chunk.
+    fn split(glb: &[u8]) -> (Value, &[u8]) {
+        let n = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
+        let json = serde_json::from_slice(&glb[20..20 + n]).unwrap();
+        let bin = glb.get(20 + n + 8..).unwrap_or(&[]);
+        (json, bin)
     }
 
-    /// Each triangle's corners, rotated to start at its smallest, so triangles that begin at
-    /// another corner (as meshopt's triangle codec may write them) compare equal.
-    fn triangles(p: &Prim) -> Vec<[[u32; 12]; 3]> {
-        let key = |i: u32| {
-            let i = i as usize;
-            let f = |v: &[f32]| v.iter().map(|c| c.to_bits()).collect::<Vec<_>>();
-            let mut k = [0u32; 12];
-            let all = [f(&p.positions[i]), f(&p.normals[i]), f(&p.uvs[i]), f(&p.colors[i])].concat();
-            k.copy_from_slice(&all);
-            k
-        };
-        let mut out: Vec<_> = p
-            .indices
-            .chunks(3)
-            .map(|t| {
-                let c = [key(t[0]), key(t[1]), key(t[2])];
-                let r = (0..3).min_by_key(|&s| c[s]).unwrap();
-                [c[r], c[(r + 1) % 3], c[(r + 2) % 3]]
+    /// The bytes of each buffer view.
+    fn views(json: &Value, bin: &[u8]) -> Vec<Vec<u8>> {
+        let empty = Vec::new();
+        let list = json["bufferViews"].as_array().unwrap_or(&empty);
+        list.iter()
+            .map(|v| {
+                if v["buffer"].as_u64() != Some(0) {
+                    return Vec::new();
+                }
+                let off = usize::try_from(v["byteOffset"].as_u64().unwrap_or(0)).unwrap();
+                let len = usize::try_from(v["byteLength"].as_u64().unwrap()).unwrap();
+                bin[off..off + len].to_vec()
             })
-            .collect();
-        out.sort_unstable();
+            .collect()
+    }
+
+    /// The JSON without what writing may restate: views' default `byteOffset` and where in the
+    /// binary chunk each view sits.
+    fn normalized(mut json: Value) -> Value {
+        for v in json["bufferViews"].as_array_mut().into_iter().flatten() {
+            let o = v.as_object_mut().unwrap();
+            if o.get("buffer").and_then(Value::as_u64) == Some(0) {
+                o.remove("byteOffset");
+            }
+        }
+        if let Some(b) = json.get_mut("buffers").and_then(|b| b.get_mut(0)) {
+            b.as_object_mut().unwrap().remove("byteLength");
+        }
+        json
+    }
+
+    fn glbs() -> Vec<PathBuf> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/gltf");
+        let mut out = Vec::new();
+        for case in std::fs::read_dir(root).unwrap().flatten() {
+            for f in std::fs::read_dir(case.path()).unwrap().flatten() {
+                if f.path().extension().is_some_and(|e| e == "glb") {
+                    out.push(f.path());
+                }
+            }
+        }
+        out.sort();
         out
     }
 
-    fn load(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Mesh {
-        let path = dir.join(name);
-        std::fs::write(&path, bytes).unwrap();
-        let ext = name.rsplit('.').next().unwrap();
-        let mesh = crate::formats::load(&path, ext, &Folder::new(dir))
-            .unwrap()
-            .mesh
-            .unwrap();
-        // From memory, with the folder's files as the assets, it reads the same.
-        let mut memory = crate::assets::Memory::new();
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let p = entry.unwrap().path();
-            memory.insert(&p.file_name().unwrap().to_string_lossy(), std::fs::read(&p).unwrap());
-        }
-        let in_memory = crate::formats::load_bytes(bytes, name, ext, &memory)
-            .unwrap()
-            .mesh
-            .unwrap();
-        assert!(
-            to_glb(&mesh).unwrap() == to_glb(&in_memory).unwrap(),
-            "{name} reads differently from memory"
-        );
-        mesh
-    }
-
-    fn same(a: &Mesh, b: &Mesh) {
-        assert_eq!(a.prims.len(), b.prims.len());
-        for (pa, pb) in a.prims.iter().zip(&b.prims) {
-            assert_eq!(triangles(pa), triangles(pb));
-            assert_eq!(pa.material, pb.material);
-        }
-        for (ma, mb) in a.materials.iter().zip(&b.materials) {
-            assert_eq!(
-                (
-                    &ma.name,
-                    ma.color,
-                    ma.emissive,
-                    ma.metallic,
-                    ma.roughness,
-                    ma.double_sided
-                ),
-                (
-                    &mb.name,
-                    mb.color,
-                    mb.emissive,
-                    mb.metallic,
-                    mb.roughness,
-                    mb.double_sided
-                )
+    #[test]
+    fn glb_round_trips() {
+        let mut n = 0;
+        for path in glbs() {
+            let dir = path.parent().unwrap();
+            let Ok(doc) = crate::formats::load(&path, "glb", &Folder::new(dir), Keep::ALL) else {
+                // Cases that are meant to fail.
+                continue;
+            };
+            let original = std::fs::read(&path).unwrap();
+            let written = doc.to_glb().unwrap();
+            let (a, abin) = split(&original);
+            let (b, bbin) = split(&written);
+            let name = path.display();
+            assert_eq!(normalized(a.clone()), normalized(b.clone()), "{name}: the JSON changed");
+            assert!(
+                views(&a, abin) == views(&b, bbin),
+                "{name}: a buffer view's bytes changed"
             );
+            // And again, now exactly.
+            let again = crate::formats::load_bytes(&written, "x.glb", "glb", &crate::assets::Memory::new(), Keep::ALL)
+                .and_then(|d: Document<'_>| d.to_glb())
+                .unwrap();
+            assert!(again == written, "{name}: a second round trip changed it");
+            n += 1;
         }
-    }
-
-    #[test]
-    fn reads_back_what_to_glb_writes() {
-        let dir = tempfile::tempdir().unwrap();
-        let mesh = grid(30);
-        let glb = to_glb(&mesh).unwrap();
-        same(&mesh, &load(dir.path(), "plain.glb", &glb));
-    }
-
-    #[test]
-    fn streamed_glb_cut_short_is_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let glb = to_glb(&grid(60)).unwrap();
-        assert!(glb.len() > 2 * super::HEAD);
-        let path = dir.path().join("cut.glb");
-        std::fs::write(&path, &glb[..glb.len() - 1000]).unwrap();
-        let err = crate::formats::load(&path, "glb", &Folder::new(dir.path())).unwrap_err();
-        assert!(err.to_string().contains("declares"), "{err}");
-    }
-
-    #[test]
-    fn reads_meshopt_compressed_glb() {
-        let dir = tempfile::tempdir().unwrap();
-        let mesh = grid(30);
-        let packed = crate::gltf::compress(&to_glb(&mesh).unwrap()).unwrap();
-        same(&mesh, &load(dir.path(), "packed.glb", &packed));
-    }
-
-    #[test]
-    fn reads_meshopt_compressed_gltf_with_external_buffers() {
-        // A compressed GLB split into a .gltf and its buffer files.
-        let dir = tempfile::tempdir().unwrap();
-        let mesh = grid(10);
-        let packed = crate::gltf::compress(&to_glb(&mesh).unwrap()).unwrap();
-        let json_len = u32::from_le_bytes(packed[12..16].try_into().unwrap()) as usize;
-        let mut json: serde_json::Value = serde_json::from_slice(&packed[20..20 + json_len]).unwrap();
-        let bin = &packed[20 + json_len + 8..];
-        json["buffers"][0]["uri"] = "packed.bin".into();
-        std::fs::write(dir.path().join("packed.bin"), bin).unwrap();
-        same(
-            &mesh,
-            &load(dir.path(), "packed.gltf", &serde_json::to_vec(&json).unwrap()),
-        );
+        assert!(n > 20, "only {n} GLBs round-tripped");
     }
 }

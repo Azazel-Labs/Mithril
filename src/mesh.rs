@@ -1,8 +1,7 @@
 //! A model as plain triangle lists: what the format readers produce, written out as a GLB.
 
-use serde_json::{Value, json};
-
 use crate::Result;
+use crate::document::Document;
 use crate::num::u32_of;
 
 /// The most triangles a reader accepts, against hostile or runaway files.
@@ -89,17 +88,25 @@ impl Image {
     /// extension.
     #[must_use]
     pub fn png_or_jpeg(bytes: &[u8]) -> Option<Self> {
-        let mime = if bytes.starts_with(b"\x89PNG") {
-            "image/png"
+        Self::mime_of(bytes)?;
+        Self::from_png_or_jpeg(bytes.to_vec())
+    }
+
+    /// [`Image::png_or_jpeg`], taking the bytes without a copy.
+    #[must_use]
+    pub fn from_png_or_jpeg(bytes: Vec<u8>) -> Option<Self> {
+        let mime = Self::mime_of(&bytes)?;
+        Some(Self { bytes, mime })
+    }
+
+    fn mime_of(bytes: &[u8]) -> Option<&'static str> {
+        if bytes.starts_with(b"\x89PNG") {
+            Some("image/png")
         } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-            "image/jpeg"
+            Some("image/jpeg")
         } else {
-            return None;
-        };
-        Some(Self {
-            bytes: bytes.to_vec(),
-            mime,
-        })
+            None
+        }
     }
 }
 
@@ -295,135 +302,8 @@ impl Welder {
 ///
 /// When the mesh has nothing to draw.
 pub fn to_glb(mesh: &Mesh) -> Result<Vec<u8>> {
-    let mut bin: Vec<u8> = Vec::new();
-    let mut views: Vec<Value> = Vec::new();
-    let mut push_view = |bin: &mut Vec<u8>, bytes: &[u8], target: Option<u32>| -> usize {
-        let offset = bin.len();
-        bin.extend_from_slice(bytes);
-        bin.resize(bin.len().div_ceil(4) * 4, 0);
-        let mut v = json!({ "buffer": 0, "byteOffset": offset, "byteLength": bytes.len() });
-        if let Some(t) = target {
-            v["target"] = json!(t);
-        }
-        views.push(v);
-        views.len() - 1
-    };
-    let mut accessors = Vec::new();
-    let mut primitives = Vec::new();
-    for p in &mesh.prims {
-        if p.indices.is_empty() {
-            continue;
-        }
-        let f32s = |v: &[f32]| v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>();
-        let pv = push_view(&mut bin, &f32s(p.positions.as_flattened()), Some(34962));
-        // Without normals, glTF clients shade flat.
-        let nv = (p.normals.len() == p.positions.len())
-            .then(|| push_view(&mut bin, &f32s(p.normals.as_flattened()), Some(34962)));
-        let iv = push_view(
-            &mut bin,
-            &p.indices.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>(),
-            Some(34963),
-        );
-        let (mut min, mut max) = ([f32::MAX; 3], [f32::MIN; 3]);
-        for v in &p.positions {
-            for k in 0..3 {
-                min[k] = min[k].min(v[k]);
-                max[k] = max[k].max(v[k]);
-            }
-        }
-        let a = accessors.len();
-        accessors.push(json!({ "bufferView": pv, "componentType": 5126, "count": p.positions.len(), "type": "VEC3", "min": min, "max": max }));
-        let mut attributes = json!({ "POSITION": a });
-        if let Some(nv) = nv {
-            accessors
-                .push(json!({ "bufferView": nv, "componentType": 5126, "count": p.normals.len(), "type": "VEC3" }));
-            attributes["NORMAL"] = json!(accessors.len() - 1);
-        }
-        let ia = accessors.len();
-        accessors.push(json!({ "bufferView": iv, "componentType": 5125, "count": p.indices.len(), "type": "SCALAR" }));
-        if p.uvs.len() == p.positions.len() {
-            let uv = push_view(&mut bin, &f32s(p.uvs.as_flattened()), Some(34962));
-            accessors.push(json!({ "bufferView": uv, "componentType": 5126, "count": p.uvs.len(), "type": "VEC2" }));
-            attributes["TEXCOORD_0"] = json!(accessors.len() - 1);
-        }
-        if p.colors.len() == p.positions.len() {
-            let clamped: Vec<f32> = p.colors.as_flattened().iter().map(|c| c.clamp(0.0, 1.0)).collect();
-            let cv = push_view(&mut bin, &f32s(&clamped), Some(34962));
-            accessors.push(json!({ "bufferView": cv, "componentType": 5126, "count": p.colors.len(), "type": "VEC4" }));
-            attributes["COLOR_0"] = json!(accessors.len() - 1);
-        }
-        primitives.push(json!({ "attributes": attributes, "indices": ia, "material": p.material.min(mesh.materials.len().saturating_sub(1)) }));
-    }
-    ensure!(!primitives.is_empty(), "nothing to draw");
-    let mut images = Vec::new();
-    for img in &mesh.images {
-        let v = push_view(&mut bin, &img.bytes, None);
-        images.push(json!({ "bufferView": v, "mimeType": img.mime }));
-    }
-    let materials: Vec<Value> = mesh
-        .materials
-        .iter()
-        .map(|m| {
-            let color = m.color.map(|c| c.clamp(0.0, 1.0));
-            let mut pbr = json!({
-                "baseColorFactor": color,
-                "metallicFactor": m.metallic.clamp(0.0, 1.0),
-                "roughnessFactor": m.roughness.clamp(0.0, 1.0),
-            });
-            if let Some(i) = m.color_image.filter(|&i| i < images.len()) {
-                pbr["baseColorTexture"] = json!({ "index": i });
-            }
-            let mut mat = json!({ "name": m.name, "pbrMetallicRoughness": pbr });
-            if let Some(i) = m.normal_image.filter(|&i| i < images.len()) {
-                mat["normalTexture"] = json!({ "index": i });
-            }
-            if m.color[3] < 1.0 {
-                mat["alphaMode"] = json!("BLEND");
-            }
-            if m.emissive.iter().any(|&e| e > 0.0) {
-                mat["emissiveFactor"] = json!(m.emissive.map(|e| e.clamp(0.0, 1.0)));
-            }
-            if m.double_sided {
-                mat["doubleSided"] = json!(true);
-            }
-            mat
-        })
-        .collect();
-    let mut doc = json!({
-        "asset": { "version": "2.0", "generator": "mithril" },
-        "scene": 0,
-        "scenes": [{ "nodes": [0] }],
-        "nodes": [{ "mesh": 0 }],
-        "meshes": [{ "primitives": primitives }],
-        "materials": materials,
-        "accessors": accessors,
-        "bufferViews": views,
-        "buffers": [{ "byteLength": bin.len() }],
-    });
-    if !images.is_empty() {
-        // One texture per image, all sharing a repeating, mipmapped sampler.
-        doc["samplers"] = json!([{ "magFilter": 9729, "minFilter": 9987, "wrapS": 10497, "wrapT": 10497 }]);
-        doc["textures"] = json!(
-            (0..images.len())
-                .map(|i| json!({ "sampler": 0, "source": i }))
-                .collect::<Vec<_>>()
-        );
-        doc["images"] = json!(images);
-    }
-    let mut json_bytes = serde_json::to_vec(&doc)?;
-    json_bytes.resize(json_bytes.len().div_ceil(4) * 4, b' ');
-    let total = 12 + 8 + json_bytes.len() + 8 + bin.len();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(b"glTF");
-    out.extend_from_slice(&2u32.to_le_bytes());
-    out.extend_from_slice(&u32::try_from(total)?.to_le_bytes());
-    out.extend_from_slice(&u32::try_from(json_bytes.len())?.to_le_bytes());
-    out.extend_from_slice(b"JSON");
-    out.extend(json_bytes);
-    out.extend_from_slice(&u32::try_from(bin.len())?.to_le_bytes());
-    out.extend_from_slice(b"BIN\0");
-    out.extend(bin);
-    Ok(out)
+    ensure!(mesh.prims.iter().any(|p| !p.indices.is_empty()), "nothing to draw");
+    Document::from_mesh(mesh.clone(), serde_json::Map::new()).to_glb()
 }
 
 /// Triangulates one polygon face, its corners in order, appending triangles as indices into

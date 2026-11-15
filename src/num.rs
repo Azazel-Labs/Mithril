@@ -7,7 +7,6 @@
     clippy::cast_possible_truncation,
     reason = "rounding to single precision is the point"
 )]
-#[cfg(any(feature = "gltf", feature = "usd", feature = "fbx", feature = "ply"))]
 #[inline]
 pub(crate) fn f32_of(x: f64) -> f32 {
     x as f32
