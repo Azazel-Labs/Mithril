@@ -7,6 +7,8 @@
 //! - [`Document::flatten`] derives the flat, posed triangle [`Mesh`] (for counting, previews or
 //!   tools that want plain triangles), and [`Document::counts`] counts what it draws from the
 //!   JSON alone.
+//! - [`Document::decode`] rewrites it as plain glTF 2.0: meshopt and Draco decoded, quantized
+//!   attributes as floats.
 //! - [`Document::prune`] drops what a [`Keep`] doesn't keep (animations, skins, materials, ...);
 //!   the loaders in [`formats`](crate::formats) apply it.
 //!

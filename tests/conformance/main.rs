@@ -230,6 +230,83 @@ fn poses(e: &Map<String, Value>, doc: &Document<'_>, tol: f32) -> Result<(), Str
     Ok(())
 }
 
+/// `Document::decode`: the case decoded, written as a GLB and read back, has no compression or quantization left
+/// and flattens to the mesh it did.
+fn decoded(case: &Case, ext: &str, want: Option<&Mesh>, tol: f32) -> Result<(), String> {
+    let mut doc = formats::load(&case.file, ext, &Folder::new(&case.dir), Keep::ALL).map_err(|e| e.to_string())?;
+    doc.decode().map_err(|err| format!("doesn't decode: {err}"))?;
+    let text = serde_json::to_string(&doc.json).unwrap();
+    for name in [
+        "EXT_meshopt_compression",
+        "KHR_meshopt_compression",
+        "KHR_draco_mesh_compression",
+        "KHR_mesh_quantization",
+    ] {
+        if text.contains(name) {
+            return Err(format!("decoded, it still mentions {name}"));
+        }
+    }
+    let accessors = doc
+        .json
+        .get("accessors")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let prims = doc.json.get("meshes").and_then(Value::as_array).into_iter().flatten();
+    for p in prims.flat_map(|m| m["primitives"].as_array().cloned().unwrap_or_default()) {
+        let targets = p.get("targets").and_then(Value::as_array).cloned().unwrap_or_default();
+        for set in std::iter::once(&p["attributes"]).chain(&targets) {
+            for (name, a) in set.as_object().into_iter().flatten() {
+                let float = matches!(name.as_str(), "POSITION" | "NORMAL" | "TANGENT") || name.starts_with("TEXCOORD_");
+                let ctype = accessors[a.as_u64().unwrap() as usize]["componentType"].as_u64();
+                if float && ctype != Some(5126) {
+                    return Err(format!("decoded, its {name} has component type {ctype:?}"));
+                }
+            }
+        }
+    }
+    let glb = doc
+        .to_glb()
+        .map_err(|err| format!("decoded, it doesn't write as GLB: {err}"))?;
+    gltf::Gltf::from_slice(&glb).map_err(|err| format!("decoded, the gltf crate rejects it: {err}"))?;
+    let none = Memory::new();
+    let back = formats::load_bytes(&glb, "decoded.glb", "glb", &none, Keep::ALL)
+        .map_err(|err| format!("decoded, its GLB doesn't read back: {err}"))?;
+    let got = back
+        .flatten(Pose::Rest)
+        .map_err(|err| format!("decoded, it doesn't flatten: {err}"))?;
+    let (want, got) = match (want, got.as_ref()) {
+        (None, None) => return Ok(()),
+        (Some(w), Some(g)) => (w, g),
+        (w, g) => {
+            return Err(format!(
+                "decoded, it draws {:?} triangles, not {:?}",
+                g.map(Mesh::triangles),
+                w.map(Mesh::triangles)
+            ));
+        }
+    };
+    if want.prims.len() != got.prims.len() {
+        return Err(format!(
+            "decoded, it has {} primitives, not {}",
+            got.prims.len(),
+            want.prims.len()
+        ));
+    }
+    for (i, (w, g)) in want.prims.iter().zip(&got.prims).enumerate() {
+        let same = w.indices == g.indices
+            && w.material == g.material
+            && close(w.positions.as_flattened(), g.positions.as_flattened(), tol)
+            && close(w.normals.as_flattened(), g.normals.as_flattened(), tol)
+            && close(w.uvs.as_flattened(), g.uvs.as_flattened(), tol)
+            && close(w.colors.as_flattened(), g.colors.as_flattened(), tol);
+        if !same {
+            return Err(format!("decoded, its primitive {i} draws differently"));
+        }
+    }
+    Ok(())
+}
+
 /// Writes the case's document as a GLB under `target/conformance/`, for the Khronos validator.
 fn keep_glb(case: &Case, doc: &Document<'_>) -> Result<(), String> {
     let rel = relative(&case.dir, &corpus());
@@ -269,6 +346,7 @@ fn run(case: &Case) -> Result<(), String> {
     }
     document(e, &doc)?;
     poses(e, &doc, tol)?;
+    decoded(case, &ext, mesh.as_ref(), tol)?;
     if e.get("no_mesh").and_then(Value::as_bool) == Some(true) {
         return match mesh {
             None => Ok(()),

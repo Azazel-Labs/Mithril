@@ -25,9 +25,11 @@ Early. What exists today:
   buffers back as they are, compression included, with images embedded. The other formats
   are converted into it. `Document::flatten(Pose)` derives a flat, posed triangle
   `mesh::Mesh` (transforms, instances, skins and morphs baked in), and `Document::counts`
-  counts triangles, points and lines from the JSON alone. A `Keep` passed to the load says
-  what to keep: everything by default, or for instance `Keep { animations: false,
-  ..Keep::ALL }` for static meshes that still carry their skins.
+  counts triangles, points and lines from the JSON alone. `Document::decode` rewrites it
+  as plain glTF any reader takes: meshopt views and Draco primitives decoded, quantized
+  attributes turned into floats, the scene graph, animation and materials untouched. A
+  `Keep` passed to the load says what to keep: everything by default, or for instance
+  `Keep { animations: false, ..Keep::ALL }` for static meshes that still carry their skins.
 - **Conformance corpus**: 489 cases under `tests/corpus`, each a file and the GLB it must
   become. They cover every format above and the variants exporters really write: OBJ's face
   forms and MTL dialects, both PLY byte orders, every FBX version and axis system, and USD's
@@ -79,9 +81,10 @@ mithril = { version = "0.1", default-features = false, features = ["stl", "ply",
 use mithril::{assets::Memory, document::{Keep, Pose}, formats};
 
 let assets = Memory::new().with("scene.bin", bin).with("albedo.png", png);
-let doc = formats::load_bytes(&gltf, "scene.gltf", "gltf", &assets, Keep::ALL)?;
+let mut doc = formats::load_bytes(&gltf, "scene.gltf", "gltf", &assets, Keep::ALL)?;
 let glb = doc.to_glb()?; // the scene, losslessly
 let mesh = doc.flatten(Pose::Rest)?; // or flat triangles
+doc.decode()?; // or plain glTF, for a reader without Draco, meshopt or quantization
 ```
 
 ### Minimum Rust

@@ -22,6 +22,8 @@
 //! Accessors are read from a buffer in place when it's in memory, and a block at a time from a
 //! file, so the peak is little more than the mesh.
 
+mod decode;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -1692,6 +1694,30 @@ mod tests {
         let mesh = grid(30);
         let packed = crate::gltf::compress(&to_glb(&mesh).unwrap()).unwrap();
         same(&mesh, &load(dir.path(), "packed.glb", &packed));
+    }
+
+    #[test]
+    fn decode_leaves_plain_gltf() {
+        let dir = tempfile::tempdir().unwrap();
+        let mesh = grid(30);
+        let packed = crate::gltf::compress(&to_glb(&mesh).unwrap()).unwrap();
+        let path = dir.path().join("packed.glb");
+        std::fs::write(&path, &packed).unwrap();
+        let mut doc = crate::formats::load(&path, "glb", &Folder::new(dir.path()), Keep::ALL).unwrap();
+        assert_eq!(doc.json["buffers"].as_array().unwrap().len(), 2, "data and fallback");
+        let before = doc.flatten(Pose::Rest).unwrap().unwrap();
+        doc.decode().unwrap();
+        let text = serde_json::to_string(&doc.json).unwrap();
+        assert!(!text.contains("meshopt"), "{text}");
+        // The compressed data and the fallback are gone: only the decoded buffer is left.
+        assert_eq!(doc.json["buffers"].as_array().unwrap().len(), 1);
+        let after = doc.flatten(Pose::Rest).unwrap().unwrap();
+        assert!(to_glb(&before).unwrap() == to_glb(&after).unwrap());
+        same(&mesh, &load(dir.path(), "decoded.glb", &doc.to_glb().unwrap()));
+        // Decoding plain glTF changes nothing.
+        let glb = doc.to_glb().unwrap();
+        doc.decode().unwrap();
+        assert!(glb == doc.to_glb().unwrap());
     }
 
     #[test]
