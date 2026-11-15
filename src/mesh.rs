@@ -3,6 +3,7 @@
 use serde_json::{Value, json};
 
 use crate::Result;
+use crate::num::u32_of;
 
 /// The most triangles a reader accepts, against hostile or runaway files.
 pub const MAX_TRIANGLES: usize = 4_000_000;
@@ -40,6 +41,7 @@ pub struct Material {
 
 impl Material {
     /// A material of one color, without textures.
+    #[must_use]
     pub fn plain(name: &str, color: [f32; 4]) -> Self {
         Self {
             name: name.to_owned(),
@@ -73,6 +75,7 @@ pub struct Mesh {
 
 impl Mesh {
     /// The number of triangles across all primitives.
+    #[must_use]
     pub fn triangles(&self) -> usize {
         self.prims.iter().map(|p| p.indices.len() / 3).sum()
     }
@@ -84,6 +87,7 @@ pub const GRAY: [f32; 4] = [0.72, 0.72, 0.74, 1.0];
 impl Image {
     /// `bytes` as an image when they are PNG or JPEG, the formats glTF embeds without an
     /// extension.
+    #[must_use]
     pub fn png_or_jpeg(bytes: &[u8]) -> Option<Self> {
         let mime = if bytes.starts_with(b"\x89PNG") {
             "image/png"
@@ -100,6 +104,7 @@ impl Image {
 }
 
 /// An sRGB-encoded color channel in linear light.
+#[must_use]
 pub fn srgb_to_linear(c: f32) -> f32 {
     if c <= 0.040_45 {
         c / 12.92
@@ -109,6 +114,7 @@ pub fn srgb_to_linear(c: f32) -> f32 {
 }
 
 /// Smooth normals from the triangles, for models that don't carry any.
+#[must_use]
 pub fn smooth_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
     let mut nrm = vec![[0.0f32; 3]; positions.len()];
     for t in indices.as_chunks::<3>().0 {
@@ -204,7 +210,12 @@ impl Welder {
     fn slot(&self, key: [u32; 3]) -> usize {
         let h = (u64::from(key[0]) | u64::from(key[1]) << 32).wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ u64::from(key[2]).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
-        (h >> self.shift) as usize
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "`shift` leaves only as many bits as the table has slots"
+        )]
+        let slot = (h >> self.shift) as usize;
+        slot
     }
 
     /// The index of point `p`, added if it's new.
@@ -225,7 +236,7 @@ impl Welder {
             }
             i = (i + 1) & mask;
         }
-        let at = self.positions.len() as u32;
+        let at = u32_of(self.positions.len());
         self.positions.push(p);
         self.table[i] = at + 1;
         // Keep the table at most 5/8 full.
@@ -245,7 +256,7 @@ impl Welder {
             while self.table[i] != 0 {
                 i = (i + 1) & mask;
             }
-            self.table[i] = at as u32 + 1;
+            self.table[i] = u32_of(at) + 1;
         }
     }
 
@@ -279,6 +290,10 @@ impl Welder {
 }
 
 /// A GLB with one mesh: a primitive per `Prim`, its materials, and the images embedded.
+///
+/// # Errors
+///
+/// When the mesh has nothing to draw.
 pub fn to_glb(mesh: &Mesh) -> Result<Vec<u8>> {
     let mut bin: Vec<u8> = Vec::new();
     let mut views: Vec<Value> = Vec::new();
@@ -444,7 +459,7 @@ pub(crate) fn triangulate(corners: &[[f32; 3]], out: &mut Vec<[u32; 3]>) {
         .max_by(|&i, &j| nrm[i].abs().total_cmp(&nrm[j].abs()))
         .unwrap_or(2);
     if nrm[axis] == 0.0 || n > 4096 {
-        out.extend((1..n as u32 - 1).map(|k| [0, k, k + 1]));
+        out.extend((1..u32_of(n) - 1).map(|k| [0, k, k + 1]));
         return;
     }
     // Project so the polygon winds counter-clockwise in 2D.
@@ -468,7 +483,7 @@ pub(crate) fn triangulate(corners: &[[f32; 3]], out: &mut Vec<[u32; 3]>) {
         let mut count = 0;
         for k in 0..4 {
             if turn(k) < 0.0 {
-                r = Some(k as u32);
+                r = Some(u32_of(k));
                 count += 1;
             }
         }
@@ -485,7 +500,7 @@ pub(crate) fn triangulate(corners: &[[f32; 3]], out: &mut Vec<[u32; 3]>) {
             _ => {}
         }
     }
-    let all: Vec<u32> = (0..n as u32).collect();
+    let all: Vec<u32> = (0..u32_of(n)).collect();
     let p: Vec<[f64; 2]> = corners.iter().map(to2).collect();
     if (0..n).all(|i| cross(p[i], p[(i + 1) % n], p[(i + 2) % n]) >= 0.0) {
         fan(out, &all);
@@ -561,7 +576,7 @@ mod triangulate_tests {
 }
 
 /// A multiply-rotate hasher (the Fx hash) for small integer keys: much faster than the
-/// default SipHash, and keys here come from the file being read, not from an attacker who can
+/// default `SipHash`, and keys here come from the file being read, not from an attacker who can
 /// see the hash.
 #[cfg(any(feature = "ply", feature = "3ds"))]
 #[derive(Default, Clone, Copy)]
@@ -579,7 +594,7 @@ impl std::hash::Hasher for FxHasher {
     }
     #[inline]
     fn write_u32(&mut self, n: u32) {
-        self.write_u64(n as u64);
+        self.write_u64(u64::from(n));
     }
     #[inline]
     fn write_u64(&mut self, n: u64) {

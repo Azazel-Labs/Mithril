@@ -31,6 +31,7 @@ use super::Input;
 use crate::assets::Assets;
 use crate::gltf as container;
 use crate::mesh::{Image, MAX_TRIANGLES, Material, Mesh, Prim};
+use crate::num::{f32_of, u32_of, usize_of};
 use crate::{Context as _, Result};
 
 /// How much of a buffer is read at once.
@@ -94,7 +95,7 @@ impl Buf<'_> {
                 file.read_exact(out)?;
                 *at = end;
             }
-            Buf::Mem(v) => out.copy_from_slice(&v[off as usize..end as usize]),
+            Buf::Mem(v) => out.copy_from_slice(&v[usize_of(off)..usize_of(end)]),
         }
         Ok(())
     }
@@ -154,7 +155,8 @@ struct Reader<'a> {
     materials: Vec<Option<usize>>,
     /// The material for primitives that name none.
     default_material: Option<usize>,
-    /// glTF image → mesh image, once tried.
+    /// glTF image → mesh image, once tried: `None` until then, `Some(None)` if it didn't embed.
+    #[allow(clippy::option_option, reason = "untried and tried-but-failed are both cached")]
     images: Vec<Option<Option<usize>>>,
     /// Every node's world transform, for joints.
     world: Vec<M4>,
@@ -169,7 +171,7 @@ fn list<'v>(obj: &'v Map<String, Value>, key: &str) -> &'v [Value] {
 }
 
 fn index(v: &Value, key: &str) -> Option<usize> {
-    v.get(key)?.as_u64().map(|i| i as usize)
+    v.get(key)?.as_u64().map(usize_of)
 }
 
 fn floats<const N: usize>(v: Option<&Value>, default: [f64; N]) -> [f64; N] {
@@ -183,7 +185,7 @@ fn floats<const N: usize>(v: Option<&Value>, default: [f64; N]) -> [f64; N] {
 }
 
 fn f32s<const N: usize>(v: Option<&Value>, default: [f32; N]) -> [f32; N] {
-    floats(v, default.map(f64::from)).map(|x| x as f32)
+    floats(v, default.map(f64::from)).map(f32_of)
 }
 
 /// `rel` when it's a plain relative path that stays inside the model's folder.
@@ -230,10 +232,9 @@ fn glb_layout(
     ensure!(&head[16..20] == b"JSON", "GLB doesn't start with a JSON chunk");
     let json_len = u64::from(u32_at(&head, 12));
     ensure!(20 + json_len <= total, "GLB is truncated");
-    let text = read(20, json_len as usize)?;
-    let json = match serde_json::from_slice(&text).context("GLB JSON doesn't parse")? {
-        Value::Object(m) => m,
-        _ => bail!("glTF JSON is not an object"),
+    let text = read(20, usize_of(json_len))?;
+    let Value::Object(json) = serde_json::from_slice(&text).context("GLB JSON doesn't parse")? else {
+        bail!("glTF JSON is not an object")
     };
     let at = (20 + json_len).next_multiple_of(4);
     let mut bin = None;
@@ -253,12 +254,12 @@ fn glb_in_memory(bytes: Cow<'_, [u8]>) -> Result<(Map<String, Value>, Option<Buf
     let total = bytes.len() as u64;
     let (json, bin) = glb_layout(total, |off, len| {
         bytes
-            .get(off as usize..off as usize + len)
+            .get(usize_of(off)..usize_of(off).saturating_add(len))
             .map(<[u8]>::to_vec)
             .context("GLB is truncated")
     })?;
     let bin = bin.map(|(base, len)| {
-        let (base, end) = (base as usize, (base + len) as usize);
+        let (base, end) = (usize_of(base), usize_of(base + len));
         Buf::Mem(match bytes {
             Cow::Borrowed(b) => Cow::Borrowed(&b[base..end]),
             Cow::Owned(mut v) => {
@@ -299,7 +300,7 @@ fn open_file(path: &Path) -> Result<(Map<String, Value>, Option<Buf<'static>>)> 
     }
     let mut pos = head.len() as u64;
     let (json, bin) = glb_layout(total, |off, len| {
-        if let Some(b) = head.get(off as usize..off as usize + len) {
+        if let Some(b) = head.get(usize_of(off)..usize_of(off).saturating_add(len)) {
             return Ok(b.to_vec());
         }
         let mut b = vec![0; len];
@@ -442,7 +443,7 @@ impl<'a> Reader<'a> {
             offset.saturating_add(len) <= b.len(),
             "glTF buffer view runs past its buffer"
         );
-        let mut out = vec![0; len as usize];
+        let mut out = vec![0; usize::try_from(len).context("glTF buffer view is too big to hold")?];
         b.read_at(offset, &mut out)?;
         Ok(out)
     }
@@ -501,7 +502,7 @@ impl<'a> Reader<'a> {
         ensure!(start + span <= b.len(), "glTF buffer view runs past its buffer");
         #[cfg_attr(not(feature = "fs"), allow(irrefutable_let_patterns))]
         if let Buf::Mem(v) = b {
-            f(0, &v[start as usize..(start + span) as usize], stride);
+            f(0, &v[usize_of(start)..usize_of(start + span)], stride);
             self.scratch = scratch;
             return Ok(());
         }
@@ -558,8 +559,10 @@ impl<'a> Reader<'a> {
                 }),
                 (5121, true) => put(out, bytes, stride, cs, m, |b| f32::from(b[0]) / 255.0),
                 (5121, false) => put(out, bytes, stride, cs, m, |b| f32::from(b[0])),
-                (5120, true) => put(out, bytes, stride, cs, m, |b| (f32::from(b[0] as i8) / 127.0).max(-1.0)),
-                (5120, false) => put(out, bytes, stride, cs, m, |b| f32::from(b[0] as i8)),
+                (5120, true) => put(out, bytes, stride, cs, m, |b| {
+                    (f32::from(b[0].cast_signed()) / 127.0).max(-1.0)
+                }),
+                (5120, false) => put(out, bytes, stride, cs, m, |b| f32::from(b[0].cast_signed())),
                 (5123, true) => put(out, bytes, stride, cs, m, |b| {
                     f32::from(u16::from_le_bytes([b[0], b[1]])) / 65535.0
                 }),
@@ -572,6 +575,10 @@ impl<'a> Reader<'a> {
                 (5122, false) => put(out, bytes, stride, cs, m, |b| {
                     f32::from(i16::from_le_bytes([b[0], b[1]]))
                 }),
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "past 2^24 an f32 attribute rounds, as in any viewer"
+                )]
                 _ => put(out, bytes, stride, cs, m, |b| {
                     u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32
                 }),
@@ -732,7 +739,7 @@ impl<'a> Reader<'a> {
             }
             (0..nodes.len()).filter(|&i| !child[i]).collect()
         } else {
-            let s = self.json.get("scene").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let s = self.json.get("scene").and_then(Value::as_u64).map_or(0, usize_of);
             list_of(scenes.get(s).context("glTF default scene doesn't exist")?, "nodes")
         };
 
@@ -757,7 +764,7 @@ impl<'a> Reader<'a> {
                 .get("weights")
                 .or_else(|| list(&self.json, "meshes").get(mesh).and_then(|m| m.get("weights")))
                 .and_then(Value::as_array)
-                .map(|w| w.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect())
+                .map(|w| w.iter().map(|x| f32_of(x.as_f64().unwrap_or(0.0))).collect())
                 .unwrap_or_default();
             let w = world[i].unwrap_or(IDENTITY);
             let transforms = if skin.is_some() {
@@ -830,7 +837,7 @@ impl<'a> Reader<'a> {
 fn list_of(v: &Value, key: &str) -> Vec<usize> {
     v.get(key)
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_u64).map(|i| i as usize).collect())
+        .map(|a| a.iter().filter_map(Value::as_u64).map(usize_of).collect())
         .unwrap_or_default()
 }
 
@@ -944,7 +951,7 @@ fn normal_matrix(m: &M4) -> [[f64; 3]; 3] {
 
 fn apply_point(m: &M4, p: [f32; 3]) -> [f32; 3] {
     let [x, y, z] = p.map(f64::from);
-    [0, 1, 2].map(|r| (m[r] * x + m[4 + r] * y + m[8 + r] * z + m[12 + r]) as f32)
+    [0, 1, 2].map(|r| f32_of(m[r] * x + m[4 + r] * y + m[8 + r] * z + m[12 + r]))
 }
 
 fn apply_normal(n: &[[f64; 3]; 3], v: [f32; 3]) -> [f32; 3] {
@@ -952,7 +959,7 @@ fn apply_normal(n: &[[f64; 3]; 3], v: [f32; 3]) -> [f32; 3] {
     let o = [0, 1, 2].map(|r| n[r][0] * x + n[r][1] * y + n[r][2] * z);
     let len = (o[0] * o[0] + o[1] * o[1] + o[2] * o[2]).sqrt();
     if len > 0.0 {
-        o.map(|c| (c / len) as f32)
+        o.map(|c| f32_of(c / len))
     } else {
         [0.0, 0.0, 1.0]
     }
@@ -1067,7 +1074,7 @@ impl Reader<'_> {
         let n = positions.len();
         let idx = match index(p, "indices") {
             Some(i) => self.read_indices(i)?,
-            None => (0..n as u32).collect(),
+            None => (0..u32_of(n)).collect(),
         };
         let mut indices = triangles(mode, idx);
         if indices.iter().copied().max().is_some_and(|m| m as usize >= n) {
@@ -1164,7 +1171,7 @@ impl Reader<'_> {
         let s = self.get("skins", skin)?.clone();
         let joints = list_of(&s, "joints");
         let ibm = match index(&s, "inverseBindMatrices") {
-            Some(a) => self.read(a, IDENTITY.map(|x| x as f32))?,
+            Some(a) => self.read(a, IDENTITY.map(f32_of))?,
             None => Vec::new(),
         };
         let mats: Vec<M4> = joints
@@ -1195,6 +1202,11 @@ impl Reader<'_> {
                 if w[k] == 0.0 {
                     continue;
                 }
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "joint indices are small whole numbers; `as` saturates bad ones and `get` refuses them"
+                )]
                 let jm = mats.get(j[k] as usize).unwrap_or(&IDENTITY);
                 let f = f64::from(w[k] / sum);
                 for (o, x) in m.iter_mut().zip(jm) {
@@ -1227,7 +1239,7 @@ impl Reader<'_> {
         }
         let [ox, oy] = f32s(t.get("offset"), [0.0; 2]);
         let [sx, sy] = f32s(t.get("scale"), [1.0; 2]);
-        let r = t.get("rotation").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+        let r = f32_of(t.get("rotation").and_then(Value::as_f64).unwrap_or(0.0));
         let (sin, cos) = r.sin_cos();
         // translation * rotation * scale, as the extension defines them.
         (set, Some([cos * sx, sin * sy, ox, -sin * sx, cos * sy, oy]))
@@ -1254,7 +1266,10 @@ impl Reader<'_> {
         };
         let def = i.and_then(|i| list(&self.json, "materials").get(i)).cloned();
         if let Some(d) = &def {
-            m.name = d.get("name").and_then(Value::as_str).unwrap_or("").to_owned();
+            d.get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .clone_into(&mut m.name);
             let sg = d
                 .get("extensions")
                 .and_then(|e| e.get("KHR_materials_pbrSpecularGlossiness"));
@@ -1262,13 +1277,13 @@ impl Reader<'_> {
                 (None, Some(sg)) => {
                     m.color = f32s(sg.get("diffuseFactor"), [1.0; 4]);
                     m.metallic = 0.0;
-                    m.roughness = 1.0 - sg.get("glossinessFactor").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+                    m.roughness = 1.0 - f32_of(sg.get("glossinessFactor").and_then(Value::as_f64).unwrap_or(1.0));
                 }
                 (pbr, _) => {
                     let pbr = pbr.cloned().unwrap_or(Value::Null);
                     m.color = f32s(pbr.get("baseColorFactor"), [1.0; 4]);
-                    m.metallic = pbr.get("metallicFactor").and_then(Value::as_f64).unwrap_or(1.0) as f32;
-                    m.roughness = pbr.get("roughnessFactor").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+                    m.metallic = f32_of(pbr.get("metallicFactor").and_then(Value::as_f64).unwrap_or(1.0));
+                    m.roughness = f32_of(pbr.get("roughnessFactor").and_then(Value::as_f64).unwrap_or(1.0));
                 }
             }
             m.emissive = f32s(d.get("emissiveFactor"), [0.0; 3]);
@@ -1358,6 +1373,7 @@ fn list_of_values(v: &Value, key: &str) -> Vec<Value> {
 }
 
 /// A primitive's geometry at each of `transforms`, as one primitive.
+#[allow(clippy::float_cmp_const, reason = "only the exact identity may skip the transform")]
 fn place(g: Geometry, transforms: &[M4], material: usize) -> Prim {
     if let [t] = transforms
         && *t == IDENTITY
@@ -1382,7 +1398,7 @@ fn place(g: Geometry, transforms: &[M4], material: usize) -> Prim {
         material,
     };
     for t in transforms {
-        let base = p.positions.len() as u32;
+        let base = u32_of(p.positions.len());
         p.positions.extend(g.positions.iter().map(|&v| apply_point(t, v)));
         let nm = normal_matrix(t);
         p.normals.extend(g.normals.iter().map(|&v| apply_normal(&nm, v)));
@@ -1398,6 +1414,7 @@ fn place(g: Geometry, transforms: &[M4], material: usize) -> Prim {
 }
 
 #[cfg(all(test, feature = "fs"))]
+#[allow(clippy::cast_precision_loss, reason = "test grids are small")]
 mod tests {
     use crate::assets::Folder;
     use crate::mesh::{Material, Mesh, Prim, to_glb};
@@ -1460,7 +1477,7 @@ mod tests {
                 [c[r], c[(r + 1) % 3], c[(r + 2) % 3]]
             })
             .collect();
-        out.sort();
+        out.sort_unstable();
         out
     }
 

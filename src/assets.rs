@@ -89,6 +89,7 @@ pub struct Memory {
 
 impl Memory {
     /// No files.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }

@@ -173,7 +173,7 @@ pub fn validate(bytes: &[u8]) -> Result<Glb, String> {
                 let b = &data[p..p + size];
                 let v = match ct {
                     5120 => {
-                        let v = f32::from(b[0] as i8);
+                        let v = f32::from(b[0].cast_signed());
                         if normalized { (v / 127.0).max(-1.0) } else { v }
                     }
                     5121 => {
@@ -340,6 +340,7 @@ pub fn validate(bytes: &[u8]) -> Result<Glb, String> {
                     min[k].as_f64().unwrap_or(f64::NAN) as f32,
                     max[k].as_f64().unwrap_or(f64::NAN) as f32,
                 );
+                #[allow(clippy::float_cmp, reason = "the spec says min/max are the data's own values")]
                 if m0 != lo || m1 != hi {
                     return Err(format!(
                         "POSITION min/max [{m0}, {m1}] != actual [{lo}, {hi}] on axis {k}"

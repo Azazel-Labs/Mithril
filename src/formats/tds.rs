@@ -10,6 +10,7 @@ use crate::Result;
 
 use crate::assets::Assets;
 use crate::mesh::{FastMap, GRAY, Image, MAX_TRIANGLES, Material, Mesh, Prim, face_normal};
+use crate::num::u32_of;
 
 const MAIN: u16 = 0x4D4D;
 /// A 3D Studio project file, which holds the same editor chunk.
@@ -322,7 +323,12 @@ fn add_faces(t: &Trimesh, face_mat: &[Option<usize>], prims: &mut HashMap<usize,
         for (f, face) in t.faces.iter().enumerate().filter(|(_, f)| whole(f)) {
             for (k, &i) in face.iter().enumerate() {
                 let slot = &mut fill[usize::from(i)];
-                around[*slot as usize] = (f as u32, k as u8);
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "3DS has at most 65535 faces of 3 corners"
+                )]
+                let entry = (f as u32, k as u8);
+                around[*slot as usize] = entry;
                 *slot += 1;
             }
         }
@@ -363,6 +369,7 @@ fn add_faces(t: &Trimesh, face_mat: &[Option<usize>], prims: &mut HashMap<usize,
                     nrm = sum.map(|c| c / len);
                 }
             }
+            #[allow(clippy::float_cmp, reason = "exactly zero: no face in the group gave a normal")]
             if nrm == [0.0; 3] {
                 nrm = [0.0, 1.0, 0.0];
             }
@@ -375,7 +382,7 @@ fn add_faces(t: &Trimesh, face_mat: &[Option<usize>], prims: &mut HashMap<usize,
                     let [s, tv] = t.uvs[usize::from(vi)];
                     prim.uvs.push([s, 1.0 - tv]);
                 }
-                (prim.positions.len() - 1) as u32
+                u32_of(prim.positions.len() - 1)
             });
             prim.indices.push(idx);
         }

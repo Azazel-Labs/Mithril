@@ -71,6 +71,11 @@ let assets = Memory::new().with("scene.bin", bin).with("albedo.png", png);
 let loaded = formats::load_bytes(&gltf, "scene.gltf", "gltf", &assets)?;
 ```
 
+### Minimum Rust
+
+Rust 1.88, with any features but `usd`. The `usd` feature, and so the default build, needs
+1.96, because `openusd` does. CI builds `minimal` on 1.88 and everything on 1.96.
+
 ## Planned scope
 
 - **glTF document**: a lossless JSON document, so unknown extensions and extras survive a

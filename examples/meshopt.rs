@@ -14,6 +14,7 @@ use std::path::Path;
 use mithril::gltf;
 use mithril::mesh::{Material, Mesh, Prim, to_glb};
 
+#[allow(clippy::cast_precision_loss, reason = "a 25 by 25 grid")]
 fn sample() -> mithril::Result<Vec<u8>> {
     let n = 24u32;
     let mut prim = Prim::default();

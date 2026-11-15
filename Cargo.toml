@@ -3,6 +3,8 @@ name = "mithril"
 version = "0.1.0"
 edition = "2024"
 license = "MIT-0"
+# 1.88 for edition 2024's let chains (and `zip` 9). The `usd` feature, on by default, needs
+# 1.96 because `openusd` 0.8 does; CI checks both.
 rust-version = "1.88"
 description = "Pure-Rust 3D asset interchange: glTF/GLB reading and writing, meshopt compression, and readers for common mesh formats"
 keywords = ["gltf", "glb", "meshopt", "3d", "mesh"]
@@ -45,7 +47,25 @@ gltf = { version = "1.4", default-features = false }
 name = "meshopt"
 required-features = ["fs"]
 
+[lints.rust]
+unsafe_code = "forbid"
+
 [lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Numbers are most of what a mesh library does, and handedness, units and transforms go wrong
+# quietly. Pedantic already flags every lossy `as` cast and every `==` on floats; these add
+# float comparison against constants, float literals that can't be represented, and spellings
+# that lose precision (`(x * x + y * y).sqrt()` rather than `x.hypot(y)`).
+float_cmp_const = "warn"
+lossy_float_literal = "warn"
+imprecise_flops = "warn"
+# `suboptimal_flops` (rewrite `a * b + c` as `mul_add`) stays off: it changes results bit for
+# bit, and without an FMA instruction (baseline x86-64, wasm) `mul_add` is a slow library call.
+# Single letters (`x`, `y`, `z`, `u`, `v`, `r`, `g`, `b`) are the math's own names.
+many_single_char_names = "allow"
+similar_names = "allow"
+# Readers are long matches over a format's records; splitting them hides the format's shape.
+too_many_lines = "allow"
 # A style suggestion (`as_chunks`) for fixed-size `chunks_exact`; the codec loops stay as
 # written, matching meshoptimizer's structure.
 chunks_exact_to_as_chunks = "allow"

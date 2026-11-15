@@ -11,6 +11,7 @@ use fbxcel::writer::v7400::binary::{FbxFooter, Writer};
 const BINARY_MAGIC: &[u8] = b"Kaydara FBX Binary";
 
 /// Whether `data` is an ASCII FBX file.
+#[must_use]
 pub fn is_ascii(data: &[u8]) -> bool {
     !data.starts_with(BINARY_MAGIC) && {
         let head = &data[..data.len().min(64 << 10)];
@@ -19,6 +20,10 @@ pub fn is_ascii(data: &[u8]) -> bool {
 }
 
 /// Rewrite an ASCII FBX file as binary FBX 7.4.
+///
+/// # Errors
+///
+/// When the text isn't ASCII FBX that parses.
 pub fn to_binary(data: &[u8]) -> Result<Vec<u8>> {
     let text = std::str::from_utf8(data)
         .map_or_else(|_| String::from_utf8_lossy(data).into_owned(), str::to_owned)
@@ -193,6 +198,10 @@ fn object_name(s: &str) -> String {
 }
 
 /// One node: its values, then its children if it has a block. `parent` decides how ids are typed.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "array values are held as doubles, exact to 2^53"
+)]
 fn node<'a>(lex: &mut Lexer<'a>, w: &mut Writer<std::io::Cursor<Vec<u8>>>, name: &'a str, parent: &str) -> Result<()> {
     let mut vals: Vec<Val<'a>> = Vec::new();
     let mut block = false;
@@ -309,6 +318,11 @@ fn array_type(name: &str) -> Ty {
     }
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "each value takes the width its property or array declares, as FBX readers expect"
+)]
 fn write_node(w: &mut Writer<std::io::Cursor<Vec<u8>>>, name: &str, parent: &str, vals: Vec<Val<'_>>) -> Result<()> {
     let err = |e: fbxcel::writer::v7400::binary::Error| invalid!("{e}");
     let declared = if name == "P" {

@@ -1,8 +1,8 @@
-//! MagicaVoxel `.vox` (the format as documented in ephtracy/voxel-model, versions 150 and 200).
+//! `MagicaVoxel` `.vox` (the format as documented in ephtracy/voxel-model, versions 150 and 200).
 //!
 //! Every model is placed where the scene graph puts it (`nTRN` translations and rotations through
 //! `nGRP` groups down to `nSHP` shapes, first animation frame), skipping hidden nodes and layers.
-//! A placed model's voxels are centred on its pivot, `floor(size / 2)`, as MagicaVoxel shows them;
+//! A placed model's voxels are centred on its pivot, `floor(size / 2)`, as `MagicaVoxel` shows them;
 //! a file without a scene graph keeps the raw voxel coordinates. Only faces between a voxel and
 //! empty space are drawn, grouped by palette color. Colors are sRGB (the default palette when the
 //! file has none), and `MATL` metal, roughness and emission carry over.
@@ -16,7 +16,7 @@ use crate::{Context as _, Result};
 
 const MAX_VOXELS: usize = 4_000_000;
 
-/// The palette MagicaVoxel uses when a file has no `RGBA` chunk, indexed by color index (0 is
+/// The palette `MagicaVoxel` uses when a file has no `RGBA` chunk, indexed by color index (0 is
 /// empty): a 6x6x6 cube of sRGB levels, then ramps of red, green, blue and gray.
 fn default_palette() -> [[u8; 4]; 256] {
     let mut p = [[0u8; 4]; 256];
@@ -139,7 +139,7 @@ impl Body<'_> {
     }
 
     fn i32(&mut self) -> Result<i32> {
-        Ok(self.u32()? as i32)
+        Ok(self.u32()?.cast_signed())
     }
 
     fn string(&mut self) -> Result<&str> {
@@ -392,6 +392,13 @@ const FACES: [([i32; 3], [[i32; 3]; 4]); 6] = [
 ];
 
 /// Adds a model's exposed faces, placed by `xform`, to the primitive of each voxel's color.
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "model sizes are checked to 1..=1024, so every coordinate is small and signs are checked"
+)]
 fn mesh_model(model: &Model, xform: &Xform, centred: bool, prims: &mut HashMap<u8, Prim>) -> Result<()> {
     let [sx, sy, sz] = model.size;
     ensure!(

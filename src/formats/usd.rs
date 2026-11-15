@@ -35,6 +35,7 @@ use openusd_schemas::shade::{self, MaterialBindingAPI};
 use super::Input;
 use crate::assets::{Assets, memory_key};
 use crate::mesh::{GRAY, Image, MAX_TRIANGLES, Material, Mesh, Prim, triangulate};
+use crate::num::f32_of;
 
 /// The file's meshes, or `None` when it has none to show (a material library, a layer of overrides).
 pub(crate) fn load(input: Input<'_>, assets: &dyn Assets) -> Result<Option<Mesh>> {
@@ -101,7 +102,7 @@ pub(crate) fn load(input: Input<'_>, assets: &dyn Assets) -> Result<Option<Mesh>
         }
     }
     let Builder { mut mesh, .. } = out;
-    let scale = meters as f32;
+    let scale = f32_of(meters);
     for prim in &mut mesh.prims {
         for v in &mut prim.positions {
             *v = up(*v, z_up).map(|c| c * scale);
@@ -118,7 +119,7 @@ fn prim_paths(stage: &usd::Stage) -> Result<Vec<sdf::Path>> {
     let mut paths = Vec::new();
     stage
         .traverse(usd::PrimPredicate::DEFAULT.with_instance_proxies(true), |p| {
-            paths.push(p.clone())
+            paths.push(p.clone());
         })
         .map_err(|e| invalid!("{e}"))?;
     Ok(paths)
@@ -237,13 +238,13 @@ impl Builder<'_> {
 
     /// A number attribute, double or float, or its fallback.
     fn number(&self, attr: &usd::Attribute, fallback: f64) -> f32 {
-        (match self.value(attr) {
+        f32_of(match self.value(attr) {
             Some(sdf::Value::Double(v)) => v,
             Some(sdf::Value::Float(v)) => f64::from(v),
             Some(sdf::Value::Half(v)) => f64::from(v.to_f32()),
             Some(sdf::Value::Int(v)) => f64::from(v),
             _ => fallback,
-        }) as f32
+        })
     }
 
     fn token(&self, attr: &usd::Attribute) -> Option<String> {
@@ -313,6 +314,7 @@ impl Builder<'_> {
                     (r, r)
                 };
                 let mut rows = Tess::sphere_rows(bottom, top, h);
+                #[allow(clippy::float_cmp, reason = "identical rows, not near ones, make an empty band")]
                 rows.dedup_by(|a, b| a == b);
                 Some(Tess::lathe(&rows, t(&c.axis_attr()).as_deref()))
             }
@@ -408,7 +410,10 @@ impl Builder<'_> {
             parts.push(part);
         }
         for (i, &w) in which.iter().enumerate() {
-            let id = ids.get(i).copied().unwrap_or(i as i64);
+            let id = ids
+                .get(i)
+                .copied()
+                .unwrap_or_else(|| i64::try_from(i).unwrap_or(i64::MAX));
             if hidden.contains(&id) {
                 continue;
             }
@@ -445,7 +450,7 @@ impl Builder<'_> {
         let mut start = 0usize;
         for (face, &n) in counts.iter().enumerate() {
             let n = usize::try_from(n).unwrap_or(0);
-            let end = start + n;
+            let end = start.saturating_add(n);
             let ok = n >= 3
                 && end <= corners.len()
                 && !shape.hole.get(face).copied().unwrap_or(false)
@@ -514,6 +519,7 @@ impl Builder<'_> {
                 "too many triangles to preview"
             );
             poly.clear();
+            #[allow(clippy::cast_sign_loss, reason = "faces keep only corners in 0..points.len()")]
             poly.extend(corners[start..start + n].iter().map(|&c| points[c as usize]));
             let flat = (shape.normals.is_none() && !shape.smooth).then(|| polygon_normal(&poly, flip));
             let material = face_material[face];
@@ -527,6 +533,7 @@ impl Builder<'_> {
                 prim.colors.resize(base, [1.0; 4]);
             }
             for (c, &corner) in corners.iter().enumerate().skip(start).take(n) {
+                #[allow(clippy::cast_sign_loss, reason = "faces keep only corners in 0..points.len()")]
                 let point = corner as usize;
                 prim.positions.push(points[point]);
                 let normal = match (&shape.normals, flat) {
@@ -665,6 +672,11 @@ struct Tess {
 }
 
 impl Tess {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "a tessellated shape has AROUND * (STACKS + 1) points at most"
+    )]
     fn face(&mut self, corners: &[([f32; 3], [f32; 3])]) {
         self.counts.push(corners.len() as i32);
         for &(p, n) in corners {
@@ -756,6 +768,7 @@ impl Tess {
             let (s, c) = match k {
                 0 => (-1.0, 0.0),
                 k if k == STACKS => (1.0, 0.0),
+                #[allow(clippy::cast_precision_loss, reason = "a small loop counter")]
                 k => (std::f32::consts::PI * (k as f32 - half as f32) / STACKS as f32).sin_cos(),
             };
             if k <= half {
@@ -770,7 +783,7 @@ impl Tess {
 
     /// Rows of a capped cylinder, cone (`top` 0) or frustum of height `h`.
     fn frustum_rows(bottom: f32, top: f32, h: f32) -> Vec<[f32; 4]> {
-        let len = (h * h + (bottom - top) * (bottom - top)).sqrt().max(f32::MIN_POSITIVE);
+        let len = h.hypot(bottom - top).max(f32::MIN_POSITIVE);
         let (nr, nz) = (h / len, (bottom - top) / len);
         vec![
             [0.0, -h / 2.0, 0.0, -1.0],
@@ -783,8 +796,13 @@ impl Tess {
     }
 
     /// A surface of revolution about Z through `rows`, turned to `axis`.
+    #[allow(
+        clippy::float_cmp,
+        reason = "a radius of exactly 0 is a pole; any other closes a band"
+    )]
     fn lathe(rows: &[[f32; 4]], axis: Option<&str>) -> Shape {
         let ring = |row: [f32; 4], j: usize| {
+            #[allow(clippy::cast_precision_loss, reason = "a small loop counter")]
             let (s, c) = (std::f32::consts::TAU * (j % AROUND) as f32 / AROUND as f32).sin_cos();
             ([row[0] * c, row[0] * s, row[1]], [row[2] * c, row[2] * s, row[3]])
         };
@@ -854,6 +872,7 @@ fn instance_matrix(s: [f32; 3], q: [f32; 4], t: [f32; 3]) -> gf::Matrix4d {
 }
 
 /// Smooth normals as Hydra makes them: each face corner adds the cross product of its two edges to its point.
+#[allow(clippy::cast_sign_loss, reason = "faces keep only corners in 0..points.len()")]
 fn smooth_normals(points: &[[f32; 3]], corners: &[i32], faces: &[(usize, usize, usize)], flip: bool) -> Vec<[f32; 3]> {
     let mut acc = vec![[0f64; 3]; points.len()];
     for &(_, start, n) in faces {
@@ -895,7 +914,7 @@ fn unit(n: [f64; 3], flip: bool) -> [f32; 3] {
     let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
     let s = if flip { -1.0 } else { 1.0 };
     if len > 0.0 {
-        n.map(|x| (s * x / len) as f32)
+        n.map(|x| f32_of(s * x / len))
     } else {
         [0.0, 1.0, 0.0]
     }
@@ -904,13 +923,13 @@ fn unit(n: [f64; 3], flip: bool) -> [f32; 3] {
 fn vec3s(v: sdf::Value) -> Option<Vec<[f32; 3]>> {
     Some(match v {
         sdf::Value::Vec3fVec(v) => v.into_iter().map(|p| [p.x, p.y, p.z]).collect(),
-        sdf::Value::Vec3dVec(v) => v.into_iter().map(|p| [p.x as f32, p.y as f32, p.z as f32]).collect(),
+        sdf::Value::Vec3dVec(v) => v.into_iter().map(|p| [p.x, p.y, p.z].map(f32_of)).collect(),
         sdf::Value::Vec3hVec(v) => v
             .into_iter()
             .map(|p| [p.x.to_f32(), p.y.to_f32(), p.z.to_f32()])
             .collect(),
         sdf::Value::Vec3f(p) => vec![[p.x, p.y, p.z]],
-        sdf::Value::Vec3d(p) => vec![[p.x as f32, p.y as f32, p.z as f32]],
+        sdf::Value::Vec3d(p) => vec![[p.x, p.y, p.z].map(f32_of)],
         _ => return None,
     })
 }
@@ -918,7 +937,7 @@ fn vec3s(v: sdf::Value) -> Option<Vec<[f32; 3]>> {
 fn vec2s(v: sdf::Value) -> Option<Vec<[f32; 2]>> {
     Some(match v {
         sdf::Value::Vec2fVec(v) => v.into_iter().map(|p| [p.x, p.y]).collect(),
-        sdf::Value::Vec2dVec(v) => v.into_iter().map(|p| [p.x as f32, p.y as f32]).collect(),
+        sdf::Value::Vec2dVec(v) => v.into_iter().map(|p| [p.x, p.y].map(f32_of)).collect(),
         sdf::Value::Vec2hVec(v) => v.into_iter().map(|p| [p.x.to_f32(), p.y.to_f32()]).collect(),
         _ => return None,
     })
@@ -927,10 +946,10 @@ fn vec2s(v: sdf::Value) -> Option<Vec<[f32; 2]>> {
 fn floats(v: sdf::Value) -> Option<Vec<f32>> {
     Some(match v {
         sdf::Value::FloatVec(v) => v,
-        sdf::Value::DoubleVec(v) => v.into_iter().map(|x| x as f32).collect(),
-        sdf::Value::HalfVec(v) => v.into_iter().map(|x| x.to_f32()).collect(),
+        sdf::Value::DoubleVec(v) => v.into_iter().map(f32_of).collect(),
+        sdf::Value::HalfVec(v) => v.into_iter().map(openusd::gf::f16::to_f32).collect(),
         sdf::Value::Float(x) => vec![x],
-        sdf::Value::Double(x) => vec![x as f32],
+        sdf::Value::Double(x) => vec![f32_of(x)],
         _ => return None,
     })
 }

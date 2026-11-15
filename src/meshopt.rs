@@ -1,5 +1,16 @@
 //! The `EXT_meshopt_compression` bitstreams: meshoptimizer's attribute (v0) and triangle (v1)
 //! encoders, the octahedral filter's encoder, and decoders for every mode and filter.
+//!
+//! Casts here are the codec's own: bytes and nibbles packed into and out of wider integers,
+//! zigzag and two's-complement reinterpretation, and quantizing floats to fixed point, all as
+//! meshoptimizer does them, bit for bit (the tests round-trip each).
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "bit-exact port of meshoptimizer's codec"
+)]
 
 use crate::{Error, Result};
 
@@ -33,6 +44,11 @@ fn block_elements(stride: usize) -> usize {
 
 /// Mode 0 (`ATTRIBUTES`): `data` holds elements of `stride` bytes (a multiple of 4, at most
 /// 256). Each byte position is delta coded against the previous element in groups of 16.
+///
+/// # Panics
+///
+/// When `stride` isn't a multiple of 4 from 4 to 256, or `data` isn't whole elements.
+#[must_use]
 pub fn encode_vertex_buffer(data: &[u8], stride: usize) -> Vec<u8> {
     assert!(stride > 0 && stride <= 256 && stride.is_multiple_of(4));
     assert!(data.len().is_multiple_of(stride));
@@ -110,6 +126,10 @@ const BITS_V1: [[u8; 4]; 2] = [[0, 1, 2, 4], [1, 2, 4, 8]];
 
 /// Decodes mode 0 into `count` elements of `stride` bytes. Reads both attribute codec versions:
 /// 0 (`EXT_meshopt_compression`, header `0xa0`) and 1 (`KHR_meshopt_compression`, `0xa1`).
+///
+/// # Errors
+///
+/// When `src` is truncated or malformed, or `stride` isn't a multiple of 4 from 4 to 256.
 pub fn decode_vertex_buffer(src: &[u8], count: usize, stride: usize) -> Result<Vec<u8>> {
     let size = count.checked_mul(stride).ok_or_else(|| bad("attribute count"))?;
     // A block of at most 256 elements costs at least a quarter byte per element byte, so a
@@ -123,6 +143,11 @@ pub fn decode_vertex_buffer(src: &[u8], count: usize, stride: usize) -> Result<V
 }
 
 /// Decodes mode 0 into `out`, whole elements of `stride` bytes, without allocating.
+///
+/// # Errors
+///
+/// When `src` is truncated or malformed, `stride` isn't a multiple of 4 from 4 to 256, or
+/// `out` isn't whole elements.
 pub fn decode_vertex_buffer_into(src: &[u8], out: &mut [u8], stride: usize) -> Result<()> {
     if stride == 0 || stride > 256 || !stride.is_multiple_of(4) || !out.len().is_multiple_of(stride) {
         return Err(bad("attribute stride"));
@@ -346,7 +371,7 @@ fn read_varint(src: &[u8], pos: &mut usize, end: usize) -> Result<u32> {
             .filter(|_| *pos < end)
             .ok_or_else(|| bad("index data truncated"))?;
         *pos += 1;
-        v |= ((byte & 0x7f) as u32) << shift;
+        v |= u32::from(byte & 0x7f) << shift;
         if byte < 0x80 {
             return Ok(v);
         }
@@ -369,6 +394,11 @@ fn read_index(src: &[u8], pos: &mut usize, end: usize, last: &mut u32) -> Result
 
 /// Mode 1 (`TRIANGLES`): a triangle list, most triangles in one byte when the list is ordered
 /// for the vertex cache and its vertices by first use.
+///
+/// # Panics
+///
+/// When `indices` isn't whole triangles.
+#[must_use]
 pub fn encode_index_buffer(indices: &[u32]) -> Vec<u8> {
     assert!(indices.len().is_multiple_of(3));
     let mut codes = Vec::with_capacity(indices.len() / 3);
@@ -468,6 +498,10 @@ pub fn encode_index_buffer(indices: &[u32]) -> Vec<u8> {
 }
 
 /// Decodes mode 1 into `count` indices.
+///
+/// # Errors
+///
+/// When `src` is truncated or malformed.
 pub fn decode_index_buffer(src: &[u8], count: usize) -> Result<Vec<u32>> {
     let tris = count / 3;
     if !count.is_multiple_of(3) || src.len() < 1 + tris + 16 || src[0] & 0xf0 != 0xe0 {
@@ -482,7 +516,7 @@ pub fn decode_index_buffer(src: &[u8], count: usize) -> Result<Vec<u32>> {
     let mut f = Fifos::new();
     let (mut next, mut last) = (0u32, 0u32);
     let mut out = Vec::with_capacity(count);
-    for &code in &src[1..1 + tris] {
+    for &code in &src[1..=tris] {
         let (hi, lo) = ((code >> 4) as usize, (code & 15) as usize);
         let tri = if hi < 15 {
             let [a, b] = f.edge_at(hi);
@@ -559,6 +593,10 @@ pub fn decode_index_buffer(src: &[u8], count: usize) -> Result<Vec<u32>> {
 }
 
 /// Decodes mode 2 (`INDICES`, any index sequence) into `count` indices.
+///
+/// # Errors
+///
+/// When `src` is truncated or malformed.
 pub fn decode_index_sequence(src: &[u8], count: usize) -> Result<Vec<u32>> {
     if src.len() < 1 + count + 4 || src[0] != 0xd1 {
         return Err(bad("index sequence header"));
@@ -579,6 +617,10 @@ pub fn decode_index_sequence(src: &[u8], count: usize) -> Result<Vec<u32>> {
 
 /// Mode 2 (`INDICES`): any index sequence (strips, lines, points, sparse accessor indices).
 /// Fails only when an index lies more than 2^30 from both of the two running baselines.
+///
+/// # Errors
+///
+/// When an index is out of reach of both baselines.
 pub fn encode_index_sequence(indices: &[u32]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(indices.len() + 5);
     out.push(0xd1);
@@ -606,6 +648,7 @@ fn snorm(v: f32, bits: u32) -> i32 {
 
 /// The octahedral filter's 8-bit input for unit vector `n` and fourth component `w`
 /// (passed through; ±1 for a tangent's handedness).
+#[must_use]
 pub fn encode_oct8(n: [f32; 3], w: f32) -> [u8; 4] {
     let l = n[0].abs() + n[1].abs() + n[2].abs();
     let s = if l == 0.0 { 0.0 } else { 1.0 / l };
@@ -617,18 +660,25 @@ pub fn encode_oct8(n: [f32; 3], w: f32) -> [u8; 4] {
 }
 
 /// Applies the named filter to decoded attribute data in place.
+///
+/// # Errors
+///
+/// When `filter` is unknown, or `stride` doesn't suit it.
 pub fn apply_filter(filter: &str, data: &mut [u8], stride: usize) -> Result<()> {
     match filter {
         "NONE" => {}
         "OCTAHEDRAL" if stride == 4 => {
             for e in data.chunks_exact_mut(4) {
-                let [x, y, z] = octahedral([e[0] as i8 as f32, e[1] as i8 as f32, e[2] as i8 as f32], 127.0);
+                let [x, y, z] = octahedral(
+                    [f32::from(e[0] as i8), f32::from(e[1] as i8), f32::from(e[2] as i8)],
+                    127.0,
+                );
                 e[..3].copy_from_slice(&[x as i8 as u8, y as i8 as u8, z as i8 as u8]);
             }
         }
         "OCTAHEDRAL" if stride == 8 => {
             for e in data.chunks_exact_mut(8) {
-                let c = |i: usize| i16::from_le_bytes([e[2 * i], e[2 * i + 1]]) as f32;
+                let c = |i: usize| f32::from(i16::from_le_bytes([e[2 * i], e[2 * i + 1]]));
                 let out = octahedral([c(0), c(1), c(2)], 32767.0);
                 for (i, v) in out.into_iter().enumerate() {
                     e[2 * i..2 * i + 2].copy_from_slice(&(v as i16).to_le_bytes());
@@ -639,10 +689,10 @@ pub fn apply_filter(filter: &str, data: &mut [u8], stride: usize) -> Result<()> 
             for e in data.chunks_exact_mut(8) {
                 let c = |i: usize| i16::from_le_bytes([e[2 * i], e[2 * i + 1]]);
                 let range = std::f32::consts::FRAC_1_SQRT_2;
-                let one = (c(3) | 3) as f32;
-                let x = c(0) as f32 / one * range;
-                let y = c(1) as f32 / one * range;
-                let z = c(2) as f32 / one * range;
+                let one = f32::from(c(3) | 3);
+                let x = f32::from(c(0)) / one * range;
+                let y = f32::from(c(1)) / one * range;
+                let z = f32::from(c(2)) / one * range;
                 let w = (1.0 - x * x - y * y - z * z).max(0.0).sqrt();
                 let max = (c(3) & 3) as usize;
                 let mut out = [0i16; 4];
@@ -664,7 +714,10 @@ pub fn apply_filter(filter: &str, data: &mut [u8], stride: usize) -> Result<()> 
         }
         "COLOR" if stride == 4 => {
             for e in data.chunks_exact_mut(4) {
-                let rgba = ycocg([e[0].into(), e[1] as i8 as i32, e[2] as i8 as i32, e[3].into()], 255.0);
+                let rgba = ycocg(
+                    [e[0].into(), i32::from(e[1] as i8), i32::from(e[2] as i8), e[3].into()],
+                    255.0,
+                );
                 for (o, v) in e.iter_mut().zip(rgba) {
                     *o = v as u8;
                 }
@@ -674,7 +727,7 @@ pub fn apply_filter(filter: &str, data: &mut [u8], stride: usize) -> Result<()> 
             for e in data.chunks_exact_mut(8) {
                 let c = |i: usize| u16::from_le_bytes([e[2 * i], e[2 * i + 1]]);
                 let rgba = ycocg(
-                    [c(0).into(), c(1) as i16 as i32, c(2) as i16 as i32, c(3).into()],
+                    [c(0).into(), i32::from(c(1) as i16), i32::from(c(2) as i16), c(3).into()],
                     65535.0,
                 );
                 for (i, v) in rgba.into_iter().enumerate() {
@@ -819,9 +872,9 @@ mod tests {
         ];
         let mut out = Vec::new();
         for (p, n, t) in pv {
-            p.iter().for_each(|v| out.extend(v.to_le_bytes()));
+            out.extend(p.iter().flat_map(|v| v.to_le_bytes()));
             out.extend(n);
-            t.iter().for_each(|v| out.extend(v.to_le_bytes()));
+            out.extend(t.iter().flat_map(|v| v.to_le_bytes()));
         }
         out
     }
@@ -939,7 +992,7 @@ mod tests {
             let n = normalize(v).unwrap_or([0.0, 0.0, 1.0]);
             let mut e = encode_oct8(n, -1.0).to_vec();
             apply_filter("OCTAHEDRAL", &mut e, 4).unwrap();
-            let d = normalize([e[0] as i8 as f32, e[1] as i8 as f32, e[2] as i8 as f32]).unwrap();
+            let d = normalize([f32::from(e[0] as i8), f32::from(e[1] as i8), f32::from(e[2] as i8)]).unwrap();
             let dot: f32 = (0..3).map(|i| d[i] * n[i]).sum();
             assert!(dot > 0.999, "{n:?} -> {d:?}");
             assert_eq!(e[3] as i8, -127);

@@ -305,13 +305,12 @@ impl Emit<'_> {
             // A mirroring transform turns faces inside out unless the winding turns too.
             let order = if mirrored { [0, 2, 1] } else { [0, 1, 2] };
             let pos = [up(*a), up(*b), up(*c)];
-            let pi = match self.looks.get(&look) {
-                Some(&pi) => pi,
-                None => {
-                    self.prims.push((look, Prim::default()));
-                    self.looks.insert(look, self.prims.len() - 1);
-                    self.prims.len() - 1
-                }
+            let pi = if let Some(&pi) = self.looks.get(&look) {
+                pi
+            } else {
+                self.prims.push((look, Prim::default()));
+                self.looks.insert(look, self.prims.len() - 1);
+                self.prims.len() - 1
             };
             let p = &mut self.prims[pi].1;
             let n = face_normal(pos[order[0]], pos[order[1]], pos[order[2]]);
@@ -349,6 +348,11 @@ impl Emit<'_> {
                 if c[0] == c[1] && c[1] == c[2] {
                     (c[0].map_or(Look::Plain, Look::Color), None, None)
                 } else {
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "a constant in 0..=1"
+                    )]
                     let gray = GRAY.map(|v| (v * 255.0) as u8);
                     (Look::Vertex, None, Some(c.map(|c| c.unwrap_or(gray))))
                 }
@@ -360,12 +364,11 @@ impl Emit<'_> {
                     return plain;
                 };
                 let key = norm(path);
-                let t = match self.textures.iter().position(|k| *k == key) {
-                    Some(t) => t,
-                    None => {
-                        self.textures.push(key);
-                        self.textures.len() - 1
-                    }
+                let t = if let Some(t) = self.textures.iter().position(|k| *k == key) {
+                    t
+                } else {
+                    self.textures.push(key);
+                    self.textures.len() - 1
                 };
                 (Look::Texture(t), Some([a, b, c]), None)
             }
@@ -808,6 +811,11 @@ mod tests {
 
     const QUAD: &str = r#"<vertices><vertex x="0" y="0" z="0"/><vertex x="10" y="0" z="0"/><vertex x="10" y="10" z="0"/><vertex x="0" y="10" z="0"/></vertices>"#;
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "`as` saturates to 0..=255"
+    )]
     fn colors(mesh: &Mesh) -> Vec<[u8; 3]> {
         let to = |c: f32| (c.powf(1.0 / 2.2) * 255.0).round() as u8;
         mesh.materials

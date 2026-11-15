@@ -77,7 +77,7 @@ enum Colors {
     /// Materialise Magics: a `COLOR=rgba` header is the default for facets whose top bit is set,
     /// and the rest have red in the low bits (as three.js reads it).
     Magics([u8; 3]),
-    /// VisCAM and SolidView set the top bit on colored facets, blue in the low bits. There's no
+    /// `VisCAM` and `SolidView` set the top bit on colored facets, blue in the low bits. There's no
     /// header saying so, and other tools leave junk in those bytes, so only two colors or more
     /// count.
     VisCam,
@@ -107,7 +107,7 @@ impl Colors {
     }
 }
 
-/// `n` binary facets. `None` when reading without colors finds two VisCAM colors.
+/// `n` binary facets. `None` when reading without colors finds two `VisCAM` colors.
 fn binary(mut blocks: Blocks<'_>, n: usize, colors: Colors) -> Result<Option<Mesh>> {
     let mut plain = Welder::with_capacity(if let Colors::None = colors { n } else { 0 });
     // Colored: a primitive per color, in order of first appearance.
@@ -196,6 +196,12 @@ fn ascii(mut blocks: Blocks<'_>) -> Result<Mesh> {
     while let Some(text) = blocks.text(stream::words)? {
         if !sized && w.triangles() > 0 {
             sized = true;
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a capacity guess from the rate so far; MAX_TRIANGLES caps it"
+            )]
             let est = (size as f64 * w.triangles() as f64 / read as f64 * 1.02) as usize + 16;
             w.expect(est.min(MAX_TRIANGLES));
         }

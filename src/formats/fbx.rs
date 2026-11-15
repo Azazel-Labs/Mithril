@@ -15,6 +15,7 @@ use fbxcel::tree::v7400::NodeHandle;
 
 use crate::assets::Assets;
 use crate::mesh::{GRAY, Image, Material, Mesh, Prim, smooth_normals, srgb_to_linear, triangulate};
+use crate::num::f32_of;
 
 const MAX_TRIANGLES: usize = 4_000_000;
 
@@ -127,6 +128,24 @@ fn ints(v: &A) -> Option<Vec<i64>> {
     }
 }
 
+/// An object ID. FBX writes them as 64-bit integers, often hashes that use every bit, so they
+/// are read as integers: through a double, IDs past 2^53 would round and collide.
+fn id(v: &A) -> Option<i64> {
+    match v {
+        A::I64(i) => Some(*i),
+        A::I32(i) => Some(i64::from(*i)),
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "a whole number written as a float; `as` saturates"
+        )]
+        v => num(v).map(|f| f as i64),
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "a property value as a double, like the FBX SDK reads it"
+)]
 fn num(v: &A) -> Option<f64> {
     match v {
         A::F64(f) => Some(*f),
@@ -259,21 +278,18 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets) -> Result<Mesh>
         children: HashMap::new(),
     };
     for o in objects_node.children() {
-        if let Some(id) = o.attributes().first().and_then(num) {
-            objs.nodes.insert(id as i64, (o, o.name().to_owned()));
+        if let Some(id) = o.attributes().first().and_then(id) {
+            objs.nodes.insert(id, (o, o.name().to_owned()));
         }
     }
     if let Some(conns) = rootnode.first_child_by_name("Connections") {
         for c in conns.children_by_name("C") {
             let a = c.attributes();
-            let (Some(kind), Some(child), Some(parent)) = (
-                a.first().and_then(string),
-                a.get(1).and_then(num),
-                a.get(2).and_then(num),
-            ) else {
+            let (Some(kind), Some(child), Some(parent)) =
+                (a.first().and_then(string), a.get(1).and_then(id), a.get(2).and_then(id))
+            else {
                 continue;
             };
-            let (child, parent) = (child as i64, parent as i64);
             let prop = if kind == "OP" {
                 a.get(3).and_then(string).unwrap_or("").to_owned()
             } else {
@@ -292,6 +308,7 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets) -> Result<Mesh>
         .map(props)
         .unwrap_or_default();
     let axis = |name: &str, sign: &str, default: i32| -> (usize, f64) {
+        #[allow(clippy::cast_possible_truncation, reason = "an axis number; `as` saturates bad ones")]
         let a = scalar(&settings, name).map_or(default, |v| v as i32);
         let s = scalar(&settings, sign).unwrap_or(1.0);
         (
@@ -415,6 +432,7 @@ fn world_of(id: i64, objs: &Objects<'_>, cache: &mut HashMap<i64, M4>) -> M4 {
         return IDENTITY;
     };
     let p = props(*node);
+    #[allow(clippy::cast_possible_truncation, reason = "an enum value; `as` saturates bad ones")]
     let order = scalar(&p, "RotationOrder").map_or(0, |v| v as i32);
     let r_pre = rotate(vec3(&p, "PreRotation", [0.0; 3]), 0);
     let r_post_inv = {
@@ -486,24 +504,24 @@ fn read_material(
         .to_owned();
     let to_linear = |c: [f64; 3]| {
         c.map(|v| {
-            let v = v.clamp(0.0, 1.0) as f32;
+            let v = f32_of(v.clamp(0.0, 1.0));
             if linear { v } else { srgb_to_linear(v) }
         })
     };
     let d = to_linear(vec3(&p, "DiffuseColor", vec3(&p, "Diffuse", [0.8, 0.8, 0.8])));
     let alpha =
         scalar(&p, "Opacity").unwrap_or_else(|| 1.0 - scalar(&p, "TransparencyFactor").unwrap_or(0.0).clamp(0.0, 1.0));
-    let mut mat = Material::plain(&name, [d[0], d[1], d[2], alpha.clamp(0.0, 1.0) as f32]);
+    let mut mat = Material::plain(&name, [d[0], d[1], d[2], f32_of(alpha.clamp(0.0, 1.0))]);
     // The emissive color is a color (sRGB unless Blender's); its factor is a linear intensity.
-    let factor = scalar(&p, "EmissiveFactor").unwrap_or(1.0).max(0.0) as f32;
+    let factor = f32_of(scalar(&p, "EmissiveFactor").unwrap_or(1.0).max(0.0));
     mat.emissive = to_linear(vec3(&p, "EmissiveColor", vec3(&p, "Emissive", [0.0; 3]))).map(|c| c * factor);
     // A Phong exponent as roughness the way Blender's importer maps it (and its exporter inverts): 1 - sqrt(n) / 10.
     if let Some(n) = scalar(&p, "Shininess").or_else(|| scalar(&p, "ShininessExponent")) {
-        mat.roughness = (1.0 - n.clamp(0.0, 100.0).sqrt() / 10.0) as f32;
+        mat.roughness = f32_of(1.0 - n.clamp(0.0, 100.0).sqrt() / 10.0);
     }
     // Blender keeps its metallic in ReflectionFactor; other tools' reflectivity is a mirror blend, not metal.
     if linear && let Some(m) = scalar(&p, "ReflectionFactor") {
-        mat.metallic = m.clamp(0.0, 1.0) as f32;
+        mat.metallic = f32_of(m.clamp(0.0, 1.0));
     }
     for (tex, prop) in objs.children.get(&id).cloned().unwrap_or_default() {
         let slot = prop.to_lowercase();
@@ -577,7 +595,11 @@ fn add_geometry(geom: NodeHandle<'_>, m: &M4, materials: &[usize], mesh: &mut Me
         Some(Layer {
             values: ints(child_attr(el, "Materials")?)?
                 .into_iter()
-                .map(|i| i as f64)
+                .map(|i| {
+                    #[allow(clippy::cast_precision_loss, reason = "a material slot, far below 2^53")]
+                    let i = i as f64;
+                    i
+                })
                 .collect(),
             index: None,
             mapping: child_attr(el, "MappingInformationType")
@@ -612,7 +634,15 @@ fn add_geometry(geom: NodeHandle<'_>, m: &M4, materials: &[usize], mesh: &mut Me
         let slot = mat_layer
             .as_ref()
             .and_then(|l| l.get(k, 0, poly - 1))
-            .map_or(0, |(_, v)| v[0] as usize);
+            .map_or(0, |(_, v)| {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "a material slot; `as` saturates bad ones and `get` refuses them"
+                )]
+                let slot = v[0] as usize;
+                slot
+            });
         let material = materials.get(slot).copied().unwrap_or(usize::MAX);
         let (prim, seen) = prims.entry(material).or_insert_with(|| {
             (
@@ -627,7 +657,7 @@ fn add_geometry(geom: NodeHandle<'_>, m: &M4, materials: &[usize], mesh: &mut Me
         corner_pos.clear();
         for &(pv, cp) in &corners {
             let pos = &verts[cp * 3..cp * 3 + 3];
-            corner_pos.push([pos[0] as f32, pos[1] as f32, pos[2] as f32]);
+            corner_pos.push([pos[0], pos[1], pos[2]].map(f32_of));
             let n = normals.as_ref().and_then(|l| l.get(pv, cp, poly - 1));
             let t = uvs.as_ref().and_then(|l| l.get(pv, cp, poly - 1));
             let c = colors.as_ref().and_then(|l| l.get(pv, cp, poly - 1));
@@ -639,17 +669,16 @@ fn add_geometry(geom: NodeHandle<'_>, m: &M4, materials: &[usize], mesh: &mut Me
             );
             let id = *seen.entry(key).or_insert_with(|| {
                 let p = apply(m, [pos[0], pos[1], pos[2]]);
-                prim.positions.push(p.map(|c| c as f32));
+                prim.positions.push(p.map(f32_of));
                 if let Some((_, nv)) = n {
-                    prim.normals
-                        .push(apply_dir(&nm, [nv[0], nv[1], nv[2]]).map(|c| c as f32));
+                    prim.normals.push(apply_dir(&nm, [nv[0], nv[1], nv[2]]).map(f32_of));
                 }
                 if let Some((_, tv)) = t {
                     // FBX's texture origin is bottom-left, glTF's top-left.
-                    prim.uvs.push([tv[0] as f32, 1.0 - tv[1] as f32]);
+                    prim.uvs.push([f32_of(tv[0]), 1.0 - f32_of(tv[1])]);
                 }
                 if let Some((_, cv)) = c {
-                    let [r, g, b, a] = [cv[0], cv[1], cv[2], cv[3]].map(|v| v.clamp(0.0, 1.0) as f32);
+                    let [r, g, b, a] = [cv[0], cv[1], cv[2], cv[3]].map(|v| f32_of(v.clamp(0.0, 1.0)));
                     prim.colors
                         .push([srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), a]);
                 }
@@ -955,6 +984,29 @@ Connections:  {{
         assert_eq!(a.materials[a.prims[0].material].name, "Stone");
         assert_eq!(a.materials[a.prims[0].material].color_image, Some(0));
         assert_eq!(a.images.len(), 1);
+    }
+
+    #[test]
+    fn object_ids_past_2_pow_53_stay_distinct() {
+        // As doubles these are one number, so the model and its material would share a key.
+        let (model, material) = ("9007199254740992", "9007199254740993");
+        let text = z_up_ascii_fbx()
+            .replace("Model: 20,", &format!("Model: {model},"))
+            .replace("Material: 30,", &format!("Material: {material},"))
+            .replace("C: \"OO\",10,20", &format!("C: \"OO\",10,{model}"))
+            .replace("C: \"OO\",20,0", &format!("C: \"OO\",{model},0"))
+            .replace("C: \"OO\",30,20", &format!("C: \"OO\",{material},{model}"))
+            .replace("C: \"OP\",40,30,", &format!("C: \"OP\",40,{material},"));
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big_ids.fbx");
+        std::fs::write(&p, text).unwrap();
+        let mesh = load(crate::formats::Input::file(&p), &crate::assets::Folder::new(dir.path())).unwrap();
+        assert_eq!(mesh.triangles(), 2);
+        assert!(
+            mesh.prims[0].positions.iter().all(|v| (v[1] - 1.0).abs() < 1e-5),
+            "placed by its model"
+        );
+        assert_eq!(mesh.materials[mesh.prims[0].material].name, "Stone");
     }
 }
 

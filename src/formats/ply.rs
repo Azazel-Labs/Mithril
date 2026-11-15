@@ -2,7 +2,7 @@
 //!
 //! Read: positions, normals, vertex colors (sRGB, as integers or floats), texture coordinates
 //! under any of their usual names, polygons (triangulated in their plane) and triangle strips;
-//! MeshLab's per-face texture coordinates and `comment TextureFile`; per-face colors. Elements
+//! `MeshLab`'s per-face texture coordinates and `comment TextureFile`; per-face colors. Elements
 //! the reader doesn't use are skipped. A file without faces is a point cloud: no mesh, but its
 //! point count.
 
@@ -14,6 +14,7 @@ use super::Input;
 use super::stream::{self, Blocks};
 use crate::assets::Assets;
 use crate::mesh::{FastMap, MAX_TRIANGLES, Material, Mesh, Prim, smooth_normals, srgb_to_linear, triangulate};
+use crate::num::{f32_of, u32_of};
 use crate::{Context as _, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,7 +159,7 @@ impl Cursor<'_> {
             return v.ok_or(Stop::Bad("bad PLY number"));
         }
         Ok(match ty {
-            Ty::I8 => f64::from(self.bytes::<1>()?[0] as i8),
+            Ty::I8 => f64::from(self.bytes::<1>()?[0].cast_signed()),
             Ty::U8 => f64::from(self.bytes::<1>()?[0]),
             Ty::I16 => f64::from(i16::from_le_bytes(self.bytes()?)),
             Ty::U16 => f64::from(u16::from_le_bytes(self.bytes()?)),
@@ -169,7 +170,12 @@ impl Cursor<'_> {
         })
     }
 
-    /// A vertex index; `u32::MAX` (never valid) for a negative one.
+    /// A vertex index; `u32::MAX` (never valid) for a negative or NaN one.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "`as` saturates, and the vertex check refuses what's past the end"
+    )]
     #[inline]
     fn index(&mut self, ty: Ty) -> Got<u32> {
         let neg = |v: i64| u32::try_from(v).unwrap_or(u32::MAX);
@@ -180,13 +186,13 @@ impl Cursor<'_> {
                     return Ok(t.iter().fold(0, |n, &c| n * 10 + u32::from(c - b'0')));
                 }
                 let v = stream::f64_from(t).ok_or(Stop::Bad("bad PLY number"))?;
-                Ok(if v < 0.0 { u32::MAX } else { v as u32 })
+                Ok(if v >= 0.0 { v as u32 } else { u32::MAX })
             }
             (_, Ty::I32) => Ok(neg(i64::from(i32::from_le_bytes(self.bytes()?)))),
             (_, Ty::U32) => Ok(u32::from_le_bytes(self.bytes()?)),
             _ => {
                 let v = self.value(ty)?;
-                Ok(if v < 0.0 { u32::MAX } else { v as u32 })
+                Ok(if v >= 0.0 { v as u32 } else { u32::MAX })
             }
         }
     }
@@ -218,6 +224,11 @@ impl Cursor<'_> {
         if !(0.0..=1e6).contains(&v) {
             return Err(Stop::Bad("bad PLY list length"));
         }
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "checked to be in 0..=1e6"
+        )]
         Ok(v as usize)
     }
 }
@@ -232,7 +243,7 @@ fn at(b: &[u8], ty: Ty, be: bool) -> f64 {
         a[..n].reverse();
     }
     match ty {
-        Ty::I8 => f64::from(a[0] as i8),
+        Ty::I8 => f64::from(a[0].cast_signed()),
         Ty::U8 => f64::from(a[0]),
         Ty::I16 => f64::from(i16::from_le_bytes([a[0], a[1]])),
         Ty::U16 => f64::from(u16::from_le_bytes([a[0], a[1]])),
@@ -243,7 +254,7 @@ fn at(b: &[u8], ty: Ty, be: bool) -> f64 {
     }
 }
 
-/// The header: format, elements, the texture file MeshLab names, and where the data starts.
+/// The header: format, elements, the texture file `MeshLab` names, and where the data starts.
 fn header(data: &[u8]) -> Result<(Format, Vec<Element>, Option<String>, usize)> {
     let mut format = None;
     let mut elements: Vec<Element> = Vec::new();
@@ -344,10 +355,12 @@ const A: &[&str] = &["alpha", "diffuse_alpha", "a"];
 
 fn color(el: &Element, vals: &[f64], slots: &[usize; 3], alpha: Option<usize>) -> [f32; 4] {
     let ch = |s: usize| {
-        let c = (vals[s] / el.props[s].ty.color_scale()).clamp(0.0, 1.0) as f32;
+        let c = f32_of((vals[s] / el.props[s].ty.color_scale()).clamp(0.0, 1.0));
         srgb_to_linear(c)
     };
-    let a = alpha.map_or(1.0, |s| (vals[s] / el.props[s].ty.color_scale()).clamp(0.0, 1.0) as f32);
+    let a = alpha.map_or(1.0, |s| {
+        f32_of((vals[s] / el.props[s].ty.color_scale()).clamp(0.0, 1.0))
+    });
     [ch(slots[0]), ch(slots[1]), ch(slots[2]), a]
 }
 
@@ -565,6 +578,12 @@ fn read_element(blocks: &mut Blocks<'_>, format: Format, el: &Element, has_faces
         ensure!(body.tris.len() / 3 <= MAX_TRIANGLES, "too many triangles to convert");
         if !sized && done > 0 {
             sized = true;
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a capacity guess from the rate so far; MAX_TRIANGLES caps it"
+            )]
             let est = (body.tris.len() as f64 / done as f64 * el.count as f64 * 1.01) as usize + 48;
             let est = est.min(MAX_TRIANGLES * 3);
             body.tris.reserve_exact(est.saturating_sub(body.tris.len()));
@@ -612,7 +631,7 @@ fn record(
                     }
                 } else if Some(k) == plan.uv_list {
                     for _ in 0..n {
-                        tc.push(cur.value(p.ty)? as f32);
+                        tc.push(f32_of(cur.value(p.ty)?));
                     }
                 } else {
                     cur.skip(p.ty, n)?;
@@ -631,7 +650,7 @@ fn vertex(cur: &mut Cursor, el: &Element, plan: &Plan, keep: bool, body: &mut Bo
     }
     let vals = &body.vals;
     let v = &mut body.verts;
-    let g = |s: usize| vals[s] as f32;
+    let g = |s: usize| f32_of(vals[s]);
     v.pos.push(plan.xyz.map(g));
     if let Some(n) = plan.n {
         v.nrm.push(unit(n.map(g)));
@@ -787,7 +806,7 @@ fn build(body: Body, texture: Option<String>, path: &Path, assets: &dyn Assets) 
                     p.colors
                         .push(col.or_else(|| verts.col.get(v as usize).copied()).unwrap_or([1.0; 4]));
                 }
-                (p.positions.len() - 1) as u32
+                u32_of(p.positions.len() - 1)
             })
         };
         for &v in &tris {

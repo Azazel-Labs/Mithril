@@ -17,6 +17,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
+use crate::num::usize_of;
 use crate::{Context as _, Result, meshopt};
 
 /// The meshopt compression extensions, by name.
@@ -33,6 +34,10 @@ const CHUNK_BIN: &[u8; 4] = b"BIN\0";
 /// type their accessor declares. Images are left as they are.
 ///
 /// A GLB that uses neither extension comes back byte for byte.
+///
+/// # Errors
+///
+/// When `input` isn't glTF that parses, or its compressed data doesn't decode.
 pub fn decompress(input: &[u8]) -> Result<Vec<u8>> {
     let doc = Doc::parse(input)?;
     if let Some(len) = doc.glb_len
@@ -51,12 +56,21 @@ pub fn decompress(input: &[u8]) -> Result<Vec<u8>> {
 /// fetched (or has no URI) becomes a URI-less placeholder and the extension is marked required.
 ///
 /// [`files_in`] gives a `fetch` that reads files next to the `.gltf`.
+///
+/// # Errors
+///
+/// When `gltf` doesn't parse, or `fetch` fails for a file the GLB can't do without.
 pub fn pack_glb(gltf: &[u8], mut fetch: impl FnMut(&str) -> Result<Vec<u8>>) -> Result<Vec<u8>> {
     Doc::parse(gltf)?.pack(&mut fetch)
 }
 
 /// [`pack_glb`] and [`decompress`] in one pass: a `.gltf` (or GLB) and the files it names to a
 /// plain GLB with every image embedded. Meshopt fallback buffers are never fetched.
+///
+/// # Errors
+///
+/// When `gltf` doesn't parse, `fetch` fails for a file the GLB can't do without, or
+/// compressed data doesn't decode.
 pub fn pack_glb_decompressed(gltf: &[u8], mut fetch: impl FnMut(&str) -> Result<Vec<u8>>) -> Result<Vec<u8>> {
     Doc::parse(gltf)?.decompress(&mut fetch, true)
 }
@@ -66,6 +80,10 @@ pub fn pack_glb_decompressed(gltf: &[u8], mut fetch: impl FnMut(&str) -> Result<
 /// views the index codec, and vertex attribute views whose stride is a multiple of 4 the
 /// attribute codec, unfiltered. Triangles may come back starting at another corner (winding is
 /// kept); every other byte decodes exactly. Already-compressed input is decompressed first.
+///
+/// # Errors
+///
+/// When `input` isn't glTF that parses, or already-compressed data doesn't decode.
 pub fn compress(input: &[u8]) -> Result<Vec<u8>> {
     let plain;
     let mut doc = Doc::parse(input)?;
@@ -188,7 +206,7 @@ impl<'a> Doc<'a> {
             .list("buffers")
             .get(i)
             .with_context(|| format!("buffer {i} doesn't exist"))?;
-        let declared = b.get("byteLength").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let declared = b.get("byteLength").and_then(Value::as_u64).map_or(0, usize_of);
         let fallback = lenient && is_fallback(b);
         let bytes: Cow<'a, [u8]> = match b.get("uri").and_then(Value::as_str) {
             Some(uri) if uri.starts_with("data:") => Cow::Owned(data_uri(uri)?.1),
@@ -219,9 +237,11 @@ impl<'a> Doc<'a> {
                 Some((_, ext)) => ext.get("buffer"),
                 None => v.get("buffer"),
             };
-            let b = buffer
-                .and_then(Value::as_u64)
-                .with_context(|| format!("buffer view {i} has no buffer"))? as usize;
+            let b = usize_of(
+                buffer
+                    .and_then(Value::as_u64)
+                    .with_context(|| format!("buffer view {i} has no buffer"))?,
+            );
             *needed
                 .get_mut(b)
                 .with_context(|| format!("buffer view {i} names missing buffer {b}"))? = true;
@@ -245,21 +265,18 @@ impl<'a> Doc<'a> {
         let mut total = 0usize;
         for (i, v) in views.iter().enumerate() {
             let len = view_len(v)?;
-            match meshopt_of(v) {
-                Some((name, ext)) => {
-                    let src = slice(
-                        bytes(get_usize(ext, "buffer")?)?,
-                        ext.get("byteOffset").and_then(Value::as_u64).unwrap_or(0) as usize,
-                        get_usize(ext, "byteLength")?,
-                    )
-                    .with_context(|| format!("buffer view {i}: {name} data out of range"))?;
-                    ensure!(len / 1024 <= src.len(), "buffer view {i}: {name} data is truncated");
-                }
-                None => {
-                    let b = get_usize(v.as_object().context("buffer view is not an object")?, "buffer")?;
-                    let off = v.get("byteOffset").and_then(Value::as_u64).unwrap_or(0) as usize;
-                    slice(bytes(b)?, off, len).with_context(|| format!("buffer view {i} out of range"))?;
-                }
+            if let Some((name, ext)) = meshopt_of(v) {
+                let src = slice(
+                    bytes(get_usize(ext, "buffer")?)?,
+                    ext.get("byteOffset").and_then(Value::as_u64).map_or(0, usize_of),
+                    get_usize(ext, "byteLength")?,
+                )
+                .with_context(|| format!("buffer view {i}: {name} data out of range"))?;
+                ensure!(len / 1024 <= src.len(), "buffer view {i}: {name} data is truncated");
+            } else {
+                let b = get_usize(v.as_object().context("buffer view is not an object")?, "buffer")?;
+                let off = v.get("byteOffset").and_then(Value::as_u64).map_or(0, usize_of);
+                slice(bytes(b)?, off, len).with_context(|| format!("buffer view {i} out of range"))?;
             }
             total = total.saturating_add(len.next_multiple_of(4));
         }
@@ -269,26 +286,25 @@ impl<'a> Doc<'a> {
             let len = view_len(v)?;
             pad4(&mut bin);
             let at = bin.len();
-            match meshopt_of(v) {
-                Some((name, ext)) => {
-                    let src = slice(
-                        bytes(get_usize(ext, "buffer")?)?,
-                        ext.get("byteOffset").and_then(Value::as_u64).unwrap_or(0) as usize,
-                        get_usize(ext, "byteLength")?,
-                    )
-                    .with_context(|| format!("buffer view {i}: {name} data out of range"))?;
-                    bin.resize(at + len, 0);
-                    decode_view(ext, src, &mut bin[at..]).with_context(|| format!("buffer view {i}"))?;
-                }
-                None => {
-                    let src = slice(
-                        bytes(v.get("buffer").and_then(Value::as_u64).context("missing buffer")? as usize)?,
-                        v.get("byteOffset").and_then(Value::as_u64).unwrap_or(0) as usize,
-                        len,
-                    )
-                    .with_context(|| format!("buffer view {i} out of range"))?;
-                    bin.extend_from_slice(src);
-                }
+            if let Some((name, ext)) = meshopt_of(v) {
+                let src = slice(
+                    bytes(get_usize(ext, "buffer")?)?,
+                    ext.get("byteOffset").and_then(Value::as_u64).map_or(0, usize_of),
+                    get_usize(ext, "byteLength")?,
+                )
+                .with_context(|| format!("buffer view {i}: {name} data out of range"))?;
+                bin.resize(at + len, 0);
+                decode_view(ext, src, &mut bin[at..]).with_context(|| format!("buffer view {i}"))?;
+            } else {
+                let src = slice(
+                    bytes(usize_of(
+                        v.get("buffer").and_then(Value::as_u64).context("missing buffer")?,
+                    ))?,
+                    v.get("byteOffset").and_then(Value::as_u64).map_or(0, usize_of),
+                    len,
+                )
+                .with_context(|| format!("buffer view {i} out of range"))?;
+                bin.extend_from_slice(src);
             }
             placed.push(at);
         }
@@ -305,7 +321,7 @@ impl<'a> Doc<'a> {
         if embed_images {
             embed_images_into(&mut self.json, &mut bin, fetch)?;
         }
-        self.finish(bin, Vec::new())
+        self.finish(&bin, Vec::new())
     }
 
     /// Every buffer into the binary chunk, compression kept.
@@ -353,7 +369,7 @@ impl<'a> Doc<'a> {
             require_extension(&mut self.json, &name);
         }
         embed_images_into(&mut self.json, &mut bin, fetch)?;
-        self.finish(bin, placeholders)
+        self.finish(&bin, placeholders)
     }
 
     /// Meshopt-encodes the index and vertex views of a plain GLB.
@@ -366,7 +382,7 @@ impl<'a> Doc<'a> {
         let mut new_views = Vec::with_capacity(views.len());
         for (i, (v, plan)) in views.iter().zip(&plans).enumerate() {
             let len = view_len(v)?;
-            let off = v.get("byteOffset").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let off = v.get("byteOffset").and_then(Value::as_u64).map_or(0, usize_of);
             let src = slice(bin, off, len).with_context(|| format!("buffer view {i}"))?;
             let mut v = v.as_object().cloned().context("buffer view is not an object")?;
             pad4(&mut out);
@@ -380,23 +396,22 @@ impl<'a> Doc<'a> {
                 Plan::Encode { mode, stride } => {
                     let stride = *stride;
                     let count = len / stride;
-                    let encoded = match *mode {
-                        "ATTRIBUTES" => meshopt::encode_vertex_buffer(src, stride),
-                        _ => {
-                            let idx: Vec<u32> = if stride == 2 {
-                                src.chunks_exact(2)
-                                    .map(|c| u32::from(u16::from_le_bytes([c[0], c[1]])))
-                                    .collect()
-                            } else {
-                                src.chunks_exact(4)
-                                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                                    .collect()
-                            };
-                            if *mode == "TRIANGLES" {
-                                meshopt::encode_index_buffer(&idx)
-                            } else {
-                                meshopt::encode_index_sequence(&idx)?
-                            }
+                    let encoded = if *mode == "ATTRIBUTES" {
+                        meshopt::encode_vertex_buffer(src, stride)
+                    } else {
+                        let idx: Vec<u32> = if stride == 2 {
+                            src.chunks_exact(2)
+                                .map(|c| u32::from(u16::from_le_bytes([c[0], c[1]])))
+                                .collect()
+                        } else {
+                            src.chunks_exact(4)
+                                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                .collect()
+                        };
+                        if *mode == "TRIANGLES" {
+                            meshopt::encode_index_buffer(&idx)
+                        } else {
+                            meshopt::encode_index_sequence(&idx)?
                         }
                     };
                     out.extend_from_slice(&encoded);
@@ -430,11 +445,11 @@ impl<'a> Doc<'a> {
             require_extension(&mut self.json, MESHOPT_EXTENSIONS[0]);
         }
         self.json.insert("bufferViews".into(), Value::Array(new_views));
-        self.finish(out, placeholders)
+        self.finish(&out, placeholders)
     }
 
     /// The GLB: `bin` as buffer 0, then `extra` URI-less buffers.
-    fn finish(mut self, bin: Vec<u8>, extra: Vec<Value>) -> Result<Vec<u8>> {
+    fn finish(mut self, bin: &[u8], extra: Vec<Value>) -> Result<Vec<u8>> {
         let has_views = !self.list("bufferViews").is_empty();
         if bin.is_empty() && extra.is_empty() && !has_views {
             self.json.remove("buffers");
@@ -443,7 +458,7 @@ impl<'a> Doc<'a> {
         let mut buffers = vec![json!({ "byteLength": bin.len() })];
         buffers.extend(extra);
         self.json.insert("buffers".into(), Value::Array(buffers));
-        write_glb(&Value::Object(self.json), Some(&bin))
+        write_glb(&Value::Object(self.json), Some(bin))
     }
 }
 
@@ -468,7 +483,7 @@ fn plan_compression(doc: &Doc) -> Result<Vec<Plan>> {
     let views = doc.list("bufferViews");
     let mut role = vec![Use::None; accessors.len()];
     let mut mark = |a: Option<&Value>, u: Use| {
-        if let Some(r) = a.and_then(Value::as_u64).and_then(|a| role.get_mut(a as usize)) {
+        if let Some(r) = a.and_then(Value::as_u64).and_then(|a| role.get_mut(usize_of(a))) {
             *r = match (*r, u) {
                 (Use::None, u) => u,
                 (Use::Index(s, t), Use::Index(_, t2)) => Use::Index(s, t && t2),
@@ -493,15 +508,15 @@ fn plan_compression(doc: &Doc) -> Result<Vec<Plan>> {
     let mut plans: Vec<Option<Use>> = vec![None; views.len()];
     for (a, acc) in accessors.iter().enumerate() {
         let sparse = acc.get("sparse").is_some();
-        let Some(v) = acc.get("bufferView").and_then(Value::as_u64).map(|v| v as usize) else {
+        let Some(v) = acc.get("bufferView").and_then(Value::as_u64).map(usize_of) else {
             continue;
         };
         let Some(slot) = plans.get_mut(v) else {
             continue;
         };
         let size = element_size(acc);
-        let off = acc.get("byteOffset").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let count = acc.get("count").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let off = acc.get("byteOffset").and_then(Value::as_u64).map_or(0, usize_of);
+        let count = acc.get("count").and_then(Value::as_u64).map_or(0, usize_of);
         let u = match (role[a], size) {
             _ if sparse => Use::Other,
             (Use::Index(_, tri), Some(s @ (2 | 4))) => {
@@ -529,7 +544,7 @@ fn plan_compression(doc: &Doc) -> Result<Vec<Plan>> {
                 .get(part)
                 .and_then(|p| p.get("bufferView"))
                 .and_then(Value::as_u64);
-            if let Some(slot) = v.and_then(|v| plans.get_mut(v as usize)) {
+            if let Some(slot) = v.and_then(|v| plans.get_mut(usize_of(v))) {
                 *slot = Some(Use::Other);
             }
         }
@@ -539,7 +554,7 @@ fn plan_compression(doc: &Doc) -> Result<Vec<Plan>> {
         .zip(plans)
         .map(|(v, u)| {
             let len = view_len(v)?;
-            let stride = v.get("byteStride").and_then(Value::as_u64).map(|s| s as usize);
+            let stride = v.get("byteStride").and_then(Value::as_u64).map(usize_of);
             Ok(match u {
                 Some(Use::Index(s, tri)) if stride.is_none() && len.is_multiple_of(s) => {
                     let tri = tri && len.is_multiple_of(3 * s);
@@ -612,7 +627,8 @@ fn decode_view(ext: &Map<String, Value>, src: &[u8], out: &mut [u8]) -> Result<(
     match stride {
         2 => {
             for (o, i) in out.chunks_exact_mut(2).zip(indices) {
-                o.copy_from_slice(&(i as u16).to_le_bytes());
+                let i = u16::try_from(i).map_err(|_| invalid!("meshopt index {i} in a 16-bit view"))?;
+                o.copy_from_slice(&i.to_le_bytes());
             }
         }
         4 => {
@@ -674,12 +690,13 @@ fn embed_images_into(
 fn rehome(obj: &mut Map<String, Value>, home: &[(usize, usize)]) -> Result<(usize, usize)> {
     let b = get_usize(obj, "buffer")?;
     let &(nb, base) = home.get(b).with_context(|| format!("missing buffer {b}"))?;
-    let off = obj.get("byteOffset").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let off = obj.get("byteOffset").and_then(Value::as_u64).map_or(0, usize_of);
+    let at = off.checked_add(base).context("byteOffset out of range")?;
     obj.insert("buffer".into(), json!(nb));
     if nb == 0 || off != 0 {
-        obj.insert("byteOffset".into(), json!(off + base));
+        obj.insert("byteOffset".into(), json!(at));
     }
-    Ok((nb, off + base))
+    Ok((nb, at))
 }
 
 /// A buffer view's meshopt extension, if it has one.
@@ -701,14 +718,14 @@ fn is_fallback(b: &Value) -> bool {
 fn view_len(v: &Value) -> Result<usize> {
     v.get("byteLength")
         .and_then(Value::as_u64)
-        .map(|l| l as usize)
+        .map(usize_of)
         .context("buffer view has no byteLength")
 }
 
 fn get_usize(obj: &Map<String, Value>, key: &str) -> Result<usize> {
     obj.get(key)
         .and_then(Value::as_u64)
-        .map(|v| v as usize)
+        .map(usize_of)
         .with_context(|| format!("missing {key}"))
 }
 
@@ -754,6 +771,10 @@ fn require_extension(json: &mut Map<String, Value>, name: &str) {
 }
 
 /// Frames JSON and an optional binary chunk as a GLB.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "each chunk is smaller than `total`, which fits"
+)]
 pub(crate) fn write_glb(json: &Value, bin: Option<&[u8]>) -> Result<Vec<u8>> {
     let mut text = serde_json::to_vec(json)?;
     text.resize(text.len().next_multiple_of(4), b' ');
@@ -813,6 +834,7 @@ fn decode_base64(s: &str) -> Result<Vec<u8>> {
         bits += 6;
         if bits >= 8 {
             bits -= 8;
+            #[allow(clippy::cast_possible_truncation, reason = "the low byte is the decoded one")]
             out.push((acc >> bits) as u8);
         }
     }
@@ -828,6 +850,7 @@ fn percent_decode_bytes(s: &str) -> Vec<u8> {
         if b[i] == b'%'
             && let (Some(h), Some(l)) = (b.get(i + 1).and_then(|&c| hex(c)), b.get(i + 2).and_then(|&c| hex(c)))
         {
+            #[allow(clippy::cast_possible_truncation, reason = "two hex digits are one byte")]
             out.push((h * 16 + l) as u8);
             i += 3;
         } else {
@@ -868,6 +891,7 @@ fn mime_from_name(name: &str) -> Option<&'static str> {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_precision_loss, reason = "test grids are small")]
 mod tests {
     use std::collections::HashMap;
 
@@ -907,7 +931,7 @@ mod tests {
     }
 
     fn u(v: &Value) -> usize {
-        v.as_u64().unwrap() as usize
+        usize::try_from(v.as_u64().unwrap()).unwrap()
     }
 
     /// Accessor `a`'s elements, tightly packed.
@@ -1133,9 +1157,9 @@ mod tests {
             ([0, 300, 0], [0, 500]),
             ([300, 300, 0], [500, 500]),
         ] {
-            p.iter().for_each(|v| want.extend(v.to_le_bytes()));
+            want.extend(p.iter().flat_map(|v| v.to_le_bytes()));
             want.extend([0u8, 0]);
-            t.iter().for_each(|v| want.extend(v.to_le_bytes()));
+            want.extend(t.iter().flat_map(|v| v.to_le_bytes()));
         }
         assert_eq!(&d.bin.unwrap()[..48], &want[..]);
     }

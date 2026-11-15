@@ -6,6 +6,12 @@
 //! Each case is also read from memory, with its folder's files as [`Memory`] assets, and must read the same.
 
 #![cfg(feature = "fs")]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "expectations are JSON doubles, compared at the GLB's single precision"
+)]
 
 mod glb;
 
@@ -77,21 +83,20 @@ fn cases(format: &str) -> Vec<Case> {
                     "{name}: expect.json needs \"{key}\""
                 );
             }
-            let file = match expect.get("file").and_then(Value::as_str) {
-                Some(f) => dir.join(f),
-                None => {
-                    let models: Vec<PathBuf> = std::fs::read_dir(&dir)
-                        .unwrap()
-                        .flatten()
-                        .map(|e| e.path())
-                        .filter(|p| p.is_file() && ALL_EXTENSIONS.contains(&ext_of(p).as_str()))
-                        .collect();
-                    assert!(
-                        models.len() == 1,
-                        "{name}: expected one model file, found {models:?}; name it with \"file\""
-                    );
-                    models.into_iter().next().unwrap()
-                }
+            let file = if let Some(f) = expect.get("file").and_then(Value::as_str) {
+                dir.join(f)
+            } else {
+                let models: Vec<PathBuf> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_file() && ALL_EXTENSIONS.contains(&ext_of(p).as_str()))
+                    .collect();
+                assert!(
+                    models.len() == 1,
+                    "{name}: expected one model file, found {models:?}; name it with \"file\""
+                );
+                models.into_iter().next().unwrap()
             };
             assert!(file.is_file(), "{name}: {} is missing", file.display());
             Case {
@@ -355,7 +360,7 @@ fn run(case: &Case) -> Result<(), String> {
                 hi[k] = hi[k].max(p[k]);
             }
         }
-        let mid = [0, 1, 2].map(|k| (lo[k] + hi[k]) / 2.0);
+        let mid = [0, 1, 2].map(|k| f32::midpoint(lo[k], hi[k]));
         for p in &g.prims {
             for t in p.indices.as_chunks::<3>().0 {
                 let [a, b, c] = t.map(|i| p.positions[i as usize]);

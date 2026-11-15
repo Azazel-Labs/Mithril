@@ -1,4 +1,9 @@
 //! A small deterministic generator (PCG32) for tests.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "PCG keeps the high bits of its state, and 24 random bits are exact in an f32"
+)]
 
 pub struct Pcg32 {
     state: u64,
@@ -31,6 +36,6 @@ impl Pcg32 {
     }
 
     pub fn below(&mut self, n: u32) -> u32 {
-        ((self.next_u32() as u64 * n as u64) >> 32) as u32
+        ((u64::from(self.next_u32()) * u64::from(n)) >> 32) as u32
     }
 }

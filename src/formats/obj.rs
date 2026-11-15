@@ -14,6 +14,7 @@ use super::stream;
 use crate::Result;
 use crate::assets::Assets;
 use crate::mesh::{MAX_TRIANGLES, Material, Mesh, Prim, smooth_normals, srgb_to_linear, triangulate};
+use crate::num::u32_of;
 
 /// Marks a corner without a texture coordinate or normal.
 const NONE: u32 = u32::MAX;
@@ -231,8 +232,13 @@ fn int(w: &[u8]) -> Option<i64> {
 #[inline]
 fn resolve(w: &[u8], len: usize) -> Option<u32> {
     let n = int(w)?;
-    let i = if n < 0 { len as i64 + n } else { n - 1 };
-    (0..len as i64).contains(&i).then_some(i as u32)
+    let len = i64::try_from(len).ok()?;
+    let i = if n < 0 { len + n } else { n - 1 };
+    if (0..len).contains(&i) {
+        u32::try_from(i).ok().filter(|&i| i != NONE)
+    } else {
+        None
+    }
 }
 
 /// One material's triangles, built as the faces are read.
@@ -387,23 +393,20 @@ impl Reader {
                 Some(s) => resolve(s, len),
             };
             let (t, nm) = (opt(self.vt.len()), opt(self.vn.len()));
-            match (p, t, nm) {
-                (Some(p), Some(t), Some(nm)) => face.push([p, t, nm]),
+            let (Some(p), Some(t), Some(nm)) = (p, t, nm) else {
                 // A corner naming something that isn't there: drop the face.
-                _ => {
-                    ok = false;
-                    break;
-                }
-            }
+                ok = false;
+                break;
+            };
+            face.push([p, t, nm]);
         }
         if ok && face.len() >= 3 {
-            let g = match self.current {
-                Some(g) => g,
-                None => {
-                    let g = self.group(String::new());
-                    self.current = Some(g);
-                    g
-                }
+            let g = if let Some(g) = self.current {
+                g
+            } else {
+                let g = self.group(String::new());
+                self.current = Some(g);
+                g
             };
             if face.len() == 3 {
                 for &c in &face {
@@ -438,6 +441,12 @@ impl Reader {
 
     /// Reserves the arrays once the faces so far say how big they'll get: bytes per face, and
     /// output vertices per position used.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a capacity guess from rates; MAX_TRIANGLES caps it"
+    )]
     fn size(&mut self, g: usize, at: usize, size: usize) {
         let per_face = (at - self.face_from) as f64 / (self.faces - 1) as f64;
         if per_face <= 0.0 {
@@ -477,7 +486,7 @@ impl Reader {
     #[inline]
     fn vertex(&mut self, g: usize, c: Corner) -> u32 {
         let [p, t, n] = c;
-        let want = [g as u32, t, n];
+        let want = [u32_of(g), t, n];
         let mut id = self.first[p as usize];
         while id != NONE {
             if self.key[id as usize] == want {
@@ -489,13 +498,13 @@ impl Reader {
         if head == NONE {
             self.used += 1;
         }
-        self.first[p as usize] = self.key.len() as u32;
+        self.first[p as usize] = u32_of(self.key.len());
         self.key.push(want);
         self.next.push(head);
         let grp = &mut self.groups[g];
         let prim = &mut grp.prim;
         let k = prim.positions.len();
-        self.local.push(k as u32);
+        self.local.push(u32_of(k));
         prim.positions.push(self.v[p as usize]);
         if t != NONE {
             if prim.uvs.len() < k {
@@ -520,7 +529,7 @@ impl Reader {
             grp.raw_colors.resize(k, [1.0; 3]);
             grp.raw_colors.push(self.colors[p as usize]);
         }
-        k as u32
+        u32_of(k)
     }
 }
 

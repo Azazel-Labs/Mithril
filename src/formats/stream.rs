@@ -250,6 +250,7 @@ pub(crate) fn f32_from(s: &[u8]) -> Option<f32> {
         // Both the digits and the power of ten are exact in an f32, so one multiply or divide
         // rounds correctly (Clinger's fast path).
         if m <= 1 << 24 && (-10..=10).contains(&e) {
+            #[allow(clippy::cast_precision_loss, reason = "checked to be at most 2^24, exact in an f32")]
             let v = m as f32;
             let p = POW10_F32[e.unsigned_abs() as usize];
             let v = if e < 0 { v / p } else { v * p };
@@ -266,6 +267,7 @@ pub(crate) fn f64_from(s: &[u8]) -> Option<f64> {
         && m <= 1 << 53
         && (-22..=22).contains(&e)
     {
+        #[allow(clippy::cast_precision_loss, reason = "checked to be at most 2^53, exact in an f64")]
         let v = m as f64;
         let p = POW10_F64[e.unsigned_abs() as usize];
         let v = if e < 0 { v / p } else { v * p };

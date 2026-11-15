@@ -1,4 +1,4 @@
-//! Model formats read natively: STL (binary and ASCII), PLY (ASCII and binary), MagicaVoxel
+//! Model formats read natively: STL (binary and ASCII), PLY (ASCII and binary), `MagicaVoxel`
 //! `.vox`, OBJ (with its MTL materials and textures), FBX (binary and ASCII), 3DS, 3MF, USD and
 //! glTF (`.gltf` and `.glb`).
 //! Each becomes a [`Mesh`]; textures are embedded so the mesh stands on its own. Each format is
@@ -31,6 +31,10 @@ mod ply;
 #[cfg(feature = "stl")]
 mod stl;
 #[cfg(any(feature = "stl", feature = "ply", feature = "obj"))]
+#[cfg_attr(
+    not(all(feature = "obj", feature = "ply", feature = "stl")),
+    allow(dead_code, reason = "each text reader uses its own part")
+)]
 mod stream;
 #[cfg(feature = "3ds")]
 mod tds;
@@ -59,6 +63,11 @@ pub struct Loaded {
 
 /// Reads the model at `path`, whose format is named by `ext` (lowercase, without the dot).
 #[cfg(feature = "fs")]
+///
+/// # Errors
+///
+/// When the file can't be read, `ext` names no reader (or one whose feature is off), or the
+/// model doesn't parse.
 pub fn load(path: &Path, ext: &str, assets: &dyn Assets) -> Result<Loaded> {
     read(Input::file(path), ext, assets)
 }
@@ -68,6 +77,10 @@ pub fn load(path: &Path, ext: &str, assets: &dyn Assets) -> Result<Loaded> {
 /// textures, glTF buffers, USD layers) are found from its folder and read through
 /// [`Assets::read`]. A model that refers to nothing reads with any name and an empty
 /// [`Memory`](crate::assets::Memory).
+///
+/// # Errors
+///
+/// When `ext` names no reader (or one whose feature is off) or the model doesn't parse.
 pub fn load_bytes(bytes: &[u8], name: &str, ext: &str, assets: &dyn Assets) -> Result<Loaded> {
     read(Input::memory(bytes, name), ext, assets)
 }
@@ -118,6 +131,10 @@ impl<'a> Input<'a> {
     }
 
     /// The model's bytes, when it's in memory.
+    #[cfg_attr(
+        not(feature = "fs"),
+        allow(clippy::unnecessary_wraps, reason = "only reading a file fails")
+    )]
     pub fn bytes(&self) -> Option<&'a [u8]> {
         match self.data {
             Data::Bytes(b) => Some(b),
@@ -127,6 +144,10 @@ impl<'a> Input<'a> {
     }
 
     /// The whole model.
+    #[cfg_attr(
+        not(feature = "fs"),
+        allow(clippy::unnecessary_wraps, reason = "only reading a file fails")
+    )]
     pub fn read(&self) -> io::Result<Cow<'a, [u8]>> {
         match self.data {
             Data::Bytes(b) => Ok(Cow::Borrowed(b)),
@@ -136,6 +157,10 @@ impl<'a> Input<'a> {
     }
 
     /// Up to `n` bytes from the start of the model.
+    #[cfg_attr(
+        not(feature = "fs"),
+        allow(clippy::unnecessary_wraps, reason = "only reading a file fails")
+    )]
     pub fn head(&self, n: usize) -> io::Result<Cow<'a, [u8]>> {
         match self.data {
             Data::Bytes(b) => Ok(Cow::Borrowed(&b[..b.len().min(n)])),
@@ -151,6 +176,10 @@ impl<'a> Input<'a> {
 
     /// The model a block at a time (in memory, in place).
     #[cfg(any(feature = "stl", feature = "ply", feature = "obj"))]
+    #[cfg_attr(
+        not(feature = "fs"),
+        allow(clippy::unnecessary_wraps, reason = "only reading a file fails")
+    )]
     pub fn blocks(&self) -> io::Result<stream::Blocks<'a>> {
         match self.data {
             Data::Bytes(b) => Ok(stream::Blocks::slice(b)),
@@ -165,6 +194,10 @@ impl<'a> Input<'a> {
 
     /// The model as a stream that seeks.
     #[cfg(any(feature = "3mf", feature = "usd"))]
+    #[cfg_attr(
+        not(feature = "fs"),
+        allow(clippy::unnecessary_wraps, reason = "only reading a file fails")
+    )]
     pub fn seekable(&self) -> io::Result<Box<dyn ReadSeek + 'a>> {
         match self.data {
             Data::Bytes(b) => Ok(Box::new(io::Cursor::new(b))),
@@ -429,12 +462,35 @@ vt 0 1
     }
 
     #[test]
+    #[cfg(feature = "ply")]
+    fn ply_nan_index_drops_its_face() {
+        let ply = "ply
+format ascii 1.0
+element vertex 4
+property float x
+property float y
+property float z
+                   element face 2
+property list uchar int vertex_indices
+end_header
+0 0 0
+1 0 0
+1 1 0
+0 1 0
+                   3 0 1 2
+3 nan 2 3
+";
+        let (_, f) = load_bytes("n.ply", ply.as_bytes());
+        assert_eq!(f["triangles"], 1, "a NaN index is no vertex, not vertex 0");
+    }
+
+    #[test]
     #[cfg(feature = "vox")]
     fn vox_exposed_faces_by_color() {
         // Two adjacent voxels with different colors: 12 faces minus the 2 touching ones.
         let chunk = |id: &[u8], body: &[u8]| {
             let mut c = id.to_vec();
-            c.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            c.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
             c.extend_from_slice(&0u32.to_le_bytes());
             c.extend_from_slice(body);
             c
@@ -452,7 +508,7 @@ vt 0 1
         file.extend_from_slice(&150u32.to_le_bytes());
         file.extend_from_slice(b"MAIN");
         file.extend_from_slice(&0u32.to_le_bytes());
-        file.extend_from_slice(&(children.len() as u32).to_le_bytes());
+        file.extend_from_slice(&u32::try_from(children.len()).unwrap().to_le_bytes());
         file.extend(children);
         let (m, f) = load_bytes("v.vox", &file);
         let m = m.unwrap();
