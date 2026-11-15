@@ -137,7 +137,7 @@ fn read(doc: &Document<'_>) -> Result<Plan> {
             for a in accs {
                 ensure!(
                     r.acc(a)?.view.is_some(),
-                    "glTF uses Draco compression, which needs Mithril's `draco` feature"
+                    "glTF uses Draco compression, which needs Polysmelt's `draco` feature"
                 );
             }
         }
