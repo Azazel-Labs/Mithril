@@ -94,8 +94,9 @@ Rust 1.88, with any features but `usd`. The `usd` feature, and so the default bu
 
 ## Planned scope
 
-- **Lossless conversion**: OBJ, 3MF, VOX, PLY, STL and 3DS converted into the document with
-  their hierarchy, skins, animations and full materials (glTF, FBX and USD already are),
+- **Lossless conversion**: OBJ, 3MF and 3DS converted into the document with
+  their hierarchy, skins, animations and full materials (glTF, FBX, USD, STL, PLY and VOX
+  already are),
   units and axes recorded in extras, and readers that skip what `Keep` drops. glTF 1.0.
 - **Typed views** over the document's meshes, accessors, nodes, skins and animations.
 - **Accessors**: typed access through the document (the mesh reader already reads every

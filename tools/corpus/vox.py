@@ -46,9 +46,11 @@ def rgba(colors):
     return chunk(b"RGBA", b"".join(struct.pack("<4B", *c) for c in pal))
 
 
-def ntrn(node, child, frame=None, attrs=None, layer=-1):
+def ntrn(node, child, frame=None, attrs=None, layer=-1, frames=None):
+    """`frames`, when given, replaces the one `frame`."""
+    frames = frames if frames is not None else [frame or {}]
     body = struct.pack("<I", node) + dict_(attrs or {}) + struct.pack("<Iii", child, -1, layer)
-    body += struct.pack("<I", 1) + dict_(frame or {})
+    body += struct.pack("<I", len(frames)) + b"".join(dict_(f) for f in frames)
     return chunk(b"nTRN", body)
 
 
@@ -61,8 +63,11 @@ def nshp(node, model):
     return chunk(b"nSHP", struct.pack("<I", node) + dict_({}) + struct.pack("<I", 1) + struct.pack("<I", model) + dict_({}))
 
 
-def layr(layer, hidden=False):
-    return chunk(b"LAYR", struct.pack("<i", layer) + dict_({"_hidden": "1"} if hidden else {}) + struct.pack("<i", -1))
+def layr(layer, hidden=False, name=None):
+    d = {"_hidden": "1"} if hidden else {}
+    if name:
+        d["_name"] = name
+    return chunk(b"LAYR", struct.pack("<i", layer) + dict_(d) + struct.pack("<i", -1))
 
 
 def matl(index, d):
@@ -170,9 +175,10 @@ def scene(models, placements, extra=b""):
 CUBE2 = ((2, 2, 2), block(2, 2, 2))
 # A placed model is centred on floor(size / 2): a 2-cube spans -1..1 before translation.
 case(FMT, "scene_translation",
-     {"scene.vox": scene([CUBE2], [(0, {"_t": "10 0 3"}, {}, 0)])},
-     {"spec": EXT + ": nTRN _t translation; the model centred on floor(size / 2)", "source": SRC,
-      "area": 24, "bounds": bounds([9, -1, 2], [11, 1, 4])})
+     {"scene.vox": scene([CUBE2], [(0, {"_t": "10 0 3"}, {"_name": "crate"}, 0)])},
+     {"spec": EXT + ": nTRN _t translation; the model centred on floor(size / 2); _name names the node",
+      "source": SRC, "area": 24, "bounds": bounds([9, -1, 2], [11, 1, 4]),
+      "document": {"nodes": 2, "node_names": ["crate"], "source": {"format": "VOX", "version": 200}}})
 
 case(FMT, "scene_odd_size_pivot",
      {"scene.vox": scene([((3, 1, 1), block(3, 1, 1))], [(0, {}, {}, 0)])},
@@ -204,18 +210,29 @@ case(FMT, "scene_two_models",
 
 case(FMT, "scene_instanced_model",
      {"scene.vox": scene([CUBE2], [(0, {"_t": "-5 0 0"}, {}, 0), (0, {"_t": "5 0 0"}, {}, 0)])},
-     {"spec": EXT + ": one model placed twice", "source": SRC, "area": 48,
-      "bounds": bounds([-6, -1, -1], [6, 1, 1])})
+     {"spec": EXT + ": one model placed twice, its nodes sharing its mesh", "source": SRC, "area": 48,
+      "bounds": bounds([-6, -1, -1], [6, 1, 1]), "document": {"nodes": 3, "meshes": 1}})
 
 case(FMT, "scene_hidden_node",
      {"scene.vox": scene([CUBE2], [(0, {}, {}, 0), (0, {"_t": "20 0 0"}, {"_hidden": "1"}, 0)])},
-     {"spec": EXT + ": a transform with _hidden 1 isn't drawn", "source": SRC, "area": 24,
-      "bounds": bounds([-1, -1, -1], [1, 1, 1])})
+     {"spec": EXT + ": a transform with _hidden 1 is kept, hidden, and isn't drawn", "source": SRC, "area": 24,
+      "bounds": bounds([-1, -1, -1], [1, 1, 1]), "document": {"nodes": 3}})
 
 case(FMT, "scene_hidden_layer",
-     {"scene.vox": scene([CUBE2], [(0, {}, {}, 0), (0, {"_t": "20 0 0"}, {}, 1)], layr(0) + layr(1, hidden=True))},
-     {"spec": EXT + ": a transform on a hidden layer isn't drawn", "source": SRC, "area": 24,
-      "bounds": bounds([-1, -1, -1], [1, 1, 1])})
+     {"scene.vox": scene([CUBE2], [(0, {}, {}, 0), (0, {"_t": "20 0 0"}, {}, 1)],
+                         layr(0) + layr(1, hidden=True, name="props"))},
+     {"spec": EXT + ": a transform on a hidden layer is kept, hidden, and isn't drawn", "source": SRC, "area": 24,
+      "bounds": bounds([-1, -1, -1], [1, 1, 1]),
+      "document": {"nodes": 3, "source": {"layers": [{"id": 0}, {"id": 1, "_hidden": "1", "_name": "props"}]}}})
+
+# Frames: the first places the node, all of them step through an animation.
+anim = (size(1, 1, 1) + xyzi([(0, 0, 0, 1)]) + ntrn(0, 1) + ngrp(1, [2])
+        + ntrn(2, 3, frames=[{"_f": "0", "_t": "0 0 0"}, {"_f": "5", "_t": "4 0 0"}, {"_f": "9", "_r": str(ROT)}])
+        + nshp(3, 0))
+case(FMT, "scene_animation", {"scene.vox": vox(anim)},
+     {"spec": EXT + ": nTRN frames with _f numbers become a step animation; the first frame is the rest pose",
+      "source": SRC, "area": 6, "bounds": bounds([0, 0, 0], [1, 1, 1]),
+      "document": {"animations": 1, "channels": 2}})
 
 # Nested groups: translations add up through the hierarchy.
 nested = (size(1, 1, 1) + xyzi([(0, 0, 0, 1)]) + ntrn(0, 1) + ngrp(1, [2]) + ntrn(2, 3, {"_t": "10 0 0"})

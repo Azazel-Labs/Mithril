@@ -3,7 +3,8 @@
 //!
 //! - The default scene is drawn (else scene 0; with no scenes, every root node; with no nodes,
 //!   every mesh). Node transforms are baked into the vertices; a mirroring transform flips the
-//!   winding back. `EXT_mesh_gpu_instancing` instances are baked the same way.
+//!   winding back. `EXT_mesh_gpu_instancing` instances are baked the same way. A node
+//!   `KHR_node_visibility` hides isn't drawn, nor anything under it.
 //! - The pose is the nodes' own transforms and weights, or an animation's at a time
 //!   ([`Pose`]): translation, rotation, scale and morph weights, with linear, step and
 //!   cubic-spline interpolation.
@@ -163,7 +164,8 @@ fn children(nodes: &[Value]) -> Vec<bool> {
     child
 }
 
-/// The nodes the default scene draws, parents before children, each once; `None` for a
+/// The nodes the default scene draws, parents before children, each once, leaving out those
+/// `KHR_node_visibility` hides and everything under them; `None` for a
 /// document without nodes, which draws every mesh as it is.
 fn scene_order(json: &Map<String, Value>) -> Result<Option<Vec<usize>>> {
     let nodes = list(json, "nodes");
@@ -186,6 +188,10 @@ fn scene_order(json: &Map<String, Value>) -> Result<Option<Vec<usize>>> {
             continue;
         }
         seen[i] = true;
+        // KHR_node_visibility: a hidden node hides everything under it.
+        if nodes[i].pointer("/extensions/KHR_node_visibility/visible") == Some(&Value::Bool(false)) {
+            continue;
+        }
         order.push(i);
         stack.extend(list_of(&nodes[i], "children").into_iter().rev());
     }
@@ -302,6 +308,7 @@ fn drawable(extension: &str) -> bool {
         "KHR_mesh_quantization",
         "EXT_mesh_gpu_instancing",
         "KHR_animation_pointer",
+        "KHR_node_visibility",
     ];
     const LOOKS: &[&str] = &[
         "KHR_materials_",
