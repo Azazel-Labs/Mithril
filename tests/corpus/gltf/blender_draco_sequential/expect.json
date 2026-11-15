@@ -1,0 +1,20 @@
+{
+  "spec": "glTF 2.0 as Blender's exporter writes it: smooth normals, Draco-compressed (sequential connectivity, level 0)",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.export_scene.gltf), tools/corpus/blender_export.py",
+  "triangles": 968,
+  "bounds": {
+    "min": [
+      -1.3672,
+      -0.9844,
+      -0.8516
+    ],
+    "max": [
+      1.3672,
+      0.9844,
+      0.8516
+    ]
+  },
+  "uvs": true,
+  "tolerance": 0.0005,
+  "needs": "draco"
+}

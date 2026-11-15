@@ -749,12 +749,18 @@ def gltf_cases():
     gltf_export("shape_key", export_apply=False)
     write_case("gltf", "shape_key", GLTF_SPEC + ": a morph target at its default weight", GLTF_OP, stats())
 
-    # Draco: refused with a clear message.
-    reset()
-    add(bpy.ops.mesh.primitive_cube_add)
-    gltf_export("draco", export_draco_mesh_compression_enable=True)
-    write_case("gltf", "draco", GLTF_SPEC + ": Draco-compressed (KHR_draco_mesh_compression), not read", GLTF_OP,
-               {"error": "Draco"})
+    # Draco (KHR_draco_mesh_compression) at three levels. Blender's exporter writes EdgeBreaker
+    # connectivity at the default and at 10 (the most compression), and sequential connectivity
+    # at 0. Positions are quantized to 14 bits, so bounds hold to about a ten-thousandth of the
+    # model's size.
+    for name, level, how in (("draco", 6, "EdgeBreaker"), ("draco_sequential", 0, "sequential connectivity"),
+                             ("draco_level_10", 10, "EdgeBreaker at the most compression")):
+        reset()
+        add(bpy.ops.mesh.primitive_monkey_add)
+        bpy.ops.object.shade_smooth()
+        gltf_export(name, export_draco_mesh_compression_enable=True, export_draco_mesh_compression_level=level)
+        write_case("gltf", name, GLTF_SPEC + f": smooth normals, Draco-compressed ({how}, level {level})",
+                   GLTF_OP, {**stats(), "uvs": True, "tolerance": 5e-4, "needs": "draco"})
 
     print("blender gltf cases written")
 

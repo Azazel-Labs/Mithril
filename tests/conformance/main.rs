@@ -42,6 +42,11 @@ fn enabled(ext: &str) -> bool {
     }
 }
 
+/// Whether this build has a cargo feature a case `needs` beyond its format's own.
+fn has_feature(name: &str) -> bool {
+    name == "draco" && cfg!(feature = "draco")
+}
+
 /// Every model extension a full build reads, so cases are found in builds without some readers.
 const ALL_EXTENSIONS: &[&str] = &[
     "stl", "ply", "vox", "obj", "3ds", "fbx", "3mf", "usd", "usda", "usdc", "usdz", "gltf", "glb",
@@ -456,7 +461,8 @@ fn check(format: &str) {
     let mut failures = Vec::new();
     let mut ran = 0;
     for case in &cases {
-        if !enabled(&ext_of(&case.file)) {
+        let needs = case.expect.get("needs").and_then(Value::as_str);
+        if !enabled(&ext_of(&case.file)) || needs.is_some_and(|f| !has_feature(f)) {
             continue;
         }
         ran += 1;

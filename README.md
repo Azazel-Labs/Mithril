@@ -50,6 +50,7 @@ Early. What exists today:
 | `fbx` | FBX | `fbxcel`, `base64` |
 | `3mf` | 3MF | `zip`, `quick-xml` |
 | `usd` | USD | `openusd`, `openusd-schemas`, `zip` |
+| `draco` | Draco-compressed glTF (KHR_draco_mesh_compression) | `draco-core` |
 | `fs` | Reading files: `formats::load`, `assets::Folder`, `gltf::files_in` | none |
 
 Every reader is on by default, and so is `fs`. `minimal` is the six readers with no

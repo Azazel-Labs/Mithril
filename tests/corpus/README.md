@@ -109,6 +109,7 @@ are required. Every other key is optional and is checked only when present.
 | Key | Meaning |
 | --- | --- |
 | `file` | The model file to load. Required when the folder holds more than one model file. |
+| `needs` | A cargo feature the case needs beyond its format's own, such as `draco`. Builds without it skip the case. |
 | `error` | Loading must fail with an error containing this text (case-insensitive). |
 | `no_mesh` | `true`: the file loads but has nothing to draw. |
 | `facts` | An object; each entry must match the loader's `facts`. |

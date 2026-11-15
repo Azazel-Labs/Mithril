@@ -24,6 +24,7 @@ use std::fs::File;
 #[cfg(feature = "fs")]
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
 
@@ -112,6 +113,8 @@ struct Acc {
     n: usize,
     normalized: bool,
     sparse: Option<Value>,
+    /// Elements decoded from Draco, tightly packed, in place of a buffer view.
+    decoded: Option<Arc<[u8]>>,
 }
 
 impl Acc {
@@ -164,6 +167,9 @@ struct Reader<'a> {
     budget: usize,
     points: usize,
     lines: usize,
+    /// The current primitive's Draco-decoded accessors: (accessor, elements, component type,
+    /// components).
+    draco: Vec<(usize, Arc<[u8]>, u64, usize)>,
 }
 
 fn list<'v>(obj: &'v Map<String, Value>, key: &str) -> &'v [Value] {
@@ -344,9 +350,12 @@ impl<'a> Reader<'a> {
                 .chain(list(&json, "extensionsUsed"))
                 .any(|e| e.as_str() == Some(name))
         };
+        #[cfg(not(feature = "draco"))]
         ensure!(
-            !required("KHR_draco_mesh_compression"),
-            "glTF uses Draco compression (KHR_draco_mesh_compression), which isn't read"
+            !list(&json, "extensionsRequired")
+                .iter()
+                .any(|e| e.as_str() == Some("KHR_draco_mesh_compression")),
+            "glTF uses Draco compression, which needs Mithril's `draco` feature"
         );
         let meshopt = container::MESHOPT_EXTENSIONS.iter().any(|e| required(e))
             || list(&json, "bufferViews").iter().any(|v| {
@@ -380,6 +389,7 @@ impl<'a> Reader<'a> {
             budget: MAX_TRIANGLES,
             points: 0,
             lines: 0,
+            draco: Vec::new(),
         })
     }
 
@@ -449,6 +459,19 @@ impl<'a> Reader<'a> {
     }
 
     fn acc(&self, i: usize) -> Result<Acc> {
+        if let Some((_, bytes, ctype, n)) = self.draco.iter().find(|d| d.0 == i) {
+            let count = bytes.len() / (n * 4);
+            return Ok(Acc {
+                view: None,
+                offset: 0,
+                count,
+                ctype: *ctype,
+                n: *n,
+                normalized: false,
+                sparse: None,
+                decoded: Some(bytes.clone()),
+            });
+        }
         let a = self.get("accessors", i)?;
         let ctype = a.get("componentType").and_then(Value::as_u64).unwrap_or(0);
         ensure!(
@@ -471,12 +494,17 @@ impl<'a> Reader<'a> {
             n,
             normalized: a.get("normalized").and_then(Value::as_bool).unwrap_or(false),
             sparse: a.get("sparse").cloned(),
+            decoded: None,
         })
     }
 
     /// Calls `f(first, bytes, stride)` over an accessor's elements a block at a time: element
     /// `first + j` is at `bytes[j * stride..]`. Nothing for an accessor without a buffer view.
     fn blocks(&mut self, a: &Acc, mut f: impl FnMut(usize, &[u8], usize)) -> Result<()> {
+        if let Some(bytes) = &a.decoded {
+            f(0, bytes, a.esize());
+            return Ok(());
+        }
         let Some(view) = a.view else {
             ensure!(a.count <= MAX_VERTICES, "glTF accessor counts {} elements", a.count);
             return Ok(());
@@ -684,6 +712,7 @@ impl<'a> Reader<'a> {
             n: 1,
             normalized: false,
             sparse: None,
+            decoded: None,
         };
         let at = self.read_u32s(&idx)?;
         let (vv, voff) = part("values")?;
@@ -691,6 +720,7 @@ impl<'a> Reader<'a> {
             view: Some(vv),
             offset: voff,
             sparse: None,
+            decoded: None,
             count,
             ..a.clone()
         };
@@ -1031,12 +1061,6 @@ impl Reader<'_> {
     }
 
     fn primitive(&mut self, p: &Value, u: &Use, mesh: &mut Mesh) -> Result<()> {
-        ensure!(
-            p.get("extensions")
-                .and_then(|e| e.get("KHR_draco_mesh_compression"))
-                .is_none(),
-            "glTF uses Draco compression (KHR_draco_mesh_compression), which isn't read"
-        );
         let mode = p.get("mode").and_then(Value::as_u64).unwrap_or(4);
         let attrs = p.get("attributes").cloned().unwrap_or(Value::Null);
         let Some(pos) = index(&attrs, "POSITION") else {
@@ -1055,6 +1079,21 @@ impl Reader<'_> {
                 _ => {}
             }
             return Ok(());
+        }
+
+        self.draco.clear();
+        if let Some(ext) = p.get("extensions").and_then(|e| e.get("KHR_draco_mesh_compression")) {
+            #[cfg(feature = "draco")]
+            self.decode_draco(ext, &attrs, index(p, "indices"))?;
+            #[cfg(not(feature = "draco"))]
+            {
+                // Files may carry uncompressed data beside the Draco stream, for readers without it.
+                let _ = ext;
+                ensure!(
+                    self.acc(pos)?.view.is_some(),
+                    "glTF uses Draco compression, which needs Mithril's `draco` feature"
+                );
+            }
         }
 
         // Check the triangle count before reading any vertices.
@@ -1162,6 +1201,73 @@ impl Reader<'_> {
         let material = self.material(material, mesh);
         self.budget -= g.indices.len() / 3 * u.transforms.len();
         mesh.prims.push(place(g, &u.transforms, material));
+        Ok(())
+    }
+
+    /// Decodes a primitive's Draco stream, so its indices and the attributes it compresses read
+    /// from the decoded values instead of their buffer views. Positions and other quantized
+    /// attributes come out dequantized; integer attributes are normalized here when their
+    /// accessor says so.
+    #[cfg(feature = "draco")]
+    fn decode_draco(&mut self, ext: &Value, attrs: &Value, indices: Option<usize>) -> Result<()> {
+        use draco_core::decode_limits::DecodeLimits;
+        use draco_core::decoder_buffer::DecoderBuffer;
+        use draco_core::draco_types::DataType;
+        use draco_core::mesh_decoder::MeshDecoder;
+
+        let view = index(ext, "bufferView").context("glTF Draco primitive has no bufferView")?;
+        let bytes = self.view_bytes(view)?;
+        let limits = DecodeLimits::default()
+            .with_max_faces(self.budget as u64)
+            .with_max_points(MAX_VERTICES as u64);
+        let mut buffer = DecoderBuffer::new(&bytes).with_limits(limits);
+        let mut dm = draco_core::mesh::Mesh::new();
+        MeshDecoder::new()
+            .decode(&mut buffer, &mut dm)
+            .map_err(|e| invalid!("glTF Draco data doesn't decode: {e}"))?;
+        drop(bytes);
+
+        if let Some(i) = indices {
+            let mut out = Vec::with_capacity(dm.num_faces() * 12);
+            for face in dm.faces() {
+                for p in face {
+                    out.extend_from_slice(&p.0.to_le_bytes());
+                }
+            }
+            self.draco.push((i, out.into(), 5125, 1));
+        }
+        let points = dm.num_points();
+        let mut decoded = Vec::new();
+        for (name, id) in ext.get("attributes").and_then(Value::as_object).into_iter().flatten() {
+            let (Some(acc), Some(id)) = (index(attrs, name), id.as_u64().and_then(|v| u32::try_from(v).ok())) else {
+                continue;
+            };
+            let attribute = dm
+                .attribute_by_unique_id(id)
+                .with_context(|| format!("glTF Draco stream has no attribute {id} for {name}"))?;
+            let a = self.acc(acc)?;
+            let mut values = attribute.read_f32s(points, a.n);
+            if a.normalized || attribute.normalized() {
+                let max = match attribute.data_type() {
+                    DataType::Uint8 => Some((255.0, 0.0)),
+                    DataType::Int8 => Some((127.0, -1.0)),
+                    DataType::Uint16 => Some((65535.0, 0.0)),
+                    DataType::Int16 => Some((32767.0, -1.0)),
+                    _ => None,
+                };
+                if let Some((max, floor)) = max {
+                    for v in &mut values {
+                        *v = (*v / max).max(floor);
+                    }
+                }
+            }
+            let mut out = Vec::with_capacity(values.len() * 4);
+            for v in values {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            decoded.push((acc, out.into(), 5126, a.n));
+        }
+        self.draco.extend(decoded);
         Ok(())
     }
 

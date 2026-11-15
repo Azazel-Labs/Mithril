@@ -597,8 +597,11 @@ case(FMT, "vertex_colors", {"tri.glb": g.glb()},
 
 g = cube_doc()
 g.use("KHR_draco_mesh_compression", required=True)
-case(FMT, "draco", {"cube.glb": g.glb()},
-     {"spec": "KHR_draco_mesh_compression: refused with a clear error", "source": SRC, "error": "Draco"})
+g.j["meshes"][0]["primitives"][0]["extensions"] = {"KHR_draco_mesh_compression": {
+    "bufferView": g.view(b"DRACO\x02\x02\x01\x01\x00" + bytes(range(7, 250, 9))), "attributes": {"POSITION": 0}}}
+case(FMT, "draco_corrupt", {"cube.glb": g.glb()},
+     {"spec": "KHR_draco_mesh_compression with a stream cut short: a clear error, with or without Draco support",
+      "source": SRC, "error": "Draco"})
 
 case(FMT, "truncated", {"cube.glb": cube_doc().glb()[:-100]},
      {"spec": SPEC + ": a GLB cut short", "source": SRC, "error": "declares"})
