@@ -6,11 +6,11 @@
 //! the reader doesn't use are skipped. A file without faces is a point cloud: no mesh, but its
 //! point count.
 
-use std::fs::File;
 use std::path::Path;
 
 use serde_json::{Map, Value, json};
 
+use super::Input;
 use super::stream::{self, Blocks};
 use crate::assets::Assets;
 use crate::mesh::{
@@ -454,8 +454,9 @@ struct Body {
     local: Vec<[u32; 3]>,
 }
 
-pub(crate) fn ply(path: &Path, assets: &dyn Assets) -> Result<(Option<Mesh>, Map<String, Value>)> {
-    let mut blocks = Blocks::new(File::open(path)?);
+pub(crate) fn ply(input: Input<'_>, assets: &dyn Assets) -> Result<(Option<Mesh>, Map<String, Value>)> {
+    let path = input.path;
+    let mut blocks = input.blocks()?;
     // The header, whole.
     let mut want = 4096;
     let (format, elements, texture, start) = loop {
@@ -509,7 +510,7 @@ enum Kind {
 
 /// Reads one element's items, a block of the file at a time.
 fn read_element(
-    blocks: &mut Blocks,
+    blocks: &mut Blocks<'_>,
     format: Format,
     el: &Element,
     has_faces: bool,

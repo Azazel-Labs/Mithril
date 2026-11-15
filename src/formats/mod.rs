@@ -3,7 +3,13 @@
 //! glTF (`.gltf` and `.glb`).
 //! Each becomes a [`Mesh`]; textures are embedded so the mesh stands on its own. Each format is
 //! behind a cargo feature of its name (`3ds` and `3mf` for those two).
+//!
+//! [`load_bytes`] reads a model already in memory, with the files it refers to found through
+//! [`Assets`] (such as [`Memory`](crate::assets::Memory)). [`load`] reads a file, and needs the
+//! `fs` feature.
 
+use std::borrow::Cow;
+use std::io;
 use std::path::Path;
 
 use serde_json::{Map, Value, json};
@@ -52,7 +58,128 @@ pub struct Loaded {
 }
 
 /// Reads the model at `path`, whose format is named by `ext` (lowercase, without the dot).
+#[cfg(feature = "fs")]
 pub fn load(path: &Path, ext: &str, assets: &dyn Assets) -> Result<Loaded> {
+    read(Input::file(path), ext, assets)
+}
+
+/// Reads a model already in memory, whose format is named by `ext` (lowercase, without the
+/// dot). `name` is the model's path among `assets`: the files it refers to (MTL libraries,
+/// textures, glTF buffers, USD layers) are found from its folder and read through
+/// [`Assets::read`]. A model that refers to nothing reads with any name and an empty
+/// [`Memory`](crate::assets::Memory).
+pub fn load_bytes(bytes: &[u8], name: &str, ext: &str, assets: &dyn Assets) -> Result<Loaded> {
+    read(Input::memory(bytes, name), ext, assets)
+}
+
+/// A model to read: its path (or, in memory, its name), and where its bytes are.
+#[derive(Clone, Copy)]
+pub(crate) struct Input<'a> {
+    /// The model's path or name: references are resolved from its folder.
+    pub path: &'a Path,
+    data: Data<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum Data<'a> {
+    /// The file at the path, read as needed.
+    #[cfg(feature = "fs")]
+    File,
+    /// The whole model, in memory.
+    Bytes(&'a [u8]),
+}
+
+/// A stream that seeks, for zip archives.
+#[cfg(any(feature = "3mf", feature = "usd"))]
+pub(crate) trait ReadSeek: io::Read + io::Seek {}
+
+#[cfg(any(feature = "3mf", feature = "usd"))]
+impl<T: io::Read + io::Seek> ReadSeek for T {}
+
+#[allow(dead_code)]
+impl<'a> Input<'a> {
+    /// The model in the file at `path`.
+    #[cfg(feature = "fs")]
+    pub fn file(path: &'a Path) -> Self {
+        Self {
+            path,
+            data: Data::File,
+        }
+    }
+
+    /// A model in memory, named `name`.
+    pub fn memory(bytes: &'a [u8], name: &'a str) -> Self {
+        Self {
+            path: Path::new(name),
+            data: Data::Bytes(bytes),
+        }
+    }
+
+    /// The model's folder.
+    pub fn dir(&self) -> &'a Path {
+        self.path.parent().unwrap_or(Path::new(""))
+    }
+
+    /// The model's bytes, when it's in memory.
+    pub fn bytes(&self) -> Option<&'a [u8]> {
+        match self.data {
+            Data::Bytes(b) => Some(b),
+            #[cfg(feature = "fs")]
+            Data::File => None,
+        }
+    }
+
+    /// The whole model.
+    pub fn read(&self) -> io::Result<Cow<'a, [u8]>> {
+        match self.data {
+            Data::Bytes(b) => Ok(Cow::Borrowed(b)),
+            #[cfg(feature = "fs")]
+            Data::File => std::fs::read(self.path).map(Cow::Owned),
+        }
+    }
+
+    /// Up to `n` bytes from the start of the model.
+    pub fn head(&self, n: usize) -> io::Result<Cow<'a, [u8]>> {
+        match self.data {
+            Data::Bytes(b) => Ok(Cow::Borrowed(&b[..b.len().min(n)])),
+            #[cfg(feature = "fs")]
+            Data::File => {
+                use std::io::Read as _;
+                let mut head = Vec::new();
+                std::fs::File::open(self.path)?
+                    .take(n as u64)
+                    .read_to_end(&mut head)?;
+                Ok(Cow::Owned(head))
+            }
+        }
+    }
+
+    /// The model a block at a time (in memory, in place).
+    #[cfg(any(feature = "stl", feature = "ply", feature = "obj"))]
+    pub fn blocks(&self) -> io::Result<stream::Blocks<'a>> {
+        match self.data {
+            Data::Bytes(b) => Ok(stream::Blocks::slice(b)),
+            #[cfg(feature = "fs")]
+            Data::File => {
+                let file = std::fs::File::open(self.path)?;
+                let size = file.metadata().map_or(0, |m| m.len());
+                Ok(stream::Blocks::reader(file, size))
+            }
+        }
+    }
+
+    /// The model as a stream that seeks.
+    #[cfg(any(feature = "3mf", feature = "usd"))]
+    pub fn seekable(&self) -> io::Result<Box<dyn ReadSeek + 'a>> {
+        match self.data {
+            Data::Bytes(b) => Ok(Box::new(io::Cursor::new(b))),
+            #[cfg(feature = "fs")]
+            Data::File => Ok(Box::new(std::fs::File::open(self.path)?)),
+        }
+    }
+}
+
+fn read(input: Input<'_>, ext: &str, assets: &dyn Assets) -> Result<Loaded> {
     let counted = |m: Mesh| {
         let mut facts = Map::new();
         facts.insert("triangles".into(), json!(m.triangles()));
@@ -61,41 +188,41 @@ pub fn load(path: &Path, ext: &str, assets: &dyn Assets) -> Result<Loaded> {
             facts,
         }
     };
-    let _ = (&counted, path, assets);
+    let _ = (&counted, input, assets);
     match ext {
         #[cfg(feature = "stl")]
-        "stl" => stl::stl(path).map(counted),
+        "stl" => stl::stl(input).map(counted),
         #[cfg(feature = "ply")]
-        "ply" => ply::ply(path, assets).map(|(mesh, facts)| Loaded { mesh, facts }),
+        "ply" => ply::ply(input, assets).map(|(mesh, facts)| Loaded { mesh, facts }),
         #[cfg(feature = "vox")]
-        "vox" => vox::vox(&std::fs::read(path)?).map(|(mesh, facts)| Loaded { mesh, facts }),
+        "vox" => vox::vox(&input.read()?).map(|(mesh, facts)| Loaded { mesh, facts }),
         #[cfg(feature = "3mf")]
-        "3mf" => threemf::load(path).map(|(mesh, facts)| Loaded { mesh, facts }),
+        "3mf" => threemf::load(input).map(|(mesh, facts)| Loaded { mesh, facts }),
         #[cfg(feature = "3ds")]
         "3ds" => {
-            let mut mesh = tds::load(path, assets)?;
-            guess_color_texture(&mut mesh, path, assets);
+            let mut mesh = tds::load(input, assets)?;
+            guess_color_texture(&mut mesh, input.path, assets);
             Ok(counted(mesh))
         }
         #[cfg(feature = "usd")]
         "usd" | "usda" | "usdc" | "usdz" => {
-            Ok(usd::load(path, assets)?.map_or_else(Loaded::default, counted))
+            Ok(usd::load(input, assets)?.map_or_else(Loaded::default, counted))
         }
         #[cfg(feature = "obj")]
         "obj" => Ok(counted(colors_and_textures(
-            obj::obj(path, assets)?,
-            path,
+            obj::obj(input, assets)?,
+            input,
             ext,
             assets,
         ))),
         #[cfg(feature = "fbx")]
         "fbx" => {
-            let mut mesh = fbx::load(path, assets)?;
-            guess_color_texture(&mut mesh, path, assets);
+            let mut mesh = fbx::load(input, assets)?;
+            guess_color_texture(&mut mesh, input.path, assets);
             Ok(counted(mesh))
         }
         #[cfg(feature = "gltf")]
-        "gltf" | "glb" => gltf::load(path, assets).map(|(mesh, mut facts)| {
+        "gltf" | "glb" => gltf::load(input, assets).map(|(mesh, mut facts)| {
             if let Some(m) = &mesh {
                 facts.insert("triangles".into(), json!(m.triangles()));
             }
@@ -117,30 +244,25 @@ fn feature_for(ext: &str) -> &str {
 
 /// OBJ and FBX: colors to linear unless the file wrote them so, and a guessed color texture.
 #[cfg(feature = "obj")]
-fn colors_and_textures(mut mesh: Mesh, path: &Path, ext: &str, assets: &dyn Assets) -> Mesh {
-    if !linear_colors(path, ext) {
+fn colors_and_textures(mut mesh: Mesh, input: Input<'_>, ext: &str, assets: &dyn Assets) -> Mesh {
+    if !linear_colors(input, ext) {
         for m in &mut mesh.materials {
             for c in m.color[..3].iter_mut().chain(&mut m.emissive) {
                 *c = crate::mesh::srgb_to_linear(*c);
             }
         }
     }
-    guess_color_texture(&mut mesh, path, assets);
+    guess_color_texture(&mut mesh, input.path, assets);
     mesh
 }
 
 #[cfg(feature = "obj")]
 /// Whether the file's material colors are linear values (Blender's OBJ and FBX exporters write them so) rather
 /// than the sRGB other tools write.
-fn linear_colors(path: &Path, ext: &str) -> bool {
-    use std::io::Read as _;
-    let mut head = Vec::new();
-    let Ok(f) = std::fs::File::open(path) else {
+fn linear_colors(input: Input<'_>, ext: &str) -> bool {
+    let Ok(head) = input.head(65_536) else {
         return false;
     };
-    if f.take(65_536).read_to_end(&mut head).is_err() {
-        return false;
-    }
     if ext == "obj" {
         let text: String = String::from_utf8_lossy(&head).chars().take(500).collect();
         text.lines().any(|l| l.starts_with("# Blender"))
@@ -177,17 +299,37 @@ fn guess_color_texture(mesh: &mut Mesh, path: &Path, assets: &dyn Assets) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
-    use crate::assets::Folder;
+    use crate::assets::{Folder, Memory};
     #[allow(unused_imports)]
     use crate::mesh::{GRAY, to_glb};
 
-    /// Reads `path` with assets found under `root`, as (mesh, facts).
+    /// Reads `path` with assets found under `root`, as (mesh, facts); and reads it again from
+    /// memory, with every file under `root` as a [`Memory`], to check the two agree.
     #[allow(dead_code)]
     fn load_in(path: &Path, ext: &str, root: &Path) -> (Option<Mesh>, Map<String, Value>) {
         let loaded = load(path, ext, &Folder::new(root)).unwrap();
+        let mut memory = Memory::new();
+        let mut dirs = vec![root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let p = entry.unwrap().path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else {
+                    let rel = p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+                    memory.insert(&rel, std::fs::read(&p).unwrap());
+                }
+            }
+        }
+        let name = path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+        let bytes = std::fs::read(path).unwrap();
+        let in_memory = super::load_bytes(&bytes, &name, ext, &memory).unwrap();
+        let glb = |m: &Option<Mesh>| m.as_ref().map(|m| to_glb(m).unwrap());
+        assert!(glb(&loaded.mesh) == glb(&in_memory.mesh), "{name} reads differently from memory");
+        assert_eq!(loaded.facts, in_memory.facts, "{name} reads differently from memory");
         (loaded.mesh, loaded.facts)
     }
 

@@ -10,8 +10,11 @@ categories = ["graphics", "game-development", "parser-implementations", "encodin
 
 [features]
 default = ["minimal", "fbx", "3mf", "usd"]
-# The readers with no dependencies: `default-features = false, features = ["minimal"]`.
-minimal = ["stl", "ply", "vox", "obj", "3ds", "gltf"]
+# The readers with no dependencies, and file access: `default-features = false, features = ["minimal"]`.
+minimal = ["fs", "stl", "ply", "vox", "obj", "3ds", "gltf"]
+# Reading from the file system: `formats::load`, `assets::Folder` and `gltf::files_in`. Without
+# it (for wasm, say), models load from memory with `formats::load_bytes` and `assets::Memory`.
+fs = []
 stl = []
 ply = []
 vox = []
@@ -37,6 +40,10 @@ tempfile = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 # The glTF reader downstream tools render with: decompressed output must load in it.
 gltf = { version = "1.4", default-features = false }
+
+[[example]]
+name = "meshopt"
+required-features = ["fs"]
 
 [lints.clippy]
 # A style suggestion (`as_chunks`) for fixed-size `chunks_exact`; the codec loops stay as

@@ -6,10 +6,10 @@
 //! (`v x y z r g b`) and the MTL PBR keys (`Pr`, `Pm`, `Ke`, `norm`) are read.
 
 use std::collections::HashMap;
-use std::fs::File;
 use std::path::Path;
 
-use super::stream::{self, Blocks};
+use super::Input;
+use super::stream;
 
 use crate::Result;
 use crate::assets::Assets;
@@ -189,7 +189,7 @@ fn read_libraries(libs: &[String], dir: &Path, assets: &dyn Assets) -> HashMap<S
                 .collect(),
         };
         for p in found {
-            if let Ok(data) = std::fs::read(&p) {
+            if let Some(data) = assets.read(&p) {
                 read_mtl(&data, &mut out);
             }
         }
@@ -548,10 +548,10 @@ fn trim_to_len<T>(v: &mut Vec<T>) {
 /// OBJ, with MTL colors and textures (base color and normal map). Faces may mix corners with
 /// and without texture coordinates or normals. The file is read a block at a time, and each
 /// corner becomes a vertex of its material's primitive as it's read.
-pub(crate) fn obj(path: &Path, assets: &dyn Assets) -> Result<Mesh> {
-    let mut blocks = Blocks::new(File::open(path)?);
+pub(crate) fn obj(input: Input<'_>, assets: &dyn Assets) -> Result<Mesh> {
+    let mut blocks = input.blocks()?;
     let size = blocks.size_hint();
-    let dir = path.parent().unwrap_or(Path::new(""));
+    let dir = input.dir();
     let mut r = Reader::new();
     // A statement continued over lines ending in a backslash.
     let mut joined: Vec<u8> = Vec::new();

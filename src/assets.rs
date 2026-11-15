@@ -1,6 +1,8 @@
 //! Finding the files a model refers to (MTL libraries, textures) and turning texture bytes into
 //! embeddable images.
 
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::mesh::Image;
@@ -12,6 +14,19 @@ pub trait Assets {
     /// or another machine's absolute path.
     fn find(&self, reference: &str, model_dir: &Path) -> Option<PathBuf>;
 
+    /// The bytes of a file [`find`](Self::find) returned, or of one a model names exactly (a
+    /// glTF buffer, a USD sublayer). Reads the file by default.
+    #[cfg(feature = "fs")]
+    fn read(&self, path: &Path) -> Option<Cow<'_, [u8]>> {
+        std::fs::read(path).ok().map(Cow::Owned)
+    }
+
+    /// The bytes of a file [`find`](Self::find) returned, or of one a model names exactly (a
+    /// glTF buffer, a USD sublayer). Without the `fs` feature there is no default: the bytes
+    /// come from wherever the assets keep them.
+    #[cfg(not(feature = "fs"))]
+    fn read(&self, path: &Path) -> Option<Cow<'_, [u8]>>;
+
     /// Texture bytes as an embeddable image; `name` is the file's name or path, for its format.
     /// By default only PNG and JPEG pass. Override to convert others (TGA, BMP, DDS, PSD, ...).
     fn image(&self, bytes: &[u8], name: &Path) -> Option<Image> {
@@ -21,7 +36,7 @@ pub trait Assets {
 
     /// A texture file read as an embeddable image.
     fn load_image(&self, path: &Path) -> Option<Image> {
-        self.image(&std::fs::read(path).ok()?, path)
+        self.image(&self.read(path)?, path)
     }
 
     /// A color texture for a model at `model` that names none, by naming convention. `None` by
@@ -36,12 +51,14 @@ pub trait Assets {
 /// the model, then found anywhere under `root` by file name (or the same name in another image
 /// format). A model naming no color texture takes one by name: `Barrel.png` or
 /// `Barrel_Albedo.png` for `Barrel.obj`.
+#[cfg(feature = "fs")]
 #[derive(Debug, Clone)]
 pub struct Folder {
     /// The top of the tree searched.
     pub root: PathBuf,
 }
 
+#[cfg(feature = "fs")]
 impl Folder {
     /// A folder tree rooted at `root`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -49,35 +66,182 @@ impl Folder {
     }
 }
 
+#[cfg(feature = "fs")]
 impl Assets for Folder {
     fn find(&self, reference: &str, model_dir: &Path) -> Option<PathBuf> {
         find_texture(reference, model_dir, &self.root)
     }
 
     fn color_texture_for(&self, model: &Path) -> Option<PathBuf> {
-        let stem = model.file_stem()?.to_string_lossy().to_lowercase();
-        if stem.len() < 3 || stem.contains('@') {
+        color_texture_by_name(model, |visit| walk_images(&self.root, visit))
+    }
+}
+
+/// Files held in memory by path: assets for loading without file access, found the way
+/// [`Folder`] finds them on disk. Paths are relative to the top of the pack and `/`-separated
+/// (`\` and a leading `./` or `/` read the same). A reference is tried next to the model, then
+/// anywhere by file name, then as the same name in another image format; a model naming no
+/// color texture takes one by name.
+#[derive(Debug, Clone, Default)]
+pub struct Memory {
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+impl Memory {
+    /// No files.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds (or replaces) the file at `path`.
+    pub fn insert(&mut self, path: &str, bytes: impl Into<Vec<u8>>) -> &mut Self {
+        self.files.insert(memory_key(path), bytes.into());
+        self
+    }
+
+    /// With the file at `path` added (or replaced).
+    #[must_use]
+    pub fn with(mut self, path: &str, bytes: impl Into<Vec<u8>>) -> Self {
+        self.insert(path, bytes);
+        self
+    }
+
+    /// The file at `path`.
+    pub fn get(&self, path: &str) -> Option<&[u8]> {
+        self.files.get(&memory_key(path)).map(Vec::as_slice)
+    }
+
+    /// The files' paths, normalized, in order.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.files.keys().map(String::as_str)
+    }
+
+    fn images(&self, visit: &mut dyn FnMut(&Path, &str) -> bool) {
+        for k in self.files.keys() {
+            let p = Path::new(k);
+            if let Some(stem) = image_stem(p)
+                && visit(p, &stem)
+            {
+                return;
+            }
+        }
+    }
+}
+
+impl Assets for Memory {
+    fn find(&self, reference: &str, model_dir: &Path) -> Option<PathBuf> {
+        let cleaned = reference.trim().replace('\\', "/");
+        if cleaned.is_empty() {
             return None;
         }
-        // A name that says it's the color wins; one that says nothing ("Barrel.png") will do.
-        let mut plain = None;
-        let mut color = None;
-        walk_images(&self.root, |p, file_stem| {
-            let Some(rest) = file_stem.strip_prefix(&stem) else {
-                return false;
-            };
-            if !(rest.is_empty() || rest.starts_with(['_', '-', ' ', '.'])) {
-                return false;
+        if !cleaned.starts_with('/') && !cleaned.contains(':') {
+            let rel = memory_key(&format!("{}/{cleaned}", model_dir.to_string_lossy()));
+            if self.files.contains_key(&rel) {
+                return Some(rel.into());
             }
-            match texture_role(file_stem) {
-                Some(Role::Color) if color.is_none() => color = Some(p.to_path_buf()),
-                None if plain.is_none() => plain = Some(p.to_path_buf()),
-                _ => {}
-            }
-            color.is_some()
-        });
-        color.or(plain)
+        }
+        let name = cleaned.rsplit('/').next()?.to_lowercase();
+        let by_name = self
+            .files
+            .keys()
+            .find(|k| k.rsplit('/').next().is_some_and(|n| n.to_lowercase() == name));
+        if let Some(k) = by_name {
+            return Some(k.into());
+        }
+        same_name_other_format(&name, |visit| self.images(visit))
     }
+
+    fn read(&self, path: &Path) -> Option<Cow<'_, [u8]>> {
+        self.files
+            .get(&memory_key(&path.to_string_lossy()))
+            .map(|b| Cow::Borrowed(b.as_slice()))
+    }
+
+    fn color_texture_for(&self, model: &Path) -> Option<PathBuf> {
+        color_texture_by_name(model, |visit| self.images(visit))
+    }
+}
+
+/// A path as a [`Memory`] keys it: `/`-separated, without empty or `.` parts, and `..` stepping
+/// up (no further than the top).
+pub(crate) fn memory_key(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            p => parts.push(p),
+        }
+    }
+    parts.join("/")
+}
+
+/// A model's color texture by its name, from the images `walk` visits (until told to stop).
+fn color_texture_by_name(
+    model: &Path,
+    walk: impl FnOnce(&mut dyn FnMut(&Path, &str) -> bool),
+) -> Option<PathBuf> {
+    let stem = model.file_stem()?.to_string_lossy().to_lowercase();
+    if stem.len() < 3 || stem.contains('@') {
+        return None;
+    }
+    // A name that says it's the color wins; one that says nothing ("Barrel.png") will do.
+    let mut plain = None;
+    let mut color = None;
+    walk(&mut |p, file_stem| {
+        let Some(rest) = file_stem.strip_prefix(&stem) else {
+            return false;
+        };
+        if !(rest.is_empty() || rest.starts_with(['_', '-', ' ', '.'])) {
+            return false;
+        }
+        match texture_role(file_stem) {
+            Some(Role::Color) if color.is_none() => color = Some(p.to_path_buf()),
+            None if plain.is_none() => plain = Some(p.to_path_buf()),
+            _ => {}
+        }
+        color.is_some()
+    });
+    color.or(plain)
+}
+
+/// An image with the same name as `name` (lowercase) in another format (`rock.png` for
+/// `rock.tga`, as packs often ship), preferring PNG and JPEG, from the images `walk` visits.
+fn same_name_other_format(
+    name: &str,
+    walk: impl FnOnce(&mut dyn FnMut(&Path, &str) -> bool),
+) -> Option<PathBuf> {
+    let (stem, ext) = name.rsplit_once('.')?;
+    if !IMAGE_EXTS.contains(&ext) {
+        return None;
+    }
+    let mut best: Option<(u8, PathBuf)> = None;
+    walk(&mut |p, s| {
+        if s == stem {
+            let ext = p
+                .extension()
+                .map(|x| x.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            let rank = u8::from(!matches!(ext.as_str(), "png" | "jpg" | "jpeg"));
+            if best.as_ref().is_none_or(|(r, _)| rank < *r) {
+                best = Some((rank, p.to_path_buf()));
+            }
+        }
+        best.as_ref().is_some_and(|(r, _)| *r == 0)
+    });
+    best.map(|(_, p)| p)
+}
+
+/// An image file's lowercased stem; `None` for a file that isn't an image.
+fn image_stem(p: &Path) -> Option<String> {
+    let ext = p.extension()?.to_string_lossy().to_lowercase();
+    IMAGE_EXTS.contains(&ext.as_str()).then(|| {
+        p.file_stem()
+            .map(|x| x.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -130,9 +294,10 @@ const IMAGE_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "tga", "bmp", "webp", "gif", "tif", "tiff", "dds", "psd",
 ];
 
-/// Visit the image files under `root` (at most 20 000 entries), with their lowercased stems, until `visit` says
-/// stop.
-fn walk_images(root: &Path, mut visit: impl FnMut(&Path, &str) -> bool) {
+/// Visit the image files under `root` (at most 20 000 entries), with their lowercased stems,
+/// until `visit` says stop.
+#[cfg(feature = "fs")]
+fn walk_images(root: &Path, visit: &mut dyn FnMut(&Path, &str) -> bool) {
     let mut stack = vec![root.to_path_buf()];
     let mut seen = 0;
     while let Some(dir) = stack.pop() {
@@ -149,28 +314,20 @@ fn walk_images(root: &Path, mut visit: impl FnMut(&Path, &str) -> bool) {
                 stack.push(p);
                 continue;
             }
-            let ext = p
-                .extension()
-                .map(|x| x.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
-            if !IMAGE_EXTS.contains(&ext.as_str()) {
-                continue;
-            }
-            let stem = p
-                .file_stem()
-                .map(|x| x.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
-            if visit(&p, &stem) {
+            if let Some(stem) = image_stem(&p)
+                && visit(&p, &stem)
+            {
                 return;
             }
         }
     }
 }
 
-/// Find a texture a model refers to: next to it, relative to it, or anywhere under `root` by file name (artists'
-/// absolute paths like `C:\Users\me\tex\rock.tga` survive only as names). Failing that, an image with the same
-/// name in another format (`rock.png` for `rock.tga`, as packs often ship), preferring PNG and JPEG.
-fn find_texture(reference: &str, model_dir: &Path, root: &Path) -> Option<std::path::PathBuf> {
+/// Find a texture a model refers to: next to it, relative to it, or anywhere under `root` by
+/// file name (artists' absolute paths like `C:\Users\me\tex\rock.tga` survive only as names).
+/// Failing that, an image with the same name in another format.
+#[cfg(feature = "fs")]
+fn find_texture(reference: &str, model_dir: &Path, root: &Path) -> Option<PathBuf> {
     let cleaned = reference.trim().replace('\\', "/");
     if cleaned.is_empty() {
         return None;
@@ -206,31 +363,10 @@ fn find_texture(reference: &str, model_dir: &Path, root: &Path) -> Option<std::p
             }
         }
     }
-    let is_image = name
-        .rsplit_once('.')
-        .is_some_and(|(_, e)| IMAGE_EXTS.contains(&e));
-    let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s);
-    if !is_image {
-        return None;
-    }
-    let mut best: Option<(u8, std::path::PathBuf)> = None;
-    walk_images(root, |p, s| {
-        if s == stem {
-            let ext = p
-                .extension()
-                .map(|x| x.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
-            let rank = u8::from(!matches!(ext.as_str(), "png" | "jpg" | "jpeg"));
-            if best.as_ref().is_none_or(|(r, _)| rank < *r) {
-                best = Some((rank, p.to_path_buf()));
-            }
-        }
-        best.as_ref().is_some_and(|(r, _)| *r == 0)
-    });
-    best.map(|(_, p)| p)
+    same_name_other_format(&name, |visit| walk_images(root, visit))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
 
@@ -240,5 +376,34 @@ mod tests {
         assert_eq!(texture_role("barrel_d"), Some(Role::Color));
         assert_eq!(texture_role("barrel_albedo"), Some(Role::Color));
         assert_eq!(texture_role("barrel"), None);
+    }
+
+    #[test]
+    fn memory_finds_like_a_folder() {
+        let m = Memory::new()
+            .with("Models/crate.obj", "")
+            .with("Models\\textures\\Crate.PNG", "png")
+            .with("textures/rock.jpg", "jpg")
+            .with("Barrel_Albedo.png", "a")
+            .with("Barrel_Normal.png", "n");
+        let found = |r: &str| {
+            m.find(r, Path::new("Models"))
+                .map(|p| p.to_string_lossy().into_owned())
+        };
+        let krate = Some("Models/textures/Crate.PNG");
+        assert_eq!(found("textures/Crate.PNG").as_deref(), krate);
+        assert_eq!(found("./textures\\Crate.PNG").as_deref(), krate);
+        assert_eq!(found("D:\\Work\\crate.png").as_deref(), krate);
+        assert_eq!(found("../textures/rock.jpg").as_deref(), Some("textures/rock.jpg"));
+        assert_eq!(found("rock.tga").as_deref(), Some("textures/rock.jpg"));
+        assert_eq!(found("missing.png"), None);
+        assert_eq!(
+            m.read(Path::new("./Models/textures/Crate.PNG")).as_deref(),
+            Some(&b"png"[..])
+        );
+        assert_eq!(
+            m.color_texture_for(Path::new("Barrel.obj")),
+            Some(PathBuf::from("Barrel_Albedo.png"))
+        );
     }
 }

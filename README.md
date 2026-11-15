@@ -17,8 +17,9 @@ Early. What exists today:
   model's folder. `cargo run --example meshopt -- sample out.glb` writes a small test file.
 - **`formats`**: readers for STL (binary and ASCII), PLY, MagicaVoxel `.vox`, OBJ with MTL
   materials and textures, FBX (binary and ASCII), 3DS, 3MF, USD (`.usda`, `.usdc`,
-  `.usdz`) and glTF 2.0 (`.gltf`, `.glb`, meshopt-compressed or not). Each produces a `mesh::Mesh`, with textures embedded. `formats::load` dispatches
-  on the extension.
+  `.usdz`) and glTF 2.0 (`.gltf`, `.glb`, meshopt-compressed or not). Each produces a
+  `mesh::Mesh`, with textures embedded. `formats::load` reads a file and `formats::load_bytes`
+  a model already in memory; both dispatch on the extension.
 - **Conformance corpus**: 489 cases under `tests/corpus`, each a file and the GLB it must
   become. They cover every format above and the variants exporters really write: OBJ's face
   forms and MTL dialects, both PLY byte orders, every FBX version and axis system, and USD's
@@ -30,9 +31,11 @@ Early. What exists today:
   from the Actions tab); the tables land in the run summary.
 - **`mesh`**: that triangle-list model (primitives, materials, images), written out as a
   plain GLB by `mesh::to_glb`.
-- **`assets`**: the `Assets` trait readers use to find referenced files and turn texture
-  bytes into embeddable images. `Folder` searches a pack's folder tree. By default only PNG
-  and JPEG embed; override `Assets::image` to convert TGA, DDS, PSD and others.
+- **`assets`**: the `Assets` trait readers use to find and read referenced files (MTL
+  libraries, textures, glTF buffers, USD layers) and turn texture bytes into embeddable
+  images. `Folder` searches a pack's folder tree; `Memory` holds files by path, for models
+  loaded from memory. By default only PNG and JPEG embed; override `Assets::image` to convert
+  TGA, DDS, PSD and others.
 
 ### Cargo features
 
@@ -47,10 +50,26 @@ Early. What exists today:
 | `fbx` | FBX | `fbxcel`, `base64` |
 | `3mf` | 3MF | `zip`, `quick-xml` |
 | `usd` | USD | `openusd`, `openusd-schemas`, `zip` |
+| `fs` | Reading files: `formats::load`, `assets::Folder`, `gltf::files_in` | none |
 
-Every reader is on by default. `minimal` is the six with no dependencies, for
-`default-features = false, features = ["minimal"]`. Asking `formats::load` for a format whose feature is off
-returns an error that names the feature.
+Every reader is on by default, and so is `fs`. `minimal` is the six readers with no
+dependencies, plus `fs`, for `default-features = false, features = ["minimal"]`. Asking
+`formats::load` for a format whose feature is off returns an error that names the feature.
+
+Without `fs` the file APIs don't exist, so a build that has no file system (such as
+`wasm32-unknown-unknown`) fails to compile rather than failing when it runs. Models load from
+memory instead:
+
+```toml
+mithril = { version = "0.1", default-features = false, features = ["stl", "ply", "obj", "gltf", "usd"] }
+```
+
+```rust
+use mithril::{assets::Memory, formats};
+
+let assets = Memory::new().with("scene.bin", bin).with("albedo.png", png);
+let loaded = formats::load_bytes(&gltf, "scene.gltf", "gltf", &assets)?;
+```
 
 ## Planned scope
 

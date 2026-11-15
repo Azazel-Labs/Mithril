@@ -11,29 +11,48 @@
 //! Materials come from `UsdPreviewSurface`: the diffuse color or texture, the normal map, opacity, emissive color,
 //! metallic and roughness (with the shader's fallbacks), textures read from the `.usdz` itself or found in the pack.
 //! A surface with no material shows its display color: one color as the material, more as vertex colors.
+//!
+//! A file is read with `openusd`'s own resolver. A model in memory is read with [`MemResolver`], which serves the
+//! layers it names from [`Assets::read`].
 
-use std::collections::HashMap;
-use std::io::Read as _;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
+use std::io::{self, Read as _};
 use std::path::Path;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{Context as _, Result};
 use openusd::usd::SchemaBase as _;
-use openusd::{gf, sdf, tf, usd};
+use openusd::{ar, gf, sdf, tf, usd};
 use openusd_schemas::geom::{
     self, CapsuleSchema, ConeSchema, CubeSchema, CylinderSchema, GprimSchema, ImageableExt, MeshSchema, PlaneSchema,
     PointBasedSchema, PointInstancerSchema, PrimvarsAPI, SphereSchema, SubsetSchema,
 };
 use openusd_schemas::shade::{self, MaterialBindingAPI};
 
-use crate::assets::Assets;
+use super::Input;
+use crate::assets::{Assets, memory_key};
 use crate::mesh::{GRAY, Image, MAX_TRIANGLES, Material, Mesh, Prim, triangulate};
 
 /// The file's meshes, or `None` when it has none to show (a material library, a layer of overrides).
-pub(crate) fn load(path: &Path, assets: &dyn Assets) -> Result<Option<Mesh>> {
-    let stage = usd::Stage::builder()
-        .schema_registry(openusd_schemas::schema_registry())
-        .open(path.to_str().context("the path isn't UTF-8")?)
-        .map_err(|e| invalid!("{e}"))?;
+pub(crate) fn load(input: Input<'_>, assets: &dyn Assets) -> Result<Option<Mesh>> {
+    let path = input.path;
+    let (stage, paths) = match input.bytes() {
+        Some(bytes) => open_in_memory(bytes, input, assets)?,
+        #[cfg(feature = "fs")]
+        None => {
+            let stage = usd::Stage::builder()
+                .schema_registry(openusd_schemas::schema_registry())
+                .open(path.to_str().context("the path isn't UTF-8")?)
+                .map_err(|e| invalid!("{e}"))?;
+            let paths = prim_paths(&stage)?;
+            (stage, paths)
+        }
+        #[cfg(not(feature = "fs"))]
+        None => unreachable!("a model without its bytes needs the `fs` feature"),
+    };
     let z_up = matches!(stage.stage_metadata("upAxis"), Ok(Some(v)) if v.as_str() == Some("Z"));
     let meters = match stage.stage_metadata("metersPerUnit") {
         Ok(Some(sdf::Value::Double(m))) if m > 0.0 => m,
@@ -46,20 +65,12 @@ pub(crate) fn load(path: &Path, assets: &dyn Assets) -> Result<Option<Mesh>> {
     } else {
         usd::TimeCode::EARLIEST
     };
-    let mut paths = Vec::new();
-    stage
-        .traverse(
-            usd::PrimPredicate::DEFAULT.with_instance_proxies(true),
-            |p| paths.push(p.clone()),
-        )
-        .map_err(|e| invalid!("{e}"))?;
-
     let mut out = Builder {
         stage: &stage,
         file: path,
         assets,
         time,
-        usdz: Usdz::open(path),
+        usdz: Usdz::open(input),
         mesh: Mesh::default(),
         materials: HashMap::new(),
         images: HashMap::new(),
@@ -96,6 +107,15 @@ pub(crate) fn load(path: &Path, assets: &dyn Assets) -> Result<Option<Mesh>> {
     Ok((!mesh.prims.is_empty()).then_some(mesh))
 }
 
+/// The paths of the stage's prims, composed (which reads the layers they reference).
+fn prim_paths(stage: &usd::Stage) -> Result<Vec<sdf::Path>> {
+    let mut paths = Vec::new();
+    stage
+        .traverse(usd::PrimPredicate::DEFAULT.with_instance_proxies(true), |p| paths.push(p.clone()))
+        .map_err(|e| invalid!("{e}"))?;
+    Ok(paths)
+}
+
 /// Z-up to glTF's Y-up: (x, y, z) becomes (x, z, -y).
 fn up([x, y, z]: [f32; 3], z_up: bool) -> [f32; 3] {
     if z_up { [x, z, -y] } else { [x, y, z] }
@@ -117,7 +137,7 @@ struct Builder<'a> {
     file: &'a Path,
     assets: &'a dyn Assets,
     time: usd::TimeCode,
-    usdz: Option<Usdz>,
+    usdz: Option<Usdz<'a>>,
     mesh: Mesh,
     /// Material prim path (or `display:<rgba>` for a display color) to its index in `mesh.materials`.
     materials: HashMap<String, usize>,
@@ -885,15 +905,16 @@ impl Builder<'_> {
 }
 
 /// A `.usdz` opened for its textures.
-struct Usdz(zip::ZipArchive<std::fs::File>);
+struct Usdz<'a>(zip::ZipArchive<Box<dyn super::ReadSeek + 'a>>);
 
-impl Usdz {
-    fn open(path: &Path) -> Option<Self> {
-        let is_usdz = path
+impl<'a> Usdz<'a> {
+    fn open(input: Input<'a>) -> Option<Self> {
+        let is_usdz = input
+            .path
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("usdz"));
-        let file = std::fs::File::open(path).ok().filter(|_| is_usdz)?;
-        zip::ZipArchive::new(file).ok().map(Self)
+        let stream = input.seekable().ok().filter(|_| is_usdz)?;
+        zip::ZipArchive::new(stream).ok().map(Self)
     }
 
     /// An entry by its path in the archive, or failing that by its file name.
@@ -919,6 +940,160 @@ impl Usdz {
         let mut bytes = Vec::new();
         f.read_to_end(&mut bytes).ok()?;
         Some(bytes)
+    }
+}
+
+/// How many times a model in memory is reopened for the layers it names: each round fetches the layers the last
+/// one found missing, so this is the depth of references a model can have.
+const FETCH_ROUNDS: usize = 32;
+
+/// The stage of a model in memory, and its prims' paths: opened and composed, then again with whatever layers it
+/// named that `assets` has, until it names no more.
+fn open_in_memory(bytes: &[u8], input: Input<'_>, assets: &dyn Assets) -> Result<(usd::Stage, Vec<sdf::Path>)> {
+    let mut root = memory_key(&input.path.to_string_lossy());
+    let ext = input.path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if !["usd", "usda", "usdc", "usdz"].iter().any(|e| ext.eq_ignore_ascii_case(e)) {
+        // The format is read from the name: a model named without its extension is given one.
+        root.push_str(if bytes.starts_with(b"PK") {
+            ".usdz"
+        } else {
+            ".usd"
+        });
+    }
+    let mut files = HashMap::new();
+    files.insert(root.clone(), Arc::<[u8]>::from(bytes));
+    let mut tried = BTreeSet::new();
+    let mut round = 0;
+    loop {
+        let resolver = MemResolver::new(files.clone());
+        let missing = Rc::clone(&resolver.missing);
+        let stage = usd::Stage::builder()
+            .schema_registry(openusd_schemas::schema_registry())
+            .resolver(resolver)
+            .open(&root)
+            .map_err(|e| invalid!("{e}"))?;
+        let paths = prim_paths(&stage)?;
+        round += 1;
+        let mut found = false;
+        for id in missing.take() {
+            if tried.insert(id.clone())
+                && let Some(b) = assets.read(Path::new(&id))
+            {
+                files.insert(id, Arc::from(b.as_ref()));
+                found = true;
+            }
+        }
+        if !found || round == FETCH_ROUNDS {
+            return Ok((stage, paths));
+        }
+    }
+}
+
+/// Resolves a model in memory: its layers are `files`, keyed by their paths among the assets (`/`-separated,
+/// relative), and a package's layers are its entries (`pkg.usdz[inner.usda]`). A layer it doesn't have is noted in
+/// `missing`, for the next round to fetch.
+struct MemResolver {
+    files: HashMap<String, Arc<[u8]>>,
+    missing: Rc<RefCell<BTreeSet<String>>>,
+    id: u64,
+}
+
+impl MemResolver {
+    fn new(files: HashMap<String, Arc<[u8]>>) -> Self {
+        // Ids apart from the ones `openusd` gives its own resolvers, which count up from zero.
+        static NEXT: AtomicU64 = AtomicU64::new(1 << 62);
+        Self {
+            files,
+            missing: Rc::default(),
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// Whether the plain path (no package) is here, noting it missing when it isn't.
+    fn has(&self, path: &str) -> bool {
+        let here = self.files.contains_key(path);
+        if !here {
+            self.missing.borrow_mut().insert(path.to_owned());
+        }
+        here
+    }
+}
+
+/// `leaf` placed inside the deepest package of `base`: `pkg.usdz[inner.usdz]` and `a.usda` give
+/// `pkg.usdz[inner.usdz[a.usda]]`.
+fn nest(base: &str, leaf: &str) -> String {
+    match ar::split_package_relative_path_outer(base) {
+        Some((package, inner)) => ar::join_package_relative_path(&package, &nest(&inner, leaf)),
+        None => ar::join_package_relative_path(base, leaf),
+    }
+}
+
+impl ar::Resolver for MemResolver {
+    fn create_identifier(&self, asset_path: &str, anchor: Option<&ar::ResolvedPath>) -> String {
+        if asset_path.is_empty() {
+            return String::new();
+        }
+        if let Some((package, inner)) = ar::split_package_relative_path_outer(asset_path) {
+            return nest(&self.create_identifier(&package, anchor), &memory_key(&inner));
+        }
+        let Some(anchor) = anchor.map(|a| a.to_string_lossy().replace('\\', "/")) else {
+            return memory_key(asset_path);
+        };
+        if let Some((package, inner)) = ar::split_package_relative_path_inner(&anchor) {
+            // A layer inside a package refers to its neighbours in the package.
+            let dir = inner.rsplit_once('/').map_or("", |(dir, _)| dir);
+            return nest(&package, &memory_key(&format!("{dir}/{asset_path}")));
+        }
+        if anchor.to_ascii_lowercase().ends_with(".usdz") {
+            // A package's root layer refers to the package's entries.
+            return ar::join_package_relative_path(&anchor, &memory_key(asset_path));
+        }
+        if asset_path.starts_with(['/', '\\']) {
+            return memory_key(asset_path);
+        }
+        let dir = anchor.rsplit_once('/').map_or("", |(dir, _)| dir);
+        memory_key(&format!("{dir}/{asset_path}"))
+    }
+
+    fn resolve(&self, asset_path: &str) -> Option<ar::ResolvedPath> {
+        if asset_path.is_empty() {
+            return None;
+        }
+        let found = match ar::split_package_relative_path_outer(asset_path) {
+            Some((package, inner)) => {
+                self.has(&package) && openusd::usdz::package_contains(self, &package, &inner)
+            }
+            None => self.has(asset_path),
+        };
+        found.then(|| ar::ResolvedPath::new(asset_path))
+    }
+
+    fn resolve_for_new_asset(&self, _asset_path: &str) -> Option<ar::ResolvedPath> {
+        None
+    }
+
+    fn open_asset(&self, resolved_path: &ar::ResolvedPath) -> io::Result<Box<dyn ar::Asset>> {
+        let path = resolved_path.to_string_lossy();
+        let bytes = match ar::split_package_relative_path_outer(&path) {
+            Some((package, inner)) => openusd::usdz::package_entry(self, &package, &inner)?,
+            None => match self.files.get(path.as_ref()) {
+                Some(b) => ar::AssetBuffer::from(Arc::clone(b)),
+                None => return Err(io::Error::new(io::ErrorKind::NotFound, format!("{path} isn't among the assets"))),
+            },
+        };
+        Ok(Box::new(io::Cursor::new(bytes)))
+    }
+
+    fn get_modification_timestamp(&self, _: &str, _: &ar::ResolvedPath) -> Option<std::time::SystemTime> {
+        None
+    }
+
+    fn identity(&self) -> String {
+        format!("mithril-memory-{}", self.id)
+    }
+
+    fn cache_id(&self) -> Option<u64> {
+        Some(self.id)
     }
 }
 
@@ -953,7 +1128,7 @@ fn transform_normal(m: &[[f64; 3]; 3], n: [f32; 3]) -> [f32; 3] {
     unit(v, false)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
 
@@ -1007,7 +1182,7 @@ def Xform "World"
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("quad.usda");
         std::fs::write(&path, CUBE).unwrap();
-        let mesh = load(&path, &crate::assets::Folder::new(dir.path()))
+        let mesh = load(Input::file(&path), &crate::assets::Folder::new(dir.path()))
             .unwrap()
             .unwrap();
         assert_eq!(mesh.prims.len(), 1, "the invisible mesh is left out");
@@ -1045,7 +1220,7 @@ def Material \"Planks\"
         )
         .unwrap();
         assert!(
-            load(&path, &crate::assets::Folder::new(dir.path()))
+            load(Input::file(&path), &crate::assets::Folder::new(dir.path()))
                 .unwrap()
                 .is_none()
         );
@@ -1060,7 +1235,7 @@ def Material \"Planks\"
             "#usda 1.0\ndef Mesh \"Tri\"\n{\n    point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]\n    int[] faceVertexCounts = [3]\n    int[] faceVertexIndices = [0, 1, 2]\n    color3f[] primvars:displayColor = [(0, 0.5, 1)] (interpolation = \"constant\")\n}\n",
         )
         .unwrap();
-        let mesh = load(&path, &crate::assets::Folder::new(dir.path()))
+        let mesh = load(Input::file(&path), &crate::assets::Folder::new(dir.path()))
             .unwrap()
             .unwrap();
         assert_eq!(

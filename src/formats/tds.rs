@@ -5,7 +5,6 @@
 //! share normals at their common corners. 3DS is Z up; glTF is Y up.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use crate::Result;
 
@@ -216,8 +215,8 @@ fn y_up(p: [f32; 3]) -> [f32; 3] {
     [p[0], p[2], -p[1]]
 }
 
-pub(crate) fn load(path: &Path, assets: &dyn Assets) -> Result<Mesh> {
-    let data = std::fs::read(path)?;
+pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets) -> Result<Mesh> {
+    let data = input.read()?;
     let main = chunks(&data)
         .next()
         .filter(|&(id, _)| id == MAIN || id == PROJECT)
@@ -231,7 +230,7 @@ pub(crate) fn load(path: &Path, assets: &dyn Assets) -> Result<Mesh> {
 
     let mut mesh = Mesh::default();
     let mut by_name: HashMap<String, usize> = HashMap::new();
-    let dir = path.parent().unwrap_or(Path::new(""));
+    let dir = input.dir();
     let mut images: HashMap<String, Option<usize>> = HashMap::new();
     for (_, b) in chunks(editor).filter(|&(id, _)| id == MATERIAL) {
         let m = material(b);
@@ -410,7 +409,7 @@ fn add_faces(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
 
@@ -480,7 +479,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("floor.3ds");
         std::fs::write(&p, square()).unwrap();
-        let mesh = load(&p, &crate::assets::Folder::new(dir.path())).unwrap();
+        let mesh = load(crate::formats::Input::file(&p), &crate::assets::Folder::new(dir.path())).unwrap();
         assert_eq!(mesh.triangles(), 3);
         assert_eq!(mesh.prims.len(), 2);
         let floor = &mesh.prims[0];
@@ -520,6 +519,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("x.3ds");
         std::fs::write(&p, b"hello").unwrap();
-        assert!(load(&p, &crate::assets::Folder::new(dir.path())).is_err());
+        assert!(load(crate::formats::Input::file(&p), &crate::assets::Folder::new(dir.path())).is_err());
     }
 }

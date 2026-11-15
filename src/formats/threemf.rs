@@ -5,14 +5,15 @@
 //! `OrcaSlicer`, `PrusaSlicer`), and the filaments painted onto triangles.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::io::{BufReader, Read};
-use std::path::Path;
 
 use crate::{Context as _, Result};
 use quick_xml::events::{BytesStart, Event};
 use serde_json::{Map, Value, json};
 use zip::ZipArchive;
+
+/// The 3MF package.
+type Zip<'a> = ZipArchive<Box<dyn super::ReadSeek + 'a>>;
 
 use crate::mesh::{GRAY, Image, MAX_TRIANGLES, Material, Mesh, Prim, face_normal, srgb_to_linear};
 
@@ -121,8 +122,8 @@ impl Slicer {
 }
 
 /// Load a 3MF: one mesh with a material per color, and the facts worth keeping.
-pub(crate) fn load(path: &Path) -> Result<(Option<Mesh>, Map<String, Value>)> {
-    let mut zip = ZipArchive::new(File::open(path)?).context("not a 3MF file (it isn't a zip)")?;
+pub(crate) fn load(input: super::Input<'_>) -> Result<(Option<Mesh>, Map<String, Value>)> {
+    let mut zip: Zip<'_> = ZipArchive::new(input.seekable()?).context("not a 3MF file (it isn't a zip)")?;
     let names: HashMap<String, String> = zip
         .file_names()
         .filter_map(Result::ok)
@@ -437,7 +438,7 @@ fn norm(name: &str) -> String {
 }
 
 fn text(
-    zip: &mut ZipArchive<File>,
+    zip: &mut Zip<'_>,
     names: &HashMap<String, String>,
     name: &str,
     limit: u64,
@@ -745,7 +746,7 @@ fn paint_state(code: &[u8]) -> u8 {
 }
 
 /// Filament colors and assignments from a slicer project's settings files, when it has them.
-fn read_slicer(zip: &mut ZipArchive<File>, names: &HashMap<String, String>) -> Slicer {
+fn read_slicer(zip: &mut Zip<'_>, names: &HashMap<String, String>) -> Slicer {
     let mut s = Slicer::default();
     // Bambu Studio and OrcaSlicer: JSON.
     if let Some(cfg) = text(zip, names, "Metadata/project_settings.config", MAX_CONFIG)
@@ -852,7 +853,7 @@ fn read_assignments(xml: &str, s: &mut Slicer) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
     use std::io::Write as _;
@@ -902,7 +903,7 @@ mod tests {
             <build><item objectid="2" transform="1 0 0 0 1 0 0 0 1 100 0 0"/><item objectid="2"/></build></model>"##
         );
         let f = zip_of(&[("_rels/.rels", RELS), ("3D/3dmodel.model", &model)]);
-        let (mesh, facts) = load(f.path()).unwrap();
+        let (mesh, facts) = load(crate::formats::Input::file(f.path())).unwrap();
         let mesh = mesh.unwrap();
         assert_eq!(facts["triangles"], 4);
         assert_eq!(facts["objects"], 2);
@@ -938,7 +939,7 @@ mod tests {
             ("Metadata/model_settings.config", settings),
             ("Metadata/project_settings.config", project),
         ]);
-        let (mesh, facts) = load(f.path()).unwrap();
+        let (mesh, facts) = load(crate::formats::Input::file(f.path())).unwrap();
         assert_eq!(facts["triangles"], 3);
         // Part 1 in white with one triangle painted green; part 2 in red.
         assert_eq!(
@@ -964,7 +965,7 @@ mod tests {
             ("Metadata/Slic3r_PE_model.config", cfg),
             ("Metadata/Slic3r_PE.config", settings),
         ]);
-        let (mesh, _) = load(f.path()).unwrap();
+        let (mesh, _) = load(crate::formats::Input::file(f.path())).unwrap();
         // Volume 0 in extruder 2 (no color of its own: its filament's yellow); volume 1 in the object's extruder 1.
         assert_eq!(colors(&mesh.unwrap()), [[255, 255, 0], [0, 0, 255]]);
     }

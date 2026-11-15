@@ -12,6 +12,7 @@
 //! as they were. `KHR_mesh_quantization` data stays quantized.
 
 use std::borrow::Cow;
+#[cfg(feature = "fs")]
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Map, Value, json};
@@ -81,6 +82,7 @@ pub fn compress(input: &[u8]) -> Result<Vec<u8>> {
 /// A `fetch` for [`pack_glb`] and [`pack_glb_decompressed`] that reads URIs as paths relative
 /// to `dir`. It refuses absolute paths and `..`, so a `.gltf` can't pull in files from outside
 /// `dir`.
+#[cfg(feature = "fs")]
 pub fn files_in(dir: impl Into<PathBuf>) -> impl FnMut(&str) -> Result<Vec<u8>> {
     let dir = dir.into();
     move |uri: &str| {
@@ -1249,6 +1251,7 @@ mod tests {
         assert_eq!(&d.bin.unwrap()[..48], &want[..]);
     }
 
+    #[cfg(feature = "fs")]
     #[test]
     fn files_in_stays_inside_the_folder() {
         let dir = tempfile::tempdir().unwrap();

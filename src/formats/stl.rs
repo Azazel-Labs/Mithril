@@ -8,19 +8,17 @@
 //! The file is read a block at a time, never whole.
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::path::Path;
 
+use super::Input;
 use super::stream::{self, Blocks};
 use crate::Result;
 use crate::mesh::{GRAY, MAX_TRIANGLES, Material, Mesh, Welder, single, srgb_to_linear};
 
 type Tri = [[f32; 3]; 3];
 
-pub(crate) fn stl(path: &Path) -> Result<Mesh> {
-    let file = File::open(path)?;
-    let size = file.metadata()?.len();
-    let mut blocks = Blocks::new(file);
+pub(crate) fn stl(input: Input<'_>) -> Result<Mesh> {
+    let mut blocks = input.blocks()?;
+    let size = blocks.size_hint() as u64;
     let head = blocks.need(1024)?;
     if let Some(n) = binary_count(head, size) {
         ensure!(n <= MAX_TRIANGLES, "too many triangles to convert ({n})");
@@ -32,7 +30,7 @@ pub(crate) fn stl(path: &Path) -> Result<Mesh> {
             Some(mesh) => Ok(mesh),
             // Two colors flagged the VisCAM way: read it again with colors.
             None if plain => {
-                let mut again = Blocks::new(File::open(path)?);
+                let mut again = input.blocks()?;
                 again.need(84)?;
                 again.consume(84);
                 binary(again, n, Colors::VisCam)?
@@ -115,7 +113,7 @@ impl Colors {
 }
 
 /// `n` binary facets. `None` when reading without colors finds two VisCAM colors.
-fn binary(mut blocks: Blocks, n: usize, colors: Colors) -> Result<Option<Mesh>> {
+fn binary(mut blocks: Blocks<'_>, n: usize, colors: Colors) -> Result<Option<Mesh>> {
     let mut plain = Welder::with_capacity(if let Colors::None = colors { n } else { 0 });
     // Colored: a primitive per color, in order of first appearance.
     let mut groups: Vec<(Option<[u8; 3]>, Welder)> = Vec::new();
@@ -184,7 +182,7 @@ fn finite(t: &Tri) -> bool {
 /// ASCII STL: `solid`, then `facet normal ... outer loop`, three `vertex x y z`, `endloop
 /// endfacet`, repeated; `endsolid`. Keywords in any case, any whitespace between words, and
 /// any number of solids one after another. Only the `vertex` lines matter.
-fn ascii(mut blocks: Blocks) -> Result<Mesh> {
+fn ascii(mut blocks: Blocks<'_>) -> Result<Mesh> {
     let head = blocks.need(5)?;
     ensure!(
         head.trim_ascii_start()

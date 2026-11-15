@@ -245,10 +245,12 @@ struct Objects<'a> {
     children: HashMap<i64, Vec<(i64, String)>>,
 }
 
-pub(crate) fn load(path: &Path, assets: &dyn Assets) -> Result<Mesh> {
-    let mut data = std::fs::read(path)?;
+pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets) -> Result<Mesh> {
+    let mut data = input.read()?;
     if super::fbx_ascii::is_ascii(&data) {
-        data = super::fbx_ascii::to_binary(&data).context("couldn't read this ASCII FBX file")?;
+        data = super::fbx_ascii::to_binary(&data)
+            .context("couldn't read this ASCII FBX file")?
+            .into();
     } else if data.starts_with(b"Kaydara FBX Binary")
         && let Some(v) = data.get(23..27)
     {
@@ -338,7 +340,7 @@ pub(crate) fn load(path: &Path, assets: &dyn Assets) -> Result<Mesh> {
     }
 
     let mut world_cache: HashMap<i64, M4> = HashMap::new();
-    let dir = path.parent().unwrap_or(Path::new(""));
+    let dir = input.dir();
     let mut mesh = Mesh::default();
     let mut material_index: HashMap<i64, usize> = HashMap::new();
     let mut image_index: HashMap<i64, Option<usize>> = HashMap::new();
@@ -744,7 +746,7 @@ fn add_geometry(geom: NodeHandle<'_>, m: &M4, materials: &[usize], mesh: &mut Me
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
     use fbxcel::writer::v7400::binary::{FbxFooter, Writer};
@@ -911,7 +913,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("floor.fbx");
         std::fs::write(&p, z_up_fbx()).unwrap();
-        let mesh = load(&p, &crate::assets::Folder::new(dir.path())).unwrap();
+        let mesh = load(crate::formats::Input::file(&p), &crate::assets::Folder::new(dir.path())).unwrap();
         assert_eq!(mesh.triangles(), 2);
         let prim = &mesh.prims[0];
         for v in &prim.positions {
@@ -1031,8 +1033,8 @@ Connections:  {{
         std::fs::write(&a, z_up_ascii_fbx()).unwrap();
         std::fs::write(&b, z_up_fbx()).unwrap();
         let (a, b) = (
-            load(&a, &crate::assets::Folder::new(dir.path())).unwrap(),
-            load(&b, &crate::assets::Folder::new(dir.path())).unwrap(),
+            load(crate::formats::Input::file(&a), &crate::assets::Folder::new(dir.path())).unwrap(),
+            load(crate::formats::Input::file(&b), &crate::assets::Folder::new(dir.path())).unwrap(),
         );
         assert_eq!(a.triangles(), 2);
         assert_eq!(a.prims[0].positions, b.prims[0].positions);
@@ -1044,7 +1046,7 @@ Connections:  {{
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fs"))]
 #[test]
 #[ignore = "writes files; run by hand"]
 fn write_fbx_fixture() {

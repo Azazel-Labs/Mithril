@@ -14,15 +14,20 @@
 //!   the color and normal textures (`KHR_materials_pbrSpecularGlossiness` as its diffuse).
 //! - Meshopt compression is decoded first. Draco (`KHR_draco_mesh_compression`) is refused.
 //!
-//! A GLB isn't read whole: accessors are read from the file a block at a time, so the peak is
-//! little more than the mesh. External buffers must sit inside the model's folder.
+//! A GLB file isn't read whole: accessors are read from the file a block at a time, so the peak
+//! is little more than the mesh. A GLB in memory is read in place. External buffers must sit
+//! inside the model's folder; for a model in memory they come from [`Assets::read`].
 
+use std::borrow::Cow;
+#[cfg(feature = "fs")]
 use std::fs::File;
+#[cfg(feature = "fs")]
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
+use super::Input;
 use crate::assets::Assets;
 use crate::gltf as container;
 use crate::mesh::{Image, MAX_TRIANGLES, Material, Mesh, Prim};
@@ -32,14 +37,15 @@ use crate::{Context as _, Result};
 const BLOCK: usize = 256 * 1024;
 
 /// How much of the file the first read takes.
+#[cfg(feature = "fs")]
 const HEAD: usize = 64 * 1024;
 
 /// The most vertices an accessor without data (all zeros) may claim.
 const MAX_VERTICES: usize = 3 * MAX_TRIANGLES;
 
 /// Reads the glTF or GLB at `path`, as its mesh (`None` when it draws no triangles) and facts.
-pub(crate) fn load(path: &Path, assets: &dyn Assets) -> Result<(Option<Mesh>, Map<String, Value>)> {
-    let mut r = Reader::open(path, assets)?;
+pub(crate) fn load(input: Input<'_>, assets: &dyn Assets) -> Result<(Option<Mesh>, Map<String, Value>)> {
+    let mut r = Reader::open(input, assets)?;
     let mesh = r.mesh()?;
     let mut facts = Map::new();
     if r.points > 0 {
@@ -52,8 +58,9 @@ pub(crate) fn load(path: &Path, assets: &dyn Assets) -> Result<(Option<Mesh>, Ma
 }
 
 /// Where a buffer's bytes are.
-enum Buf {
+enum Buf<'a> {
     /// A stretch of a file: the GLB's binary chunk, or an external `.bin`.
+    #[cfg(feature = "fs")]
     File {
         file: File,
         base: u64,
@@ -61,12 +68,13 @@ enum Buf {
         /// Where the file's cursor is, relative to `base`, to skip needless seeks.
         at: u64,
     },
-    Mem(Vec<u8>),
+    Mem(Cow<'a, [u8]>),
 }
 
-impl Buf {
+impl Buf<'_> {
     fn len(&self) -> u64 {
         match self {
+            #[cfg(feature = "fs")]
             Buf::File { len, .. } => *len,
             Buf::Mem(v) => v.len() as u64,
         }
@@ -78,6 +86,7 @@ impl Buf {
             .filter(|&e| e <= self.len())
             .context("glTF data runs past the end of its buffer")?;
         match self {
+            #[cfg(feature = "fs")]
             Buf::File { file, base, at, .. } => {
                 if *at != off {
                     file.seek(SeekFrom::Start(*base + off))?;
@@ -136,9 +145,9 @@ struct Use {
 struct Reader<'a> {
     json: Map<String, Value>,
     /// The GLB's binary chunk, until buffer 0 claims it.
-    bin: Option<Buf>,
-    bufs: Vec<Option<Buf>>,
-    dir: PathBuf,
+    bin: Option<Buf<'a>>,
+    bufs: Vec<Option<Buf<'a>>>,
+    input: Input<'a>,
     assets: &'a dyn Assets,
     scratch: Vec<u8>,
     /// glTF material → mesh material.
@@ -179,12 +188,28 @@ fn f32s<const N: usize>(v: Option<&Value>, default: [f32; N]) -> [f32; N] {
     floats(v, default.map(f64::from)).map(|x| x as f32)
 }
 
-/// Whether `uri` is a plain relative path that stays inside the model's folder.
-fn safe_relative(uri: &str) -> bool {
-    !uri.contains(':')
-        && Path::new(uri)
+/// `rel` when it's a plain relative path that stays inside the model's folder.
+fn checked(rel: &str) -> Result<&str> {
+    let safe = !rel.contains(':')
+        && Path::new(rel)
             .components()
-            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+    ensure!(safe, "refusing to read {rel:?}: not a relative path inside the model's folder");
+    Ok(rel)
+}
+
+/// An external file the model names by URI, whole: from the model's folder, or for a model in
+/// memory from its assets.
+fn external<'a>(input: Input<'a>, assets: &'a dyn Assets, uri: &str) -> Result<Cow<'a, [u8]>> {
+    let rel = container::percent_decode(uri);
+    let p = input.dir().join(checked(&rel)?);
+    #[cfg(feature = "fs")]
+    if input.bytes().is_none() {
+        return Ok(Cow::Owned(std::fs::read(&p).map_err(|e| invalid!("glTF buffer {rel:?}: {e}"))?));
+    }
+    assets
+        .read(&p)
+        .with_context(|| format!("glTF buffer {rel:?} isn't among the assets"))
 }
 
 /// Where a GLB's binary chunk is: offset and length.
@@ -219,8 +244,9 @@ fn glb_layout(
     Ok((json, bin))
 }
 
-/// A GLB in memory, as its JSON and binary chunk, the chunk moved out without a copy.
-fn glb_in_memory(mut bytes: Vec<u8>) -> Result<(Map<String, Value>, Option<Buf>)> {
+/// A GLB in memory, as its JSON and binary chunk: borrowed bytes sliced, owned ones moved out
+/// without a copy.
+fn glb_in_memory(bytes: Cow<'_, [u8]>) -> Result<(Map<String, Value>, Option<Buf<'_>>)> {
     let total = bytes.len() as u64;
     let (json, bin) = glb_layout(total, |off, len| {
         bytes
@@ -229,52 +255,75 @@ fn glb_in_memory(mut bytes: Vec<u8>) -> Result<(Map<String, Value>, Option<Buf>)
             .context("GLB is truncated")
     })?;
     let bin = bin.map(|(base, len)| {
-        bytes.truncate((base + len) as usize);
-        bytes.drain(..base as usize);
-        Buf::Mem(bytes)
+        let (base, end) = (base as usize, (base + len) as usize);
+        Buf::Mem(match bytes {
+            Cow::Borrowed(b) => Cow::Borrowed(&b[base..end]),
+            Cow::Owned(mut v) => {
+                v.truncate(end);
+                v.drain(..base);
+                Cow::Owned(v)
+            }
+        })
+    });
+    Ok((json, bin))
+}
+
+/// glTF JSON (a `.gltf`), after any byte-order mark.
+fn gltf_json(bytes: &[u8]) -> Result<Map<String, Value>> {
+    let text = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    match serde_json::from_slice(text) {
+        Ok(Value::Object(m)) => Ok(m),
+        _ => bail!("not a glTF file: neither GLB nor glTF JSON"),
+    }
+}
+
+/// The JSON and binary chunk of a glTF or GLB file, read in pieces.
+#[cfg(feature = "fs")]
+fn open_file(path: &Path) -> Result<(Map<String, Value>, Option<Buf<'static>>)> {
+    let mut file = File::open(path)?;
+    let total = file.metadata()?.len();
+    // One read for the header, the JSON and the binary chunk's header in the usual case,
+    // and the whole file when it's small.
+    let mut head = vec![0; usize::try_from(total).unwrap_or(HEAD).min(HEAD)];
+    file.read_exact(&mut head)?;
+    let glb = head.starts_with(b"glTF");
+    if glb && head.len() as u64 == total {
+        return glb_in_memory(Cow::Owned(head));
+    }
+    if !glb {
+        file.read_to_end(&mut head)?;
+        return Ok((gltf_json(&head)?, None));
+    }
+    let mut pos = head.len() as u64;
+    let (json, bin) = glb_layout(total, |off, len| {
+        if let Some(b) = head.get(off as usize..off as usize + len) {
+            return Ok(b.to_vec());
+        }
+        let mut b = vec![0; len];
+        file.seek(SeekFrom::Start(off))?;
+        file.read_exact(&mut b).context("GLB is truncated")?;
+        pos = off + len as u64;
+        Ok(b)
+    })?;
+    drop(head);
+    let bin = bin.map(|(base, len)| Buf::File {
+        file,
+        base,
+        len,
+        at: pos.wrapping_sub(base),
     });
     Ok((json, bin))
 }
 
 impl<'a> Reader<'a> {
-    fn open(path: &Path, assets: &'a dyn Assets) -> Result<Self> {
-        let dir = path.parent().unwrap_or(Path::new("")).to_path_buf();
-        let mut file = File::open(path)?;
-        let total = file.metadata()?.len();
-        // One read for the header, the JSON and the binary chunk's header in the usual case,
-        // and the whole file when it's small.
-        let mut head = vec![0; usize::try_from(total).unwrap_or(HEAD).min(HEAD)];
-        file.read_exact(&mut head)?;
-        let glb = head.starts_with(b"glTF");
-        let (mut json, mut bin) = if glb && head.len() as u64 == total {
-            glb_in_memory(std::mem::take(&mut head))?
-        } else if glb {
-            let mut pos = head.len() as u64;
-            let (json, bin) = glb_layout(total, |off, len| {
-                if let Some(b) = head.get(off as usize..off as usize + len) {
-                    return Ok(b.to_vec());
-                }
-                let mut b = vec![0; len];
-                file.seek(SeekFrom::Start(off))?;
-                file.read_exact(&mut b).context("GLB is truncated")?;
-                pos = off + len as u64;
-                Ok(b)
-            })?;
-            drop(head);
-            let bin = bin.map(|(base, len)| Buf::File {
-                file,
-                base,
-                len,
-                at: pos.wrapping_sub(base),
-            });
-            (json, bin)
-        } else {
-            file.read_to_end(&mut head)?;
-            let text = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&head);
-            match serde_json::from_slice(text) {
-                Ok(Value::Object(m)) => (m, None),
-                _ => bail!("not a glTF file: neither GLB nor glTF JSON"),
-            }
+    fn open(input: Input<'a>, assets: &'a dyn Assets) -> Result<Self> {
+        let (mut json, mut bin) = match input.bytes() {
+            Some(b) if b.starts_with(b"glTF") => glb_in_memory(Cow::Borrowed(b))?,
+            Some(b) => (gltf_json(b)?, None),
+            #[cfg(feature = "fs")]
+            None => open_file(input.path)?,
+            #[cfg(not(feature = "fs"))]
+            None => unreachable!("a model without its bytes needs the `fs` feature"),
         };
         let version = json
             .get("asset")
@@ -303,14 +352,16 @@ impl<'a> Reader<'a> {
             });
         if meshopt {
             drop(bin);
-            let bytes = std::fs::read(path)?;
-            let plain = if glb {
+            let bytes = input.read()?;
+            let plain = if bytes.starts_with(b"glTF") {
                 container::decompress(&bytes)?
             } else {
-                container::pack_glb_decompressed(&bytes, container::files_in(&dir))?
+                container::pack_glb_decompressed(&bytes, |uri| {
+                    external(input, assets, uri).map(Cow::into_owned)
+                })?
             };
             drop(bytes);
-            (json, bin) = glb_in_memory(plain)?;
+            (json, bin) = glb_in_memory(Cow::Owned(plain))?;
         }
         let n = |key| list(&json, key).len();
         Ok(Self {
@@ -319,7 +370,7 @@ impl<'a> Reader<'a> {
             images: vec![None; n("images")],
             json,
             bin,
-            dir,
+            input,
             assets,
             scratch: Vec::new(),
             default_material: None,
@@ -336,20 +387,19 @@ impl<'a> Reader<'a> {
             .with_context(|| format!("glTF {key}[{i}] doesn't exist"))
     }
 
-    fn buf(&mut self, i: usize) -> Result<&mut Buf> {
+    fn buf(&mut self, i: usize) -> Result<&mut Buf<'a>> {
         ensure!(i < self.bufs.len(), "glTF buffers[{i}] doesn't exist");
         if self.bufs[i].is_none() {
             let b = self.get("buffers", i)?.clone();
             let declared = b.get("byteLength").and_then(Value::as_u64).unwrap_or(0);
             let buf = match b.get("uri").and_then(Value::as_str) {
-                Some(uri) if uri.starts_with("data:") => Buf::Mem(container::data_uri(uri)?.1),
-                Some(uri) => {
+                Some(uri) if uri.starts_with("data:") => {
+                    Buf::Mem(Cow::Owned(container::data_uri(uri)?.1))
+                }
+                #[cfg(feature = "fs")]
+                Some(uri) if self.input.bytes().is_none() => {
                     let rel = container::percent_decode(uri);
-                    ensure!(
-                        safe_relative(&rel),
-                        "refusing to read {rel:?}: not a relative path inside the model's folder"
-                    );
-                    let p = self.dir.join(&rel);
+                    let p = self.input.dir().join(checked(&rel)?);
                     let file = File::open(&p).map_err(|e| invalid!("glTF buffer {rel:?}: {e}"))?;
                     let len = file.metadata()?.len();
                     Buf::File {
@@ -359,6 +409,7 @@ impl<'a> Reader<'a> {
                         at: u64::MAX,
                     }
                 }
+                Some(uri) => Buf::Mem(external(self.input, self.assets, uri)?),
                 None if i == 0 && self.bin.is_some() => self.bin.take().unwrap(),
                 None => bail!("glTF buffer {i} has no data"),
             };
@@ -443,6 +494,7 @@ impl<'a> Reader<'a> {
         let mut scratch = std::mem::take(&mut self.scratch);
         let b = self.buf(buffer)?;
         ensure!(start + span <= b.len(), "glTF buffer view runs past its buffer");
+        #[cfg_attr(not(feature = "fs"), allow(irrefutable_let_patterns))]
         if let Buf::Mem(v) = b {
             f(0, &v[start as usize..(start + span) as usize], stride);
             self.scratch = scratch;
@@ -1250,7 +1302,7 @@ impl Reader<'_> {
                     .and_then(|(m, b)| self.assets.image(&b, &named(m.as_deref().or(mime)))),
                 Some(uri) => self
                     .assets
-                    .find(&container::percent_decode(uri), &self.dir)
+                    .find(&container::percent_decode(uri), self.input.dir())
                     .and_then(|p| self.assets.load_image(&p)),
                 None => None,
             }
@@ -1319,7 +1371,7 @@ fn place(g: Geometry, transforms: &[M4], material: usize) -> Prim {
     p
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fs"))]
 mod tests {
     use crate::assets::Folder;
     use crate::mesh::{Material, Mesh, Prim, to_glb};
@@ -1382,7 +1434,16 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, bytes).unwrap();
         let ext = name.rsplit('.').next().unwrap();
-        crate::formats::load(&path, ext, &Folder::new(dir)).unwrap().mesh.unwrap()
+        let mesh = crate::formats::load(&path, ext, &Folder::new(dir)).unwrap().mesh.unwrap();
+        // From memory, with the folder's files as the assets, it reads the same.
+        let mut memory = crate::assets::Memory::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let p = entry.unwrap().path();
+            memory.insert(&p.file_name().unwrap().to_string_lossy(), std::fs::read(&p).unwrap());
+        }
+        let in_memory = crate::formats::load_bytes(bytes, name, ext, &memory).unwrap().mesh.unwrap();
+        assert!(to_glb(&mesh).unwrap() == to_glb(&in_memory).unwrap(), "{name} reads differently from memory");
+        mesh
     }
 
     fn same(a: &Mesh, b: &Mesh) {

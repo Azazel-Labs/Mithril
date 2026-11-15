@@ -2,12 +2,16 @@
 //! refers to) and an `expect.json` saying which part of which standard it exercises, where it came from, and what
 //! the GLB made from it must hold. Each case is loaded, written as GLB, validated as glTF 2.0, decoded, and checked
 //! against its expectations. See `tests/corpus/README.md` for the layout and the expectation keys.
+//!
+//! Each case is also read from memory, with its folder's files as [`Memory`] assets, and must read the same.
+
+#![cfg(feature = "fs")]
 
 mod glb;
 
 use std::path::{Path, PathBuf};
 
-use mithril::assets::Folder;
+use mithril::assets::{Folder, Memory};
 use mithril::formats::{self, EXTENSIONS};
 use serde_json::{Map, Value};
 
@@ -105,12 +109,44 @@ fn close(a: &[f32], b: &[f32], tol: f32) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= tol * (1.0 + y.abs()))
 }
 
+/// A path under `root`, `/`-separated and relative to it.
+fn relative(p: &Path, root: &Path) -> String {
+    p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/")
+}
+
+/// Reads the case from memory, with every file in its folder as an asset, and checks it reads as it did from its
+/// file: the same GLB and facts, or an error where that failed.
+fn same_from_memory(case: &Case, ext: &str, from_file: &mithril::Result<formats::Loaded>) -> Result<(), String> {
+    let mut memory = Memory::new();
+    let mut dirs = vec![case.dir.clone()];
+    while let Some(dir) = dirs.pop() {
+        for p in std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()) {
+            if p.is_dir() {
+                dirs.push(p);
+            } else {
+                memory.insert(&relative(&p, &case.dir), std::fs::read(&p).unwrap());
+            }
+        }
+    }
+    let bytes = std::fs::read(&case.file).unwrap();
+    let from_memory = formats::load_bytes(&bytes, &relative(&case.file, &case.dir), ext, &memory);
+    let glb = |m: &Option<mithril::mesh::Mesh>| m.as_ref().map(|m| mithril::mesh::to_glb(m).unwrap());
+    match (from_file, &from_memory) {
+        (Ok(a), Ok(b)) if glb(&a.mesh) == glb(&b.mesh) && a.facts == b.facts => Ok(()),
+        (Ok(_), Ok(_)) => Err("reads differently from memory".into()),
+        (Err(_), Err(_)) => Ok(()),
+        (Ok(_), Err(err)) => Err(format!("fails to load from memory: {err}")),
+        (Err(_), Ok(_)) => Err("loads from memory, though not from its file".into()),
+    }
+}
+
 /// Runs one case, returning what's wrong with it.
 fn run(case: &Case) -> Result<(), String> {
     let e = &case.expect;
     let ext = ext_of(&case.file);
     let tol = e.get("tolerance").and_then(Value::as_f64).unwrap_or(1e-4) as f32;
     let loaded = formats::load(&case.file, &ext, &Folder::new(&case.dir));
+    same_from_memory(case, &ext, &loaded)?;
     if let Some(want) = e.get("error").and_then(Value::as_str) {
         return match loaded {
             Err(err) if err.to_string().to_lowercase().contains(&want.to_lowercase()) => Ok(()),

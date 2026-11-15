@@ -578,9 +578,11 @@ mod triangulate_tests {
 /// A multiply-rotate hasher (the Fx hash) for small integer keys: much faster than the
 /// default SipHash, and keys here come from the file being read, not from an attacker who can
 /// see the hash.
+#[cfg(any(feature = "ply", feature = "3ds"))]
 #[derive(Default, Clone, Copy)]
 pub(crate) struct FxHasher(u64);
 
+#[cfg(any(feature = "ply", feature = "3ds"))]
 impl std::hash::Hasher for FxHasher {
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
@@ -609,5 +611,6 @@ impl std::hash::Hasher for FxHasher {
 }
 
 /// A `HashMap` with [`FxHasher`].
+#[cfg(any(feature = "ply", feature = "3ds"))]
 pub(crate) type FastMap<K, V> =
     std::collections::HashMap<K, V, std::hash::BuildHasherDefault<FxHasher>>;
