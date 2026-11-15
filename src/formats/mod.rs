@@ -243,7 +243,7 @@ fn convert<'a>(input: Input<'a>, ext: &str, assets: &'a dyn Assets, keep: Keep) 
     let _ = (input, assets, keep);
     match ext {
         #[cfg(feature = "stl")]
-        "stl" => stl::stl(input).map(counted),
+        "stl" => stl::stl(input),
         #[cfg(feature = "ply")]
         "ply" => ply::ply(input, assets).map(|(mesh, facts)| of_mesh(mesh, facts)),
         #[cfg(feature = "vox")]

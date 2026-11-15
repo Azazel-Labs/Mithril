@@ -47,5 +47,11 @@
       -1
     ]
   ],
-  "winding_matches_normals": true
+  "winding_matches_normals": true,
+  "document": {
+    "nodes": 1,
+    "node_names": [
+      "cube"
+    ]
+  }
 }

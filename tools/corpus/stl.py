@@ -172,11 +172,12 @@ case(FMT, "ascii_no_endsolid", {"cube.stl": ascii_stl(CUBE_TRIS, end=False)},
 
 case(FMT, "ascii_one_line", {"cube.stl": ascii_stl(CUBE_TRIS, nl=" ", indent="")},
      {"spec": ASC + ": everything on one line (the grammar is whitespace-separated words)",
-      "source": SRC, **CUBE})
+      "source": SRC, **CUBE, "document": {"nodes": 1, "node_names": ["cube"]}})
 
 case(FMT, "ascii_multiple_solids",
      {"cube.stl": ascii_stl(CUBE_TRIS[:6], name="a") + ascii_stl(CUBE_TRIS[6:], name="b")},
-     {"spec": ASC + ": two solids in one file", "source": SRC, **CUBE})
+     {"spec": ASC + ": two solids in one file, each a named node", "source": SRC, **CUBE,
+      "document": {"nodes": 2, "node_names": ["a", "b"]}})
 
 case(FMT, "ascii_non_utf8_name", {"cube.stl": ascii_stl(CUBE_TRIS, name="pi\xe8ce").encode("latin-1")},
      {"spec": ASC + ": a Latin-1 solid name", "source": SRC, **CUBE})

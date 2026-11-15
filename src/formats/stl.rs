@@ -5,40 +5,70 @@
 //! the same point are shared, and the mesh carries no normals, so glTF clients shade it flat from
 //! the winding, as STL means. Facets with a coordinate that isn't a finite number are dropped.
 //!
+//! Each ASCII `solid` is a node and mesh of its own, named as the file names it; a binary
+//! file's header text, when it is text, is kept in the asset's `extras.source`.
+//!
 //! The file is read a block at a time, never whole.
 
 use std::collections::HashMap;
 
+use serde_json::{Map, Value, json};
+
 use super::Input;
 use super::stream::{self, Blocks};
 use crate::Result;
-use crate::mesh::{GRAY, MAX_TRIANGLES, Material, Mesh, Welder, single, srgb_to_linear};
+use crate::document::Document;
+use crate::mesh::{GRAY, MAX_TRIANGLES, Material, Mesh, Prim, Welder, single, srgb_to_linear};
 
 type Tri = [[f32; 3]; 3];
 
-pub(crate) fn stl(input: Input<'_>) -> Result<Mesh> {
+pub(crate) fn stl(input: Input<'_>) -> Result<Document<'static>> {
     let mut blocks = input.blocks()?;
     let size = blocks.size_hint() as u64;
     let head = blocks.need(1024)?;
-    if let Some(n) = binary_count(head, size) {
-        ensure!(n <= MAX_TRIANGLES, "too many triangles to convert ({n})");
-        let header: [u8; 80] = head[..80].try_into().unwrap_or([0; 80]);
-        blocks.consume(84);
-        let colors = magics(&header);
-        let plain = colors.is_none();
-        return match binary(blocks, n, colors.unwrap_or(Colors::None))? {
-            Some(mesh) => Ok(mesh),
-            // Two colors flagged the VisCAM way: read it again with colors.
-            None if plain => {
-                let mut again = input.blocks()?;
-                again.need(84)?;
-                again.consume(84);
-                binary(again, n, Colors::VisCam)?.ok_or_else(|| invalid!("STL changed while being read"))
-            }
-            None => bail!("STL changed while being read"),
-        };
+    let Some(n) = binary_count(head, size) else {
+        let solids: Vec<_> = ascii(blocks)?.into_iter().map(|(name, p)| (name, vec![p])).collect();
+        let source = json!({ "format": "STL", "encoding": "ASCII" });
+        return Ok(document(solids, single(Prim::default()), source));
+    };
+    ensure!(n <= MAX_TRIANGLES, "too many triangles to convert ({n})");
+    let header: [u8; 80] = head[..80].try_into().unwrap_or([0; 80]);
+    let mut source = json!({ "format": "STL", "encoding": "binary" });
+    if let Some(text) = header_text(&header) {
+        source["header"] = json!(text);
     }
-    ascii(blocks)
+    blocks.consume(84);
+    let colors = magics(&header);
+    let plain = colors.is_none();
+    let mut mesh = match binary(blocks, n, colors.unwrap_or(Colors::None))? {
+        Some(mesh) => mesh,
+        // Two colors flagged the VisCAM way: read it again with colors.
+        None if plain => {
+            let mut again = input.blocks()?;
+            again.need(84)?;
+            again.consume(84);
+            binary(again, n, Colors::VisCam)?.ok_or_else(|| invalid!("STL changed while being read"))?
+        }
+        None => bail!("STL changed while being read"),
+    };
+    let prims = std::mem::take(&mut mesh.prims);
+    Ok(document(vec![(None, prims)], mesh, source))
+}
+
+/// The document for `meshes` using `mesh`'s materials, with its triangles counted.
+fn document(meshes: Vec<(Option<String>, Vec<Prim>)>, mesh: Mesh, source: Value) -> Document<'static> {
+    let triangles: usize = meshes.iter().flat_map(|(_, p)| p).map(|p| p.indices.len() / 3).sum();
+    let mut facts = Map::new();
+    facts.insert("triangles".into(), json!(triangles));
+    Document::from_named(meshes, &mesh.materials, mesh.images, Some(source), facts)
+}
+
+/// A binary header's text: printable ASCII up to the first NUL, trimmed; `None` when that is
+/// empty or the bytes aren't text.
+fn header_text(header: &[u8; 80]) -> Option<String> {
+    let text = header.split(|&b| b == 0).next().unwrap_or_default().trim_ascii();
+    (!text.is_empty() && text.iter().all(|&b| b == b' ' || b.is_ascii_graphic()))
+        .then(|| String::from_utf8_lossy(text).into_owned())
 }
 
 /// The facet count when the file is binary STL, from its first bytes and its size. The 80-byte
@@ -175,8 +205,10 @@ fn finite(t: &Tri) -> bool {
 
 /// ASCII STL: `solid`, then `facet normal ... outer loop`, three `vertex x y z`, `endloop
 /// endfacet`, repeated; `endsolid`. Keywords in any case, any whitespace between words, and
-/// any number of solids one after another. Only the `vertex` lines matter.
-fn ascii(mut blocks: Blocks<'_>) -> Result<Mesh> {
+/// any number of solids one after another, each a mesh named by the rest of its `solid` line
+/// (up to a `facet` keyword, for files written on one line). Otherwise only the `vertex` lines
+/// matter.
+fn ascii(mut blocks: Blocks<'_>) -> Result<Vec<(Option<String>, Prim)>> {
     let head = blocks.need(5)?;
     ensure!(
         head.trim_ascii_start()
@@ -187,6 +219,11 @@ fn ascii(mut blocks: Blocks<'_>) -> Result<Mesh> {
     // Sized from the first block's bytes per facet once it's read.
     let size = blocks.size_hint();
     let mut w = Welder::with_capacity((size / 250).min(4096));
+    let mut solids: Vec<(Option<String>, Prim)> = Vec::new();
+    // The current solid's name, and whether its `solid` line is still being read.
+    let (mut name, mut naming): (Vec<u8>, bool) = (Vec::new(), false);
+    let mut seen = false;
+    let mut total = 0;
     let mut read = 0;
     let mut sized = false;
     let mut tri: Tri = [[0.0; 3]; 3];
@@ -210,6 +247,7 @@ fn ascii(mut blocks: Blocks<'_>) -> Result<Mesh> {
         let n = text.len();
         loop {
             while i < n && stream::space(text[i]) {
+                naming &= text[i] != b'\n' && text[i] != b'\r';
                 i += 1;
             }
             if i == n {
@@ -220,6 +258,17 @@ fn ascii(mut blocks: Blocks<'_>) -> Result<Mesh> {
                 i += 1;
             }
             let word = &text[start..i];
+            if naming {
+                if word.eq_ignore_ascii_case(b"facet") || word.eq_ignore_ascii_case(b"endsolid") {
+                    naming = false;
+                } else {
+                    if !name.is_empty() {
+                        name.push(b' ');
+                    }
+                    name.extend_from_slice(word);
+                    continue;
+                }
+            }
             if want > 0 {
                 let c = &mut tri[corner][3 - want];
                 *c = stream::f32_from(word).ok_or_else(|| invalid!("bad vertex line in STL"))?;
@@ -230,16 +279,85 @@ fn ascii(mut blocks: Blocks<'_>) -> Result<Mesh> {
                         corner = 0;
                         if finite(&tri) {
                             w.push(tri);
-                            ensure!(w.triangles() <= MAX_TRIANGLES, "too many triangles to convert");
+                            total += 1;
+                            ensure!(total <= MAX_TRIANGLES, "too many triangles to convert");
                         }
                     }
                 }
             } else if word.len() == 6 && word.eq_ignore_ascii_case(b"vertex") {
                 want = 3;
+            } else if word.len() == 5 && word.eq_ignore_ascii_case(b"solid") {
+                if seen {
+                    finish_solid(&mut solids, &name, std::mem::replace(&mut w, Welder::with_capacity(0)));
+                }
+                (seen, naming) = (true, true);
+                name.clear();
             }
         }
     }
     ensure!(want == 0, "bad vertex line in STL");
-    ensure!(w.triangles() > 0, "STL has no triangles");
-    Ok(single(w.finish()))
+    finish_solid(&mut solids, &name, w);
+    ensure!(!solids.is_empty(), "STL has no triangles");
+    Ok(solids)
+}
+
+/// Adds a solid's triangles, if it has any, under its name.
+fn finish_solid(solids: &mut Vec<(Option<String>, Prim)>, name: &[u8], w: Welder) {
+    if w.triangles() > 0 {
+        let name = (!name.is_empty()).then(|| String::from_utf8_lossy(name).into_owned());
+        solids.push((name, w.finish()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read(bytes: &[u8]) -> Document<'static> {
+        stl(Input::memory(bytes, "t.stl")).unwrap()
+    }
+
+    fn facet(z: f32) -> String {
+        format!("facet normal 0 0 1 outer loop vertex 0 0 {z} vertex 1 0 {z} vertex 0 1 {z} endloop endfacet\n")
+    }
+
+    #[test]
+    fn each_solid_is_a_named_node() {
+        let text = format!(
+            "solid left part\n{}endsolid left part\nsolid\n{}endsolid\nsolid empty\nendsolid empty\n",
+            facet(0.0),
+            facet(1.0)
+        );
+        let doc = read(text.as_bytes());
+        let nodes = doc.json["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0]["name"], "left part");
+        assert_eq!(doc.json["meshes"][0]["name"], "left part");
+        assert!(nodes[1].get("name").is_none());
+        assert_eq!(doc.json["asset"]["extras"]["source"]["encoding"], "ASCII");
+        assert_eq!(doc.facts["triangles"], 2);
+    }
+
+    #[test]
+    fn a_name_ends_at_the_first_facet_on_one_line() {
+        let text = format!("solid one line {}endsolid one line", facet(0.0)).replace('\n', " ");
+        assert_eq!(read(text.as_bytes()).json["nodes"][0]["name"], "one line");
+    }
+
+    #[test]
+    fn binary_header_text_is_kept() {
+        let mut bytes = b"made by a tool".to_vec();
+        bytes.resize(80, 0);
+        bytes.extend(1u32.to_le_bytes());
+        for v in [0.0f32, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0] {
+            bytes.extend(v.to_le_bytes());
+        }
+        bytes.extend([0, 0]);
+        let doc = read(&bytes);
+        let source = &doc.json["asset"]["extras"]["source"];
+        assert_eq!(source["encoding"], "binary");
+        assert_eq!(source["header"], "made by a tool");
+        bytes[..80].fill(0);
+        assert!(read(&bytes).json["asset"]["extras"]["source"].get("header").is_none());
+    }
 }

@@ -534,31 +534,53 @@ impl<'a> Document<'a> {
     /// its arrays moved into the document's buffer without a copy.
     #[must_use]
     pub fn from_mesh(mesh: Mesh, facts: Map<String, Value>) -> Document<'static> {
-        let mut b = Builder::default();
         let Mesh {
             prims,
             materials,
             images,
         } = mesh;
-        let last_material = materials.len().saturating_sub(1);
-        let primitives: Vec<Value> = prims
-            .into_iter()
-            .filter_map(|p| {
-                let material = p.material.min(last_material);
-                let mut prim = b.primitive(p)?;
-                prim["material"] = json!(material);
-                Some(prim)
-            })
-            .collect();
-        if primitives.is_empty() {
+        Self::from_named(vec![(None, prims)], &materials, images, None, facts)
+    }
+
+    /// The document for named triangle meshes sharing `materials` and `images`: a node drawing
+    /// each, in order, skipping those with no triangles; `source` becomes the asset's
+    /// `extras.source`.
+    pub(crate) fn from_named(
+        meshes: Vec<(Option<String>, Vec<Prim>)>,
+        materials: &[Material],
+        images: Vec<Image>,
+        source: Option<Value>,
+        facts: Map<String, Value>,
+    ) -> Document<'static> {
+        let mut b = Builder::default();
+        let (mut nodes, mut out) = (Vec::new(), Vec::new());
+        for (name, prims) in meshes {
+            let Some(mut mesh) = b.mesh(prims, materials.len()) else {
+                continue;
+            };
+            let mut node = json!({ "mesh": out.len() });
+            if let Some(name) = name {
+                mesh["name"] = json!(name);
+                node["name"] = json!(name);
+            }
+            out.push(mesh);
+            nodes.push(node);
+        }
+        if out.is_empty() {
             return Document::empty(facts);
         }
         let mut json = Map::new();
+        if let Some(source) = source {
+            json.insert("asset".into(), json!({ "extras": { "source": source } }));
+        }
         json.insert("scene".into(), json!(0));
-        json.insert("scenes".into(), json!([{ "nodes": [0] }]));
-        json.insert("nodes".into(), json!([{ "mesh": 0 }]));
-        json.insert("meshes".into(), json!([{ "primitives": primitives }]));
-        b.materials(&materials, images, &mut json);
+        json.insert(
+            "scenes".into(),
+            json!([{ "nodes": (0..nodes.len()).collect::<Vec<_>>() }]),
+        );
+        json.insert("nodes".into(), Value::Array(nodes));
+        json.insert("meshes".into(), Value::Array(out));
+        b.materials(materials, images, &mut json);
         b.finish(json, facts)
     }
 }
@@ -601,6 +623,22 @@ impl Builder {
             attributes["COLOR_0"] = json!(a);
         }
         Some(json!({ "attributes": attributes, "indices": indices }))
+    }
+
+    /// A mesh of `prims`, each using its material (the last of `materials` when out of range);
+    /// `None` when none has triangles.
+    pub(crate) fn mesh(&mut self, prims: Vec<Prim>, materials: usize) -> Option<Value> {
+        let last = materials.saturating_sub(1);
+        let primitives: Vec<Value> = prims
+            .into_iter()
+            .filter_map(|p| {
+                let material = p.material.min(last);
+                let mut prim = self.primitive(p)?;
+                prim["material"] = json!(material);
+                Some(prim)
+            })
+            .collect();
+        (!primitives.is_empty()).then(|| json!({ "primitives": primitives }))
     }
 
     /// A `VEC3` float accessor with the `min` and `max` glTF requires of positions (and of
