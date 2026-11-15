@@ -1,0 +1,13 @@
+mtllib m.mtl
+v 0 0 0
+v 1 0 0
+v 1 1 0
+v 0 1 0
+vt 0 0
+vt 1 0
+vt 1 1
+vt 0 1
+usemtl bump
+f 1/1 2/2 3/3
+usemtl norm
+f 1/1 3/3 4/4

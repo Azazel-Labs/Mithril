@@ -1,0 +1,18 @@
+{
+  "spec": "Wavefront OBJ + MTL as Blender's exporter writes them: smooth normals, mixed triangles and quads, no MTL",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.wm.obj_export), tools/corpus/blender_export.py",
+  "triangles": 968,
+  "bounds": {
+    "min": [
+      -1.3672,
+      -0.9844,
+      -0.8516
+    ],
+    "max": [
+      1.3672,
+      0.9844,
+      0.8516
+    ]
+  },
+  "uvs": true
+}

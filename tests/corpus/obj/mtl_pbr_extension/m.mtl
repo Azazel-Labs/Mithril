@@ -1,0 +1,5 @@
+newmtl metal
+Kd 1 1 1
+Ke 1 0.5 0
+Pr 0.3
+Pm 0.9

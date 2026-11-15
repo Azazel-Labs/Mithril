@@ -1,0 +1,30 @@
+{
+  "spec": "Wavefront OBJ + MTL as Blender's exporter writes them: map_Kd image texture",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.wm.obj_export), tools/corpus/blender_export.py",
+  "triangles": 2,
+  "bounds": {
+    "min": [
+      -1.0,
+      0.0,
+      -1.0
+    ],
+    "max": [
+      1.0,
+      0.0,
+      1.0
+    ]
+  },
+  "area": 4.0,
+  "uvs": true,
+  "materials": [
+    {
+      "name": "Textured",
+      "textured": true,
+      "pixel": [
+        255,
+        0,
+        0
+      ]
+    }
+  ]
+}

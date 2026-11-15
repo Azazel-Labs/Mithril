@@ -1,0 +1,46 @@
+{
+  "spec": "Wavefront OBJ + MTL as Blender's exporter writes them: vertex colors after positions",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.wm.obj_export), tools/corpus/blender_export.py",
+  "triangles": 2,
+  "bounds": {
+    "min": [
+      -1.0,
+      0.0,
+      -1.0
+    ],
+    "max": [
+      1.0,
+      0.0,
+      1.0
+    ]
+  },
+  "area": 4.0,
+  "colors": true,
+  "tolerance": 0.002,
+  "colors_include": [
+    [
+      1.0,
+      0.0,
+      0.0,
+      1
+    ],
+    [
+      0.0,
+      1.0,
+      0.0,
+      1
+    ],
+    [
+      0.0,
+      0.0,
+      1.0,
+      1
+    ],
+    [
+      0.214,
+      0.214,
+      0.214,
+      1
+    ]
+  ]
+}

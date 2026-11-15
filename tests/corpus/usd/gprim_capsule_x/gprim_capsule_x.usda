@@ -1,0 +1,15 @@
+#usda 1.0
+(
+    upAxis = "Y"
+    metersPerUnit = 1.0
+)
+
+def Xform "Root"
+{
+    def Capsule "Pill"
+    {
+        double radius = 0.5
+        double height = 2
+        uniform token axis = "X"
+    }
+}

@@ -19,6 +19,11 @@ Early. What exists today:
   materials and textures, FBX (binary and ASCII), 3DS, 3MF and USD (`.usda`, `.usdc`,
   `.usdz`). Each produces a `mesh::Mesh`, with textures embedded. `formats::load` dispatches
   on the extension.
+- **Conformance corpus**: 423 cases under `tests/corpus`, each a file and the GLB it must
+  become. They cover every format above and the variants exporters really write: OBJ's face
+  forms and MTL dialects, both PLY byte orders, every FBX version and axis system, and USD's
+  three encodings and its composition. Most are generated against the specifications; the
+  rest are Blender 5.2 exports. See [tests/corpus/README.md](tests/corpus/README.md).
 - **`mesh`**: that triangle-list model (primitives, materials, images), written out as a
   plain GLB by `mesh::to_glb`.
 - **`assets`**: the `Assets` trait readers use to find referenced files and turn texture

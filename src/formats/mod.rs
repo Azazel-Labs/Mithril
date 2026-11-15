@@ -61,7 +61,7 @@ pub fn load(path: &Path, ext: &str, assets: &dyn Assets) -> Result<Loaded> {
         #[cfg(feature = "stl")]
         "stl" => stl::stl(&std::fs::read(path)?).map(counted),
         #[cfg(feature = "ply")]
-        "ply" => ply::ply(&std::fs::read(path)?).map(|(mesh, facts)| Loaded { mesh, facts }),
+        "ply" => ply::ply(path, assets).map(|(mesh, facts)| Loaded { mesh, facts }),
         #[cfg(feature = "vox")]
         "vox" => vox::vox(&std::fs::read(path)?).map(|(mesh, facts)| Loaded { mesh, facts }),
         #[cfg(feature = "3mf")]
@@ -84,23 +84,22 @@ pub fn load(path: &Path, ext: &str, assets: &dyn Assets) -> Result<Loaded> {
             assets,
         ))),
         #[cfg(feature = "fbx")]
-        "fbx" => Ok(counted(colors_and_textures(
-            fbx::load(path, assets)?,
-            path,
-            ext,
-            assets,
-        ))),
+        "fbx" => {
+            let mut mesh = fbx::load(path, assets)?;
+            guess_color_texture(&mut mesh, path, assets);
+            Ok(counted(mesh))
+        }
         e if EXTENSIONS.contains(&e) => bail!("built without the `{e}` feature"),
         _ => bail!("not a model format handled here: .{ext}"),
     }
 }
 
 /// OBJ and FBX: colors to linear unless the file wrote them so, and a guessed color texture.
-#[cfg(any(feature = "obj", feature = "fbx"))]
+#[cfg(feature = "obj")]
 fn colors_and_textures(mut mesh: Mesh, path: &Path, ext: &str, assets: &dyn Assets) -> Mesh {
     if !linear_colors(path, ext) {
         for m in &mut mesh.materials {
-            for c in &mut m.color[..3] {
+            for c in m.color[..3].iter_mut().chain(&mut m.emissive) {
                 *c = crate::mesh::srgb_to_linear(*c);
             }
         }
@@ -109,7 +108,7 @@ fn colors_and_textures(mut mesh: Mesh, path: &Path, ext: &str, assets: &dyn Asse
     mesh
 }
 
-#[cfg(any(feature = "obj", feature = "fbx"))]
+#[cfg(feature = "obj")]
 /// Whether the file's material colors are linear values (Blender's OBJ and FBX exporters write them so) rather
 /// than the sRGB other tools write.
 fn linear_colors(path: &Path, ext: &str) -> bool {

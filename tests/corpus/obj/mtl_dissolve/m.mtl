@@ -1,0 +1,6 @@
+newmtl glass
+Kd 1 1 1
+d 0.5
+newmtl tinted
+Kd 1 1 1
+Tr 0.25

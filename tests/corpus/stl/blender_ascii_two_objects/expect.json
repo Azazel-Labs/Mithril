@@ -1,0 +1,18 @@
+{
+  "spec": "STL as Blender's exporter writes it: ascii, two objects in one solid",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.wm.stl_export), tools/corpus/blender_export.py",
+  "triangles": 980,
+  "bounds": {
+    "min": [
+      -1.3672,
+      -1.6465,
+      -1.3105
+    ],
+    "max": [
+      4.6091,
+      1.6465,
+      1.3105
+    ]
+  },
+  "winding_matches_normals": true
+}

@@ -1,0 +1,67 @@
+{
+  "spec": "binary FBX 7.4 as Blender's exporter writes it: quads, UVs, flat normals, one material",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.export_scene.fbx), tools/corpus/blender_export.py",
+  "triangles": 12,
+  "bounds": {
+    "min": [
+      -1.0,
+      -1.0,
+      -1.0
+    ],
+    "max": [
+      1.0,
+      1.0,
+      1.0
+    ]
+  },
+  "area": 24.0,
+  "uvs": true,
+  "normals_in": [
+    [
+      1,
+      0,
+      0
+    ],
+    [
+      -1,
+      0,
+      0
+    ],
+    [
+      0,
+      1,
+      0
+    ],
+    [
+      0,
+      -1,
+      0
+    ],
+    [
+      0,
+      0,
+      1
+    ],
+    [
+      0,
+      0,
+      -1
+    ]
+  ],
+  "winding_matches_normals": true,
+  "faces_outward": true,
+  "material_count": 1,
+  "materials": [
+    {
+      "name": "Painted",
+      "color": [
+        0.8,
+        0.1,
+        0.05,
+        1
+      ],
+      "roughness": 0.4,
+      "metallic": 0.3
+    }
+  ]
+}

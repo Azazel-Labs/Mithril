@@ -1,0 +1,28 @@
+{
+  "spec": "OpenUSD as Blender's exporter writes it: emission color and strength",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.wm.usd_export), tools/corpus/blender_export.py",
+  "triangles": 12,
+  "bounds": {
+    "min": [
+      -1.0,
+      -1.0,
+      -1.0
+    ],
+    "max": [
+      1.0,
+      1.0,
+      1.0
+    ]
+  },
+  "area": 24.0,
+  "materials": [
+    {
+      "name": "Lamp",
+      "emissive": [
+        0.5,
+        0.25,
+        0
+      ]
+    }
+  ]
+}

@@ -16,13 +16,7 @@ use mithril::mesh::{Material, Mesh, Prim, to_glb};
 
 fn sample() -> mithril::Result<Vec<u8>> {
     let n = 24u32;
-    let mut prim = Prim {
-        positions: Vec::new(),
-        normals: Vec::new(),
-        uvs: Vec::new(),
-        indices: Vec::new(),
-        material: 0,
-    };
+    let mut prim = Prim::default();
     for y in 0..=n {
         for x in 0..=n {
             let (u, v) = (x as f32 / n as f32, y as f32 / n as f32);

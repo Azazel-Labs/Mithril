@@ -1,55 +1,127 @@
 //! STL, binary (with facet colors) and ASCII.
+//!
+//! The stored facet normals are ignored: many exporters write zeros, and the vertex order is the
+//! one thing the format requires to be right (counter-clockwise seen from outside), so normals
+//! come from the winding. Facets with a coordinate that isn't a finite number are dropped.
 
-use crate::mesh::{MAX_TRIANGLES, Mesh, colored_soup, single, soup};
-use crate::{Context as _, Result};
+use crate::mesh::{MAX_TRIANGLES, Mesh, Prim, colored_soup, single};
+use crate::Result;
+
+type Tri = [[f32; 3]; 3];
 
 pub(crate) fn stl(data: &[u8]) -> Result<Mesh> {
-    let le_f32 = |b: &[u8], at: usize| f32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
-    // Binary files may also start with "solid", so trust the size arithmetic first.
-    if data.len() >= 84 {
-        let n = u32::from_le_bytes([data[80], data[81], data[82], data[83]]) as usize;
-        if 84 + n * 50 == data.len() {
-            ensure!(n <= MAX_TRIANGLES, "too many triangles to preview ({n})");
-            let tris: Vec<[[f32; 3]; 3]> = (0..n)
-                .map(|i| {
-                    let at = 84 + i * 50 + 12;
-                    let v = |k: usize| {
-                        [
-                            le_f32(data, at + k * 12),
-                            le_f32(data, at + k * 12 + 4),
-                            le_f32(data, at + k * 12 + 8),
-                        ]
-                    };
-                    [v(0), v(1), v(2)]
-                })
-                .collect();
-            let attrs: Vec<u16> = (0..n)
-                .map(|i| u16::from_le_bytes([data[84 + i * 50 + 48], data[84 + i * 50 + 49]]))
-                .collect();
-            return Ok(match stl_colors(&data[..80], &attrs) {
-                Some(colors) => colored_soup(&tris, &colors),
-                None => single(soup(&tris)),
-            });
+    if let Some(n) = binary_count(data) {
+        ensure!(n <= MAX_TRIANGLES, "too many triangles to convert ({n})");
+        let facets = data[84..84 + n * 50].as_chunks::<50>().0;
+        let attrs: Vec<u16> = facets.iter().map(|f| u16::from_le_bytes([f[48], f[49]])).collect();
+        if let Some(colors) = stl_colors(&data[..80], &attrs) {
+            let (tris, colors): (Vec<Tri>, Vec<_>) = facets
+                .iter()
+                .map(facet)
+                .zip(colors)
+                .filter(|(t, _)| finite(t))
+                .unzip();
+            ensure!(!tris.is_empty(), "STL has no triangles");
+            return Ok(colored_soup(&tris, &colors));
         }
-    }
-    let text = std::str::from_utf8(data).context("neither binary nor ASCII STL")?;
-    ensure!(text.trim_start().starts_with("solid"), "not an STL file");
-    let mut verts = Vec::new();
-    for line in text.lines() {
-        let mut it = line.split_whitespace();
-        if it.next() == Some("vertex") {
-            let v: Vec<f32> = it.take(3).filter_map(|s| s.parse().ok()).collect();
-            ensure!(v.len() == 3, "bad vertex line in STL");
-            verts.push([v[0], v[1], v[2]]);
+        let mut p = Prim::default();
+        p.reserve(n * 3);
+        for f in facets {
+            p.push_flat(facet(f));
         }
+        ensure!(!p.indices.is_empty(), "STL has no triangles");
+        return Ok(single(p));
     }
+    ascii(data)
+}
+
+/// The facet count when `data` is binary STL. The 80-byte header may itself start with "solid",
+/// so the size is what decides: exactly 50 bytes per facet, or more (some tools pad the end)
+/// when the text doesn't read as ASCII STL.
+fn binary_count(data: &[u8]) -> Option<usize> {
+    let n = u32::from_le_bytes(data.get(80..84)?.try_into().ok()?) as usize;
+    let need = n.checked_mul(50)?.checked_add(84)?;
+    if need == data.len() {
+        return Some(n);
+    }
+    (need < data.len() && !looks_ascii(data)).then_some(n)
+}
+
+/// Whether the file starts like ASCII STL: `solid`, then a `facet` or `endsolid` soon after.
+fn looks_ascii(data: &[u8]) -> bool {
+    let head = &data[..data.len().min(1024)];
+    let starts = head.trim_ascii_start().get(..5).is_some_and(|w| w.eq_ignore_ascii_case(b"solid"));
+    starts
+        && head
+            .windows(5)
+            .skip(5)
+            .any(|w| w.eq_ignore_ascii_case(b"facet") || w.eq_ignore_ascii_case(b"endso"))
+}
+
+fn facet(f: &[u8; 50]) -> Tri {
+    let at = |k: usize| f32::from_le_bytes([f[k], f[k + 1], f[k + 2], f[k + 3]]);
+    let v = |k: usize| [at(12 + k * 12), at(16 + k * 12), at(20 + k * 12)];
+    [v(0), v(1), v(2)]
+}
+
+fn finite(t: &Tri) -> bool {
+    t.as_flattened().iter().all(|c| c.is_finite())
+}
+
+impl Prim {
+    /// Room for `n` more unshared vertices.
+    fn reserve(&mut self, n: usize) {
+        self.positions.reserve(n);
+        self.normals.reserve(n);
+        self.indices.reserve(n);
+    }
+
+    /// One flat-shaded triangle, unless a coordinate isn't finite.
+    fn push_flat(&mut self, t: Tri) {
+        if !finite(&t) {
+            return;
+        }
+        let n = crate::mesh::face_normal(t[0], t[1], t[2]);
+        let base = self.positions.len() as u32;
+        self.positions.extend_from_slice(&t);
+        self.normals.extend_from_slice(&[n; 3]);
+        self.indices.extend_from_slice(&[base, base + 1, base + 2]);
+    }
+}
+
+/// ASCII STL: `solid`, then `facet normal ... outer loop`, three `vertex x y z`, `endloop
+/// endfacet`, repeated; `endsolid`. Keywords in any case, any whitespace between words, and
+/// any number of solids one after another. Only the `vertex` lines matter.
+fn ascii(data: &[u8]) -> Result<Mesh> {
     ensure!(
-        verts.len() / 3 <= MAX_TRIANGLES,
-        "too many triangles to preview"
+        data.trim_ascii_start().get(..5).is_some_and(|w| w.eq_ignore_ascii_case(b"solid")),
+        "not an STL file"
     );
-    let tris: Vec<[[f32; 3]; 3]> = verts.as_chunks::<3>().0.to_vec();
-    ensure!(!tris.is_empty(), "STL has no triangles");
-    Ok(single(soup(&tris)))
+    let mut p = Prim::default();
+    p.reserve(data.len() / 80);
+    let mut words = data.split(u8::is_ascii_whitespace).filter(|w| !w.is_empty());
+    let mut tri: Tri = [[0.0; 3]; 3];
+    let mut k = 0;
+    while let Some(w) = words.next() {
+        if !w.eq_ignore_ascii_case(b"vertex") {
+            continue;
+        }
+        for c in &mut tri[k] {
+            let num = words
+                .next()
+                .and_then(|w| std::str::from_utf8(w).ok())
+                .and_then(|s| s.parse().ok());
+            *c = num.ok_or_else(|| invalid!("bad vertex line in STL"))?;
+        }
+        k += 1;
+        if k == 3 {
+            p.push_flat(tri);
+            k = 0;
+            ensure!(p.indices.len() / 3 <= MAX_TRIANGLES, "too many triangles to convert");
+        }
+    }
+    ensure!(!p.indices.is_empty(), "STL has no triangles");
+    Ok(single(p))
 }
 
 /// Each facet's color (sRGB, 0-255) from a binary STL's attribute bytes, when the file has colors. Materialize

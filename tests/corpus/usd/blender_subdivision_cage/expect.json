@@ -1,0 +1,19 @@
+{
+  "spec": "OpenUSD as Blender's exporter writes it: a subdivision modifier written as a catmullClark cage",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.wm.usd_export), tools/corpus/blender_export.py",
+  "triangles": 12,
+  "bounds": {
+    "min": [
+      -1.0,
+      -1.0,
+      -1.0
+    ],
+    "max": [
+      1.0,
+      1.0,
+      1.0
+    ]
+  },
+  "area": 24.0,
+  "faces_outward": true
+}

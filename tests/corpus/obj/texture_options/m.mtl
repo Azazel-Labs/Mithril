@@ -1,0 +1,2 @@
+newmtl tex
+map_Kd -blendu on -s 1 1 1 -o 0 0 0 -mm 0 1 -clamp off albedo.png

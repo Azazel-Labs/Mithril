@@ -1,0 +1,18 @@
+{
+  "spec": "binary FBX 7.4 as Blender's exporter writes it: parented, rotated, non-uniformly scaled and mirrored objects",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.export_scene.fbx), tools/corpus/blender_export.py",
+  "triangles": 1042,
+  "bounds": {
+    "min": [
+      -4.3672,
+      -0.9844,
+      -4.0678
+    ],
+    "max": [
+      3.2158,
+      2.6164,
+      2.2025
+    ]
+  },
+  "winding_matches_normals": true
+}

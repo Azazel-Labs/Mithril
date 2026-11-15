@@ -1,0 +1,18 @@
+{
+  "spec": "OpenUSD as Blender's exporter writes it: a subdivision modifier applied before writing",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.wm.usd_export), tools/corpus/blender_export.py",
+  "triangles": 48,
+  "bounds": {
+    "min": [
+      -0.8395,
+      -0.8395,
+      -0.8395
+    ],
+    "max": [
+      0.8395,
+      0.8395,
+      0.8395
+    ]
+  },
+  "faces_outward": true
+}

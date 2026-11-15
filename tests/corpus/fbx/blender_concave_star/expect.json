@@ -1,0 +1,26 @@
+{
+  "spec": "binary FBX 7.4 as Blender's exporter writes it: one concave 10-sided polygon",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.export_scene.fbx), tools/corpus/blender_export.py",
+  "triangles": 8,
+  "bounds": {
+    "min": [
+      -0.9511,
+      0.0,
+      -1.0
+    ],
+    "max": [
+      0.9511,
+      0.0,
+      0.809
+    ]
+  },
+  "area": 1.1756,
+  "normals_in": [
+    [
+      0,
+      1,
+      0
+    ]
+  ],
+  "winding_matches_normals": true
+}

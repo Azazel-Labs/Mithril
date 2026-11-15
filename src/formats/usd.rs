@@ -1,8 +1,16 @@
 //! USD (`.usd`, `.usda`, `.usdc`, `.usdz`), read with the pure-Rust `openusd` crate. The composed stage's visible
-//! meshes become one `meshes::Mesh`: references, payloads, variants and instances resolved, each mesh placed by its
-//! world transform, the stage's up axis and units turned into glTF's (Y up, meters). Materials come from
-//! `UsdPreviewSurface`: the diffuse color or texture, the normal map and the opacity, with textures read from the
-//! `.usdz` itself or found in the pack. A mesh with no material shows its display color.
+//! surfaces become one `meshes::Mesh`: references, payloads, variants, instances and point instancers resolved, each
+//! surface placed by its world transform, the stage's up axis and units turned into glTF's (Y up, meters).
+//!
+//! Meshes keep their polygons' outlines (concave faces are ear-clipped, `holeIndices` faces left out) and their
+//! normals, texture coordinates and display colors in any interpolation; with no normals a subdivision surface is
+//! smoothed and a polygonal one faceted. The implicit surfaces (Cube, Sphere, Cylinder, Cone, Capsule, Plane) are
+//! tessellated. Values are read at the stage's start time when it gives a time range, else at the earliest sample,
+//! so an animated file shows its first frame.
+//!
+//! Materials come from `UsdPreviewSurface`: the diffuse color or texture, the normal map, opacity, emissive color,
+//! metallic and roughness (with the shader's fallbacks), textures read from the `.usdz` itself or found in the pack.
+//! A surface with no material shows its display color: one color as the material, more as vertex colors.
 
 use std::collections::HashMap;
 use std::io::Read as _;
@@ -10,14 +18,15 @@ use std::path::Path;
 
 use crate::{Context as _, Result};
 use openusd::usd::SchemaBase as _;
-use openusd::{gf, sdf, usd};
+use openusd::{gf, sdf, tf, usd};
 use openusd_schemas::geom::{
-    self, GprimSchema, ImageableExt, MeshSchema, PointBasedSchema, PrimvarsAPI, SubsetSchema,
+    self, CapsuleSchema, ConeSchema, CubeSchema, CylinderSchema, GprimSchema, ImageableExt, MeshSchema, PlaneSchema,
+    PointBasedSchema, PointInstancerSchema, PrimvarsAPI, SphereSchema, SubsetSchema,
 };
 use openusd_schemas::shade::{self, MaterialBindingAPI};
 
 use crate::assets::Assets;
-use crate::mesh::{GRAY, Image, MAX_TRIANGLES, Material, Mesh, Prim};
+use crate::mesh::{GRAY, Image, MAX_TRIANGLES, Material, Mesh, Prim, triangulate};
 
 /// The file's meshes, or `None` when it has none to show (a material library, a layer of overrides).
 pub(crate) fn load(path: &Path, assets: &dyn Assets) -> Result<Option<Mesh>> {
@@ -31,6 +40,12 @@ pub(crate) fn load(path: &Path, assets: &dyn Assets) -> Result<Option<Mesh>> {
         Ok(Some(sdf::Value::Float(m))) if m > 0.0 => f64::from(m),
         _ => 0.01,
     };
+    // A value that isn't animated reads the same at any time; an animated one shows the first frame.
+    let time = if stage.has_authored_time_code_range() {
+        usd::TimeCode::new(stage.start_time_code())
+    } else {
+        usd::TimeCode::EARLIEST
+    };
     let mut paths = Vec::new();
     stage
         .traverse(
@@ -43,24 +58,30 @@ pub(crate) fn load(path: &Path, assets: &dyn Assets) -> Result<Option<Mesh>> {
         stage: &stage,
         file: path,
         assets,
+        time,
         usdz: Usdz::open(path),
         mesh: Mesh::default(),
         materials: HashMap::new(),
         images: HashMap::new(),
         prims: HashMap::new(),
     };
-    let mut xforms = geom::XformCache::new(None);
-    for p in paths {
-        let Ok(Some(mesh)) = geom::Mesh::get(&stage, p.clone()) else {
-            continue;
-        };
-        if !shown(&mesh) {
+    let mut xforms = geom::XformCache::new(time);
+    let prims: Vec<usd::Prim> = paths.iter().filter_map(|p| stage.prim(p.clone()).ok()).collect();
+    // A point instancer's prototypes show only where it places them.
+    let instancers: Vec<&usd::Prim> = prims.iter().filter(|p| kind(p).as_deref() == Some("PointInstancer")).collect();
+    for prim in &prims {
+        if instancers.iter().any(|i| within(prim.path(), i.path()) && prim.path() != i.path()) {
             continue;
         }
-        let world = xforms
-            .local_to_world_transform(mesh.prim())
-            .unwrap_or_default();
-        out.mesh(&mesh, world)?;
+        if !out.shown(prim) {
+            continue;
+        }
+        if kind(prim).as_deref() == Some("PointInstancer") {
+            out.instancer(prim, &prims, &mut xforms)?;
+        } else if let Some(shape) = out.shape(prim) {
+            let world = xforms.local_to_world_transform(prim).unwrap_or_default();
+            out.emit(prim, &shape, world)?;
+        }
     }
     let Builder { mut mesh, .. } = out;
     let scale = meters as f32;
@@ -80,23 +101,25 @@ fn up([x, y, z]: [f32; 3], z_up: bool) -> [f32; 3] {
     if z_up { [x, z, -y] } else { [x, y, z] }
 }
 
-/// Visible, and drawn for rendering: guides and proxies stand in for the real thing.
-fn shown(mesh: &geom::Mesh) -> bool {
-    let visible = !matches!(
-        mesh.compute_visibility(None),
-        Ok(geom::Visibility::Invisible)
-    );
-    let purpose = mesh.compute_purpose().unwrap_or_default();
-    visible && !matches!(purpose, geom::Purpose::Guide | geom::Purpose::Proxy)
+/// The prim's schema type name.
+fn kind(prim: &usd::Prim) -> Option<String> {
+    prim.type_name().ok().flatten().map(|t| t.as_str().to_owned())
+}
+
+/// Whether `path` is `root` or beneath it.
+fn within(path: &sdf::Path, root: &sdf::Path) -> bool {
+    let (p, r) = (path.as_str(), root.as_str());
+    p == r || (p.starts_with(r) && p.as_bytes().get(r.len()) == Some(&b'/'))
 }
 
 struct Builder<'a> {
     stage: &'a usd::Stage,
     file: &'a Path,
     assets: &'a dyn Assets,
+    time: usd::TimeCode,
     usdz: Option<Usdz>,
     mesh: Mesh,
-    /// Material prim path (or `display:<rgb>` for a display color) to its index in `mesh.materials`.
+    /// Material prim path (or `display:<rgba>` for a display color) to its index in `mesh.materials`.
     materials: HashMap<String, usize>,
     /// Texture asset path to its index in `mesh.images`, or `None` when it couldn't be found.
     images: HashMap<String, Option<usize>>,
@@ -136,6 +159,7 @@ impl Spread {
 }
 
 /// A primvar's values with its indices and interpolation.
+#[derive(Clone)]
 struct Primvar<T> {
     values: Vec<T>,
     indices: Option<Vec<i32>>,
@@ -151,121 +175,124 @@ impl<T: Copy> Primvar<T> {
         };
         self.values.get(i).copied()
     }
-}
 
-fn primvar<T>(
-    api: &PrimvarsAPI,
-    name: &str,
-    decode: impl Fn(sdf::Value) -> Option<Vec<T>>,
-) -> Option<Primvar<T>> {
-    let pv = api.primvar(name).ok()?;
-    let values = decode(pv.attribute().get::<sdf::Value>().ok()??)?;
-    let indices = pv.indices(None).ok().flatten().filter(|i| !i.is_empty());
-    let spread = pv
-        .interpolation()
-        .ok()
-        .map_or(Spread::Vertex, |i| Spread::of(Some(i.as_token())));
-    Some(Primvar {
-        values,
-        indices,
-        spread,
-    })
-}
-
-fn vec3s(v: sdf::Value) -> Option<Vec<[f32; 3]>> {
-    Some(match v {
-        sdf::Value::Vec3fVec(v) => v.into_iter().map(|p| [p.x, p.y, p.z]).collect(),
-        sdf::Value::Vec3dVec(v) => v
-            .into_iter()
-            .map(|p| [p.x as f32, p.y as f32, p.z as f32])
-            .collect(),
-        sdf::Value::Vec3hVec(v) => v
-            .into_iter()
-            .map(|p| [p.x.to_f32(), p.y.to_f32(), p.z.to_f32()])
-            .collect(),
-        sdf::Value::Vec3f(p) => vec![[p.x, p.y, p.z]],
-        sdf::Value::Vec3d(p) => vec![[p.x as f32, p.y as f32, p.z as f32]],
-        _ => return None,
-    })
-}
-
-fn vec2s(v: sdf::Value) -> Option<Vec<[f32; 2]>> {
-    Some(match v {
-        sdf::Value::Vec2fVec(v) => v.into_iter().map(|p| [p.x, p.y]).collect(),
-        sdf::Value::Vec2dVec(v) => v.into_iter().map(|p| [p.x as f32, p.y as f32]).collect(),
-        sdf::Value::Vec2hVec(v) => v
-            .into_iter()
-            .map(|p| [p.x.to_f32(), p.y.to_f32()])
-            .collect(),
-        _ => return None,
-    })
-}
-
-fn ints(v: Option<sdf::Value>) -> Vec<i32> {
-    match v {
-        Some(sdf::Value::IntVec(v)) => v,
-        _ => Vec::new(),
+    /// One value for the whole surface.
+    fn constant(&self) -> bool {
+        self.spread == Spread::Constant || (self.values.len() == 1 && self.indices.is_none())
     }
 }
 
-/// Names texture coordinates go by: USD's own `st`, then what exporters write.
-const UV_NAMES: &[&str] = &[
-    "st",
-    "st0",
-    "st_0",
-    "UVMap",
-    "uv",
-    "uv0",
-    "map1",
-    "UVChannel_1",
-];
-
 impl Builder<'_> {
-    fn mesh(&mut self, mesh: &geom::Mesh, world: gf::Matrix4d) -> Result<()> {
-        let Some(points) = mesh
-            .points_attr()
-            .get::<sdf::Value>()
+    fn primvar<T>(&self, api: &PrimvarsAPI, name: &str, decode: impl Fn(sdf::Value) -> Option<Vec<T>>) -> Option<Primvar<T>> {
+        let pv = api.primvar(name).ok()?;
+        let values = decode(pv.attribute().get_at::<sdf::Value>(self.time).ok()??)?;
+        let indices = pv.indices(self.time).ok().flatten().filter(|i| !i.is_empty());
+        let spread = pv
+            .interpolation()
             .ok()
-            .flatten()
-            .and_then(vec3s)
-        else {
-            return Ok(());
-        };
-        let counts = ints(
-            mesh.face_vertex_counts_attr()
-                .get::<sdf::Value>()
-                .ok()
-                .flatten(),
-        );
-        let corners = ints(
-            mesh.face_vertex_indices_attr()
-                .get::<sdf::Value>()
-                .ok()
-                .flatten(),
-        );
-        if points.is_empty() || counts.is_empty() {
-            return Ok(());
-        }
-        let points: Vec<[f32; 3]> = points
-            .into_iter()
-            .map(|p| {
-                let v = world.transform_point(gf::vec3f(p[0], p[1], p[2]));
-                [v.x, v.y, v.z]
-            })
-            .collect();
-        let normal_matrix = normal_matrix(&world);
-        let left_handed = matches!(mesh.orientation_attr().get::<sdf::Value>(), Ok(Some(v)) if v.as_str() == Some("leftHanded"));
-        let flip = left_handed != (det3(&world) < 0.0);
+            .map_or(Spread::Vertex, |i| Spread::of(Some(i.as_token())));
+        Some(Primvar {
+            values,
+            indices,
+            spread,
+        })
+    }
 
+    fn value(&self, attr: &usd::Attribute) -> Option<sdf::Value> {
+        attr.get_at::<sdf::Value>(self.time).ok().flatten()
+    }
+
+    /// A number attribute, double or float, or its fallback.
+    fn number(&self, attr: &usd::Attribute, fallback: f64) -> f32 {
+        (match self.value(attr) {
+            Some(sdf::Value::Double(v)) => v,
+            Some(sdf::Value::Float(v)) => f64::from(v),
+            Some(sdf::Value::Half(v)) => f64::from(v.to_f32()),
+            Some(sdf::Value::Int(v)) => f64::from(v),
+            _ => fallback,
+        }) as f32
+    }
+
+    fn token(&self, attr: &usd::Attribute) -> Option<String> {
+        attr.get_at::<tf::Token>(self.time).ok().flatten().map(|t| t.as_str().to_owned())
+    }
+
+    /// Visible, and drawn for rendering: guides and proxies stand in for the real thing.
+    fn shown(&self, prim: &usd::Prim) -> bool {
+        let img = geom::Imageable::from_prim_unchecked(prim.clone());
+        let visible = !matches!(img.compute_visibility(self.time), Ok(geom::Visibility::Invisible));
+        let purpose = img.compute_purpose().unwrap_or_default();
+        visible && !matches!(purpose, geom::Purpose::Guide | geom::Purpose::Proxy)
+    }
+
+    /// The prim's surface as polygons in its own space: a mesh's, or an implicit surface's tessellation.
+    fn shape(&self, prim: &usd::Prim) -> Option<Shape> {
+        let t = |attr: &usd::Attribute| self.token(attr);
+        match kind(prim)?.as_str() {
+            "Mesh" => self.mesh_shape(&geom::Mesh::from_prim_unchecked(prim.clone())),
+            "Cube" => {
+                let s = self.number(&geom::Cube::from_prim_unchecked(prim.clone()).size_attr(), 2.0);
+                Some(Tess::cube(s))
+            }
+            "Sphere" => {
+                let r = self.number(&geom::Sphere::from_prim_unchecked(prim.clone()).radius_attr(), 1.0);
+                Some(Tess::lathe(&Tess::sphere_rows(r, r, 0.0), None))
+            }
+            "Cylinder" | "Cylinder_1" => {
+                let c = geom::Cylinder::from_prim_unchecked(prim.clone());
+                let r = self.number(&c.radius_attr(), 1.0);
+                let h = self.number(&c.height_attr(), 2.0);
+                let (bottom, top) = if kind(prim)?.as_str() == "Cylinder_1" {
+                    (self.number(&prim.attribute("radiusBottom"), f64::from(r)), self.number(&prim.attribute("radiusTop"), f64::from(r)))
+                } else {
+                    (r, r)
+                };
+                Some(Tess::lathe(&Tess::frustum_rows(bottom, top, h), t(&c.axis_attr()).as_deref()))
+            }
+            "Cone" => {
+                let c = geom::Cone::from_prim_unchecked(prim.clone());
+                let r = self.number(&c.radius_attr(), 1.0);
+                let h = self.number(&c.height_attr(), 2.0);
+                Some(Tess::lathe(&Tess::frustum_rows(r, 0.0, h), t(&c.axis_attr()).as_deref()))
+            }
+            "Capsule" | "Capsule_1" => {
+                let c = geom::Capsule::from_prim_unchecked(prim.clone());
+                let r = self.number(&c.radius_attr(), 0.5);
+                let h = self.number(&c.height_attr(), 1.0);
+                let (bottom, top) = if kind(prim)?.as_str() == "Capsule_1" {
+                    (self.number(&prim.attribute("radiusBottom"), f64::from(r)), self.number(&prim.attribute("radiusTop"), f64::from(r)))
+                } else {
+                    (r, r)
+                };
+                let mut rows = Tess::sphere_rows(bottom, top, h);
+                rows.dedup_by(|a, b| a == b);
+                Some(Tess::lathe(&rows, t(&c.axis_attr()).as_deref()))
+            }
+            "Plane" => {
+                let p = geom::Plane::from_prim_unchecked(prim.clone());
+                let w = self.number(&p.width_attr(), 2.0);
+                let l = self.number(&p.length_attr(), 2.0);
+                Some(Tess::plane(w, l, t(&p.axis_attr()).as_deref()))
+            }
+            _ => None,
+        }
+    }
+
+    fn mesh_shape(&self, mesh: &geom::Mesh) -> Option<Shape> {
+        let points = vec3s(self.value(&mesh.points_attr())?)?;
+        let counts = ints(self.value(&mesh.face_vertex_counts_attr()));
+        let corners = ints(self.value(&mesh.face_vertex_indices_attr()));
+        if points.is_empty() || counts.is_empty() {
+            return None;
+        }
+        let holes = ints(self.value(&mesh.hole_indices_attr()));
+        let left_handed = self.token(&mesh.orientation_attr()).as_deref() == Some("leftHanded");
         let api = PrimvarsAPI::from_prim_unchecked(mesh.prim().clone());
-        let uvs = UV_NAMES.iter().find_map(|n| primvar(&api, n, vec2s));
-        let normals = primvar(&api, "normals", vec3s).or_else(|| {
+        let uvs = UV_NAMES.iter().find_map(|n| self.primvar(&api, n, vec2s));
+        let normals = self.primvar(&api, "normals", vec3s).or_else(|| {
             let attr = mesh.normals_attr();
-            let values = vec3s(attr.get::<sdf::Value>().ok()??)?;
-            let spread = attr
-                .get_metadata::<sdf::Value>("interpolation")
-                .ok()
-                .flatten();
+            let values = vec3s(self.value(&attr)?)?;
+            let spread = attr.get_metadata::<sdf::Value>("interpolation").ok().flatten();
             Some(Primvar {
                 values,
                 indices: None,
@@ -273,124 +300,204 @@ impl Builder<'_> {
             })
         });
         // No normals: a subdivision surface is smooth, a polygon mesh faceted.
-        let smooth = normals.is_none()
-            && !matches!(mesh.subdivision_scheme_attr().get::<sdf::Value>(), Ok(Some(v)) if v.as_str() == Some("none"));
-        let point_normals = if smooth {
-            let mut tris = Vec::new();
-            let mut c = 0;
-            for &n in &counts {
-                let n = usize::try_from(n).unwrap_or(0);
-                for i in 1..n.saturating_sub(1) {
-                    for k in [c, c + i, c + i + 1] {
-                        tris.push(
-                            corners
-                                .get(k)
-                                .and_then(|&p| u32::try_from(p).ok())
-                                .unwrap_or(0),
-                        );
-                    }
-                }
-                c += n;
+        let smooth = normals.is_none() && self.token(&mesh.subdivision_scheme_attr()).as_deref() != Some("none");
+        let mut hole = vec![false; counts.len()];
+        for h in holes {
+            if let Some(slot) = usize::try_from(h).ok().and_then(|h| hole.get_mut(h)) {
+                *slot = true;
             }
-            crate::mesh::smooth_normals(&points, &tris)
-        } else {
-            Vec::new()
-        };
-        let display = primvar(&api, "displayColor", vec3s);
+        }
+        Some(Shape {
+            points,
+            counts,
+            corners,
+            hole,
+            normals,
+            uvs,
+            left_handed,
+            smooth,
+        })
+    }
 
-        // Each face's material: a material-binding subset's, else the mesh's own.
-        let own = self.material_of(
-            mesh.prim(),
-            display.as_ref().and_then(|d| d.values.first().copied()),
-        );
+    /// A point instancer's prototypes, each placed at every instance that names it.
+    fn instancer(&mut self, prim: &usd::Prim, all: &[usd::Prim], xforms: &mut geom::XformCache) -> Result<()> {
+        let pi = geom::PointInstancer::from_prim_unchecked(prim.clone());
+        let protos = pi.prototypes_rel().targets().unwrap_or_default();
+        let which = ints(self.value(&pi.proto_indices_attr()));
+        let positions = self.value(&pi.positions_attr()).and_then(vec3s).unwrap_or_default();
+        let orients = self
+            .value(&prim.attribute("orientationsf"))
+            .or_else(|| self.value(&pi.orientations_attr()))
+            .and_then(quats)
+            .unwrap_or_default();
+        let scales = self.value(&prim.attribute("scales")).and_then(vec3s).unwrap_or_default();
+        let ids = int64s(self.value(&prim.attribute("ids")));
+        let hidden = int64s(self.value(&prim.attribute("invisibleIds")));
+        let world = xforms.local_to_world_transform(prim).unwrap_or_default();
+
+        // Each prototype's shown surfaces, placed relative to the prototype root's parent: the root's own
+        // transform applies, its parents' don't.
+        let mut parts: Vec<Vec<(usd::Prim, Shape, gf::Matrix4d)>> = Vec::new();
+        for root in &protos {
+            let base = match all.iter().find(|p| p.path() == root).and_then(usd::Prim::parent) {
+                Some(parent) => xforms.local_to_world_transform(&parent).unwrap_or_default(),
+                None => gf::Matrix4d::IDENTITY,
+            };
+            let inv = base.inverse().unwrap_or(gf::Matrix4d::IDENTITY);
+            let mut part = Vec::new();
+            for p in all.iter().filter(|p| within(p.path(), root)) {
+                if !self.shown(p) {
+                    continue;
+                }
+                if let Some(shape) = self.shape(p) {
+                    let m = xforms.local_to_world_transform(p).unwrap_or_default() * inv;
+                    part.push((p.clone(), shape, m));
+                }
+            }
+            parts.push(part);
+        }
+        for (i, &w) in which.iter().enumerate() {
+            let id = ids.get(i).copied().unwrap_or(i as i64);
+            if hidden.contains(&id) {
+                continue;
+            }
+            let Some(part) = usize::try_from(w).ok().and_then(|w| parts.get(w)) else {
+                continue;
+            };
+            let s = scales.get(i).copied().unwrap_or([1.0; 3]);
+            let q = orients.get(i).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
+            let t = positions.get(i).copied().unwrap_or_default();
+            let place = instance_matrix(s, q, t) * world;
+            for (p, shape, m) in part.clone() {
+                self.emit(&p, &shape, m * place)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds a surface's faces, placed by `world`.
+    fn emit(&mut self, prim: &usd::Prim, shape: &Shape, world: gf::Matrix4d) -> Result<()> {
+        let points: Vec<[f32; 3]> = shape
+            .points
+            .iter()
+            .map(|p| {
+                let v = world.transform_point(gf::vec3f(p[0], p[1], p[2]));
+                [v.x, v.y, v.z]
+            })
+            .collect();
+        let normal_matrix = normal_matrix(&world);
+        let flip = shape.left_handed != (det3(&world) < 0.0);
+        let (counts, corners) = (&shape.counts, &shape.corners);
+
+        // The faces to draw, by their first corner.
+        let mut faces = Vec::with_capacity(counts.len());
+        let mut start = 0usize;
+        for (face, &n) in counts.iter().enumerate() {
+            let n = usize::try_from(n).unwrap_or(0);
+            let end = start + n;
+            let ok = n >= 3
+                && end <= corners.len()
+                && !shape.hole.get(face).copied().unwrap_or(false)
+                && corners[start..end].iter().all(|&c| usize::try_from(c).is_ok_and(|c| c < points.len()));
+            if ok {
+                faces.push((face, start, n));
+            }
+            start = end;
+        }
+        let point_normals = if shape.smooth { smooth_normals(&points, corners, &faces, flip) } else { Vec::new() };
+
+        let api = PrimvarsAPI::from_prim_unchecked(prim.clone());
+        let display = self.primvar(&api, "displayColor", vec3s);
+        let opacity = self.primvar(&api, "displayOpacity", floats);
+        let binding = bound(prim);
+        // Display colors show only where no material is bound.
+        let vertex_colors = binding.is_none()
+            && (display.as_ref().is_some_and(|d| !d.constant()) || opacity.as_ref().is_some_and(|o| !o.constant()));
+        let own = match binding {
+            Some(path) => self.material(Some(path), GRAY),
+            None if vertex_colors => self.material(None, [1.0; 4]),
+            None => {
+                let [r, g, b] = display.as_ref().and_then(|d| d.values.first().copied()).unwrap_or([GRAY[0], GRAY[1], GRAY[2]]);
+                let a = opacity.as_ref().and_then(|o| o.values.first().copied()).unwrap_or(1.0);
+                self.material(None, [r, g, b, a.clamp(0.0, 1.0)])
+            }
+        };
+
+        // Each face's material: a material-binding subset's, else the surface's own.
         let mut face_material = vec![own; counts.len()];
-        if let Ok(children) = mesh.prim().children() {
+        if let Ok(children) = prim.children() {
             for child in children {
                 let Ok(Some(subset)) = geom::Subset::get(self.stage, child.path().clone()) else {
                     continue;
                 };
-                let family = subset.family_name_attr().get::<sdf::Value>().ok().flatten();
-                if family
-                    .as_ref()
-                    .and_then(sdf::Value::as_str)
-                    .is_some_and(|f| f != "materialBind")
-                {
+                let family = self.token(&subset.family_name_attr());
+                if family.as_deref().is_some_and(|f| f != "materialBind") {
                     continue;
                 }
-                let material = self.material_of(&child, None);
-                for i in ints(subset.indices_attr().get::<sdf::Value>().ok().flatten()) {
-                    if let Some(slot) = usize::try_from(i)
-                        .ok()
-                        .and_then(|i| face_material.get_mut(i))
-                    {
+                let material = match bound(&child) {
+                    Some(path) => self.material(Some(path), GRAY),
+                    None => own,
+                };
+                for i in ints(self.value(&subset.indices_attr())) {
+                    if let Some(slot) = usize::try_from(i).ok().and_then(|i| face_material.get_mut(i)) {
                         *slot = material;
                     }
                 }
             }
         }
 
-        let mut corner = 0;
-        for (face, &n) in counts.iter().enumerate() {
-            let n = usize::try_from(n).unwrap_or(0);
-            let start = corner;
-            corner += n;
-            if n < 3 || corner > corners.len() {
-                continue;
-            }
-            ensure!(
-                self.mesh.triangles() + n - 2 <= MAX_TRIANGLES,
-                "too many triangles to preview"
-            );
+        let mut tris = Vec::new();
+        let mut poly = Vec::new();
+        for &(face, start, n) in &faces {
+            ensure!(self.mesh.triangles() + n - 2 <= MAX_TRIANGLES, "too many triangles to preview");
+            poly.clear();
+            poly.extend(corners[start..start + n].iter().map(|&c| points[c as usize]));
+            let flat = (shape.normals.is_none() && !shape.smooth).then(|| polygon_normal(&poly, flip));
             let material = face_material[face];
             let prim = self.prim_for(material);
             let first = u32::try_from(prim.positions.len()).context("too many vertices")?;
-            let flat = if normals.is_none() && !smooth {
-                let p = |k: usize| {
-                    points
-                        .get(usize::try_from(corners[start + k]).unwrap_or(usize::MAX))
-                        .copied()
-                };
-                match (p(0), p(1), p(2)) {
-                    (Some(a), Some(b), Some(c)) => Some(face_normal(a, b, c, flip)),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            for (c, &raw) in corners.iter().enumerate().take(corner).skip(start) {
-                let point = usize::try_from(raw).unwrap_or(usize::MAX);
-                prim.positions
-                    .push(points.get(point).copied().unwrap_or_default());
-                let normal = match (&normals, flat) {
-                    (Some(nv), _) => nv
-                        .at(face, point, c)
-                        .map(|v| transform_normal(&normal_matrix, v, left_handed)),
+            let base = prim.positions.len();
+            if shape.uvs.is_some() || !prim.uvs.is_empty() {
+                prim.uvs.resize(base, [0.0, 0.0]);
+            }
+            if vertex_colors || !prim.colors.is_empty() {
+                prim.colors.resize(base, [1.0; 4]);
+            }
+            for (c, &corner) in corners.iter().enumerate().skip(start).take(n) {
+                let point = corner as usize;
+                prim.positions.push(points[point]);
+                let normal = match (&shape.normals, flat) {
+                    (Some(nv), _) => nv.at(face, point, c).map(|v| transform_normal(&normal_matrix, v)),
                     (None, Some(f)) => Some(f),
                     (None, None) => point_normals.get(point).copied(),
                 };
                 prim.normals.push(normal.unwrap_or([0.0, 1.0, 0.0]));
-                if let Some(uv) = &uvs {
+                if let Some(uv) = &shape.uvs {
                     let [u, v] = uv.at(face, point, c).unwrap_or_default();
                     prim.uvs.push([u, 1.0 - v]);
+                } else if !prim.uvs.is_empty() {
+                    prim.uvs.push([0.0, 0.0]);
+                }
+                if vertex_colors {
+                    let [r, g, b] = display.as_ref().and_then(|d| d.at(face, point, c)).unwrap_or([1.0; 3]);
+                    let a = opacity.as_ref().and_then(|o| o.at(face, point, c)).unwrap_or(1.0);
+                    prim.colors.push([r, g, b, a.clamp(0.0, 1.0)]);
+                } else if !prim.colors.is_empty() {
+                    prim.colors.push([1.0; 4]);
                 }
             }
-            if uvs.is_none() && !prim.uvs.is_empty() {
-                prim.uvs.resize(prim.positions.len(), [0.0, 0.0]);
-            }
-            for i in 1..u32::try_from(n - 1).unwrap_or(0) {
-                let tri = if flip {
-                    [first, first + i + 1, first + i]
-                } else {
-                    [first, first + i, first + i + 1]
-                };
-                prim.indices.extend(tri);
+            tris.clear();
+            triangulate(&poly, &mut tris);
+            for &[a, b, c] in &tris {
+                let tri = if flip { [a, c, b] } else { [a, b, c] };
+                prim.indices.extend(tri.map(|k| first + k));
             }
         }
         Ok(())
     }
 
-    /// The prim collecting a material's triangles. Its UVs stay empty until a mesh with UVs adds to it, then are
-    /// padded so every vertex has one.
+    /// The prim collecting a material's triangles. Its UVs and colors stay empty until a surface with them adds
+    /// to it, then are padded so every vertex has one.
     fn prim_for(&mut self, material: usize) -> &mut Prim {
         let next = self.mesh.prims.len();
         let i = *self.prims.entry(material).or_insert(next);
@@ -403,13 +510,8 @@ impl Builder<'_> {
         &mut self.mesh.prims[i]
     }
 
-    /// The material bound to `prim`, made once per material prim; with none bound, a plain one in the mesh's
-    /// display color (or gray).
-    fn material_of(&mut self, prim: &usd::Prim, display: Option<[f32; 3]>) -> usize {
-        let bound = MaterialBindingAPI::from_prim_unchecked(prim.clone())
-            .compute_bound_material("")
-            .ok()
-            .flatten();
+    /// The material at `bound`, made once per material prim; with none, a plain one in `display`.
+    fn material(&mut self, bound: Option<sdf::Path>, display: [f32; 4]) -> usize {
         let key = match &bound {
             Some(p) => p.as_str().to_owned(),
             None => format!("display:{display:?}"),
@@ -419,7 +521,7 @@ impl Builder<'_> {
         }
         let material = match bound {
             Some(path) => self.preview_surface(&path),
-            None => Material::plain("default", display.map_or(GRAY, |[r, g, b]| [r, g, b, 1.0])),
+            None => Material::plain("default", display),
         };
         let i = self.mesh.materials.len();
         self.mesh.materials.push(material);
@@ -428,16 +530,11 @@ impl Builder<'_> {
     }
 
     fn preview_surface(&mut self, path: &sdf::Path) -> Material {
-        let name = path
-            .as_str()
-            .rsplit('/')
-            .next()
-            .unwrap_or("material")
-            .to_owned();
+        let name = path.as_str().rsplit('/').next().unwrap_or("material").to_owned();
         let Ok(Some(ps)) = shade::read_preview_surface(self.stage, path) else {
             return Material::plain(&name, GRAY);
         };
-        // UsdPreviewSurface colors are linear, as glTF's are.
+        // UsdPreviewSurface colors are linear, as glTF's are. Unauthored inputs take the shader's fallbacks.
         let mut color = match ps.diffuse_color.value() {
             Some(c) => [c.x, c.y, c.z, 1.0],
             None if ps.diffuse_color.texture().is_some() => [1.0; 4],
@@ -446,16 +543,320 @@ impl Builder<'_> {
         if let Some(&o) = ps.opacity.value() {
             color[3] = o.clamp(0.0, 1.0);
         }
+        let specular_workflow = self
+            .stage
+            .prim(ps.shader.as_str())
+            .ok()
+            .and_then(|s| match self.value(&s.attribute("inputs:useSpecularWorkflow")) {
+                Some(sdf::Value::Int(v)) => Some(v != 0),
+                _ => None,
+            })
+            .unwrap_or(false);
+        let metallic = if specular_workflow { 0.0 } else { ps.metallic.value().copied().unwrap_or(0.0) };
+        let emissive = ps.emissive_color.value().map_or([0.0; 3], |c| [c.x, c.y, c.z]);
         let color_image = ps.diffuse_color.texture().and_then(|t| self.image(t));
         let normal_image = ps.normal.texture().and_then(|t| self.image(t));
         Material {
-            name,
-            color,
             color_image,
             normal_image,
+            emissive,
+            metallic: metallic.clamp(0.0, 1.0),
+            roughness: ps.roughness.value().copied().unwrap_or(0.5).clamp(0.0, 1.0),
+            ..Material::plain(&name, color)
+        }
+    }
+}
+
+/// A surface as polygons in its prim's space, with what it carries per point or corner.
+#[derive(Clone)]
+struct Shape {
+    points: Vec<[f32; 3]>,
+    counts: Vec<i32>,
+    corners: Vec<i32>,
+    /// Faces `holeIndices` leaves out.
+    hole: Vec<bool>,
+    normals: Option<Primvar<[f32; 3]>>,
+    uvs: Option<Primvar<[f32; 2]>>,
+    /// Faces wound clockwise.
+    left_handed: bool,
+    /// Smoothed when it has no normals: a subdivision surface.
+    smooth: bool,
+}
+
+/// How finely the implicit surfaces are tessellated: around their axis, and from pole to pole. Multiples of four
+/// and two, so the tessellation reaches the surface's extent on every axis.
+const AROUND: usize = 32;
+const STACKS: usize = 16;
+
+/// A tessellation of an implicit surface, built around Z and then turned to the surface's axis.
+#[derive(Default)]
+struct Tess {
+    points: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    counts: Vec<i32>,
+    corners: Vec<i32>,
+}
+
+impl Tess {
+    fn face(&mut self, corners: &[([f32; 3], [f32; 3])]) {
+        self.counts.push(corners.len() as i32);
+        for &(p, n) in corners {
+            self.corners.push(self.points.len() as i32);
+            self.points.push(p);
+            self.normals.push(n);
         }
     }
 
+    /// The shape, its Z axis turned to `axis` (a cyclic swap, which keeps the winding).
+    fn finish(self, axis: Option<&str>) -> Shape {
+        let turn = |v: [f32; 3]| match axis {
+            Some("X") => [v[2], v[0], v[1]],
+            Some("Y") => [v[1], v[2], v[0]],
+            _ => v,
+        };
+        Shape {
+            points: self.points.into_iter().map(turn).collect(),
+            counts: self.counts,
+            corners: self.corners,
+            hole: Vec::new(),
+            normals: Some(Primvar {
+                values: self.normals.into_iter().map(turn).collect(),
+                indices: None,
+                spread: Spread::FaceVarying,
+            }),
+            uvs: None,
+            left_handed: false,
+            smooth: false,
+        }
+    }
+
+    /// A cube of edge `size` about the origin.
+    fn cube(size: f32) -> Shape {
+        let h = size / 2.0;
+        let mut t = Self::default();
+        for k in 0..3 {
+            let (u, v) = ((k + 1) % 3, (k + 2) % 3);
+            for s in [1.0f32, -1.0] {
+                let mut quad: Vec<([f32; 3], [f32; 3])> = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+                    .iter()
+                    .map(|&(a, b)| {
+                        let mut p = [0.0; 3];
+                        let mut n = [0.0; 3];
+                        p[k] = s * h;
+                        p[u] = a * h;
+                        p[v] = b * h;
+                        n[k] = s;
+                        (p, n)
+                    })
+                    .collect();
+                if s < 0.0 {
+                    quad.reverse();
+                }
+                t.face(&quad);
+            }
+        }
+        t.finish(None)
+    }
+
+    /// A plane facing `axis`: `width` along X (Z when facing X), `length` along Y (Z when facing Y).
+    fn plane(width: f32, length: f32, axis: Option<&str>) -> Shape {
+        let (w, l) = (width / 2.0, length / 2.0);
+        let (corners, n): ([[f32; 3]; 4], [f32; 3]) = match axis {
+            Some("X") => ([[0.0, -l, -w], [0.0, l, -w], [0.0, l, w], [0.0, -l, w]], [1.0, 0.0, 0.0]),
+            Some("Y") => ([[-w, 0.0, -l], [-w, 0.0, l], [w, 0.0, l], [w, 0.0, -l]], [0.0, 1.0, 0.0]),
+            _ => ([[-w, -l, 0.0], [w, -l, 0.0], [w, l, 0.0], [-w, l, 0.0]], [0.0, 0.0, 1.0]),
+        };
+        let mut t = Self::default();
+        t.face(&corners.map(|p| (p, n)));
+        t.finish(None)
+    }
+
+    /// Rows of a sphere (`h` 0) or capsule from bottom to top: radius, height, and the normal's radial and axial
+    /// parts. The bottom half has radius `bottom` about -h/2, the top half `top` about h/2.
+    fn sphere_rows(bottom: f32, top: f32, h: f32) -> Vec<[f32; 4]> {
+        let mut rows = Vec::new();
+        let half = STACKS / 2;
+        for k in 0..=STACKS {
+            let (s, c) = match k {
+                0 => (-1.0, 0.0),
+                k if k == STACKS => (1.0, 0.0),
+                k => (std::f32::consts::PI * (k as f32 - half as f32) / STACKS as f32).sin_cos(),
+            };
+            if k <= half {
+                rows.push([bottom * c, -h / 2.0 + bottom * s, c, s]);
+            }
+            if k >= half {
+                rows.push([top * c, h / 2.0 + top * s, c, s]);
+            }
+        }
+        rows
+    }
+
+    /// Rows of a capped cylinder, cone (`top` 0) or frustum of height `h`.
+    fn frustum_rows(bottom: f32, top: f32, h: f32) -> Vec<[f32; 4]> {
+        let len = (h * h + (bottom - top) * (bottom - top)).sqrt().max(f32::MIN_POSITIVE);
+        let (nr, nz) = (h / len, (bottom - top) / len);
+        vec![
+            [0.0, -h / 2.0, 0.0, -1.0],
+            [bottom, -h / 2.0, 0.0, -1.0],
+            [bottom, -h / 2.0, nr, nz],
+            [top, h / 2.0, nr, nz],
+            [top, h / 2.0, 0.0, 1.0],
+            [0.0, h / 2.0, 0.0, 1.0],
+        ]
+    }
+
+    /// A surface of revolution about Z through `rows`, turned to `axis`.
+    fn lathe(rows: &[[f32; 4]], axis: Option<&str>) -> Shape {
+        let ring = |row: [f32; 4], j: usize| {
+            let (s, c) = (std::f32::consts::TAU * (j % AROUND) as f32 / AROUND as f32).sin_cos();
+            ([row[0] * c, row[0] * s, row[1]], [row[2] * c, row[2] * s, row[3]])
+        };
+        let mut t = Self::default();
+        for pair in rows.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            if (a[0] == b[0] && a[1] == b[1]) || (a[0] == 0.0 && b[0] == 0.0) {
+                continue;
+            }
+            for i in 0..AROUND {
+                if a[0] == 0.0 {
+                    t.face(&[ring(a, i), ring(b, i + 1), ring(b, i)]);
+                } else if b[0] == 0.0 {
+                    t.face(&[ring(a, i), ring(a, i + 1), ring(b, i)]);
+                } else {
+                    t.face(&[ring(a, i), ring(a, i + 1), ring(b, i + 1), ring(b, i)]);
+                }
+            }
+        }
+        t.finish(axis)
+    }
+}
+
+/// The material bound to `prim` (directly or through a parent), if any.
+fn bound(prim: &usd::Prim) -> Option<sdf::Path> {
+    MaterialBindingAPI::from_prim_unchecked(prim.clone())
+        .compute_bound_material("")
+        .ok()
+        .flatten()
+}
+
+/// A point instancer's placement of one instance: scale, then orientation (w, x, y, z), then translation, as
+/// row vectors compose.
+fn instance_matrix(s: [f32; 3], q: [f32; 4], t: [f32; 3]) -> gf::Matrix4d {
+    let len = q.iter().map(|c| f64::from(*c).powi(2)).sum::<f64>().sqrt();
+    let [w, x, y, z] = if len > 0.0 { q.map(|c| f64::from(c) / len) } else { [1.0, 0.0, 0.0, 0.0] };
+    // The rotation for column vectors; row vectors take its transpose.
+    let r = [
+        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z), 2.0 * (x * z + w * y)],
+        [2.0 * (x * y + w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - w * x)],
+        [2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y)],
+    ];
+    let mut m = gf::Matrix4d::IDENTITY;
+    for row in 0..3 {
+        for col in 0..3 {
+            m.0[row * 4 + col] = f64::from(s[row]) * r[col][row];
+        }
+        m.0[12 + row] = f64::from(t[row]);
+    }
+    m
+}
+
+/// Smooth normals as Hydra makes them: each face corner adds the cross product of its two edges to its point.
+fn smooth_normals(points: &[[f32; 3]], corners: &[i32], faces: &[(usize, usize, usize)], flip: bool) -> Vec<[f32; 3]> {
+    let mut acc = vec![[0f64; 3]; points.len()];
+    for &(_, start, n) in faces {
+        let ix = &corners[start..start + n];
+        for k in 0..n {
+            let (p, c, nx) = (ix[(k + n - 1) % n] as usize, ix[k] as usize, ix[(k + 1) % n] as usize);
+            let at = |i: usize| points[i].map(f64::from);
+            let (a, b, o) = (at(nx), at(p), at(c));
+            let (u, v) = ([a[0] - o[0], a[1] - o[1], a[2] - o[2]], [b[0] - o[0], b[1] - o[1], b[2] - o[2]]);
+            let x = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+            for (s, d) in acc[c].iter_mut().zip(x) {
+                *s += d;
+            }
+        }
+    }
+    acc.into_iter().map(|n| unit(n, flip)).collect()
+}
+
+/// A polygon's normal (Newell's), unit length.
+fn polygon_normal(poly: &[[f32; 3]], flip: bool) -> [f32; 3] {
+    let mut n = [0f64; 3];
+    for (i, a) in poly.iter().enumerate() {
+        let (a, b) = (a.map(f64::from), poly[(i + 1) % poly.len()].map(f64::from));
+        n[0] += (a[1] - b[1]) * (a[2] + b[2]);
+        n[1] += (a[2] - b[2]) * (a[0] + b[0]);
+        n[2] += (a[0] - b[0]) * (a[1] + b[1]);
+    }
+    unit(n, flip)
+}
+
+fn unit(n: [f64; 3], flip: bool) -> [f32; 3] {
+    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    let s = if flip { -1.0 } else { 1.0 };
+    if len > 0.0 { n.map(|x| (s * x / len) as f32) } else { [0.0, 1.0, 0.0] }
+}
+
+fn vec3s(v: sdf::Value) -> Option<Vec<[f32; 3]>> {
+    Some(match v {
+        sdf::Value::Vec3fVec(v) => v.into_iter().map(|p| [p.x, p.y, p.z]).collect(),
+        sdf::Value::Vec3dVec(v) => v.into_iter().map(|p| [p.x as f32, p.y as f32, p.z as f32]).collect(),
+        sdf::Value::Vec3hVec(v) => v.into_iter().map(|p| [p.x.to_f32(), p.y.to_f32(), p.z.to_f32()]).collect(),
+        sdf::Value::Vec3f(p) => vec![[p.x, p.y, p.z]],
+        sdf::Value::Vec3d(p) => vec![[p.x as f32, p.y as f32, p.z as f32]],
+        _ => return None,
+    })
+}
+
+fn vec2s(v: sdf::Value) -> Option<Vec<[f32; 2]>> {
+    Some(match v {
+        sdf::Value::Vec2fVec(v) => v.into_iter().map(|p| [p.x, p.y]).collect(),
+        sdf::Value::Vec2dVec(v) => v.into_iter().map(|p| [p.x as f32, p.y as f32]).collect(),
+        sdf::Value::Vec2hVec(v) => v.into_iter().map(|p| [p.x.to_f32(), p.y.to_f32()]).collect(),
+        _ => return None,
+    })
+}
+
+fn floats(v: sdf::Value) -> Option<Vec<f32>> {
+    Some(match v {
+        sdf::Value::FloatVec(v) => v,
+        sdf::Value::DoubleVec(v) => v.into_iter().map(|x| x as f32).collect(),
+        sdf::Value::HalfVec(v) => v.into_iter().map(|x| x.to_f32()).collect(),
+        sdf::Value::Float(x) => vec![x],
+        sdf::Value::Double(x) => vec![x as f32],
+        _ => return None,
+    })
+}
+
+/// Quaternions as (w, x, y, z).
+fn quats(v: sdf::Value) -> Option<Vec<[f32; 4]>> {
+    Some(match v {
+        sdf::Value::QuathVec(v) => v.into_iter().map(|q| [q.w.to_f32(), q.x.to_f32(), q.y.to_f32(), q.z.to_f32()]).collect(),
+        sdf::Value::QuatfVec(v) => v.into_iter().map(|q| [q.w, q.x, q.y, q.z]).collect(),
+        _ => return None,
+    })
+}
+
+fn ints(v: Option<sdf::Value>) -> Vec<i32> {
+    match v {
+        Some(sdf::Value::IntVec(v)) => v,
+        _ => Vec::new(),
+    }
+}
+
+fn int64s(v: Option<sdf::Value>) -> Vec<i64> {
+    match v {
+        Some(sdf::Value::Int64Vec(v)) => v,
+        Some(sdf::Value::IntVec(v)) => v.into_iter().map(i64::from).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Names texture coordinates go by: USD's own `st`, then what exporters write.
+const UV_NAMES: &[&str] = &["st", "st0", "st_0", "UVMap", "uv", "uv0", "map1", "UVChannel_1"];
+
+impl Builder<'_> {
     /// A texture by its asset path: inside the `.usdz`, beside the file, or anywhere in the pack by name.
     fn image(&mut self, asset: &str) -> Option<usize> {
         if let Some(&i) = self.images.get(asset) {
@@ -544,37 +945,12 @@ fn normal_matrix(m: &gf::Matrix4d) -> [[f64; 3]; 3] {
     out
 }
 
-/// A normal through the cofactor matrix (row vector times matrix, as USD composes), unit length.
-fn transform_normal(m: &[[f64; 3]; 3], n: [f32; 3], left_handed: bool) -> [f32; 3] {
+/// A normal through the cofactor matrix (row vector times matrix, as USD composes), unit length. Authored normals
+/// are taken as they are, whatever the winding.
+fn transform_normal(m: &[[f64; 3]; 3], n: [f32; 3]) -> [f32; 3] {
     let n = n.map(f64::from);
-    let s = if left_handed { -1.0 } else { 1.0 };
-    let v: [f64; 3] =
-        std::array::from_fn(|c| s * (n[0] * m[0][c] + n[1] * m[1][c] + n[2] * m[2][c]));
-    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    if len > 0.0 {
-        v.map(|x| (x / len) as f32)
-    } else {
-        [0.0, 1.0, 0.0]
-    }
-}
-
-fn face_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3], flip: bool) -> [f32; 3] {
-    let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-    let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-    let mut n = [
-        u[1] * v[2] - u[2] * v[1],
-        u[2] * v[0] - u[0] * v[2],
-        u[0] * v[1] - u[1] * v[0],
-    ];
-    if flip {
-        n = n.map(|x| -x);
-    }
-    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-    if len > 0.0 {
-        n.map(|x| x / len)
-    } else {
-        [0.0, 1.0, 0.0]
-    }
+    let v: [f64; 3] = std::array::from_fn(|c| n[0] * m[0][c] + n[1] * m[1][c] + n[2] * m[2][c]);
+    unit(v, false)
 }
 
 #[cfg(test)]

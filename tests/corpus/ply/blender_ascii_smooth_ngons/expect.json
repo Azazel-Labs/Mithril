@@ -1,0 +1,17 @@
+{
+  "spec": "PLY as Blender's exporter writes it: ascii, smooth normals, n-gon caps",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.wm.ply_export), tools/corpus/blender_export.py",
+  "triangles": 1012,
+  "bounds": {
+    "min": [
+      -1.3672,
+      -1.0,
+      -1.0
+    ],
+    "max": [
+      4.0,
+      1.0,
+      1.0
+    ]
+  }
+}

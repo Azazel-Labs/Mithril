@@ -1,0 +1,13 @@
+#usda 1.0
+(
+    upAxis = "Y"
+    metersPerUnit = 1.0
+)
+
+def Xform "Root"
+{
+    def Cube "Box"
+    {
+        double size = 3
+    }
+}

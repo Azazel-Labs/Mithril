@@ -1,6 +1,10 @@
-//! Binary FBX (7.x) to a `meshes::Mesh`: geometry with normals and UVs, materials with their diffuse color and
-//! textures (embedded or found in the pack), node transforms through the hierarchy, and the file's axis system and
+//! Binary FBX (7.x) to a `meshes::Mesh`: geometry with normals, UVs and vertex colors, materials with their diffuse,
+//! emissive and shininess and their textures (embedded or found in the pack), node transforms through the hierarchy
+//! (pivots, offsets, pre- and post-rotation, rotation order, geometric transforms), and the file's axis system and
 //! unit converted to glTF's Y-up meters. Skinning and animation aren't carried over: the result is the bind pose.
+//!
+//! Colors are sRGB, as the FBX SDK's tools write them, except that Blender writes material colors linear; vertex
+//! colors are sRGB from every tool, Blender included (its exporter's default).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -10,7 +14,7 @@ use fbxcel::low::v7400::AttributeValue as A;
 use fbxcel::tree::v7400::NodeHandle;
 
 use crate::assets::Assets;
-use crate::mesh::{GRAY, Image, Material, Mesh, Prim, smooth_normals};
+use crate::mesh::{GRAY, Image, Material, Mesh, Prim, smooth_normals, srgb_to_linear, triangulate};
 
 const MAX_TRIANGLES: usize = 4_000_000;
 
@@ -82,6 +86,23 @@ fn rotate(deg: [f64; 3], order: i32) -> M4 {
 
 fn apply(m: &M4, p: [f64; 3]) -> [f64; 3] {
     [0, 1, 2].map(|i| m[i][0] * p[0] + m[i][1] * p[1] + m[i][2] * p[2] + m[i][3])
+}
+
+/// The matrix that carries normals through `m`: the inverse transpose of its 3x3 part (cofactors over the
+/// determinant, whose sign keeps a mirrored normal pointing out).
+fn normal_matrix(m: &M4) -> M4 {
+    let d = det3(m);
+    let mut n = IDENTITY;
+    if d.abs() < 1e-300 {
+        return n;
+    }
+    for (i, row) in n.iter_mut().enumerate().take(3) {
+        for (j, v) in row.iter_mut().enumerate().take(3) {
+            let (i1, i2, j1, j2) = ((i + 1) % 3, (i + 2) % 3, (j + 1) % 3, (j + 2) % 3);
+            *v = (m[i1][j1] * m[i2][j2] - m[i1][j2] * m[i2][j1]) / d;
+        }
+    }
+    n
 }
 
 fn apply_dir(m: &M4, d: [f64; 3]) -> [f64; 3] {
@@ -228,6 +249,16 @@ pub(crate) fn load(path: &Path, assets: &dyn Assets) -> Result<Mesh> {
     let mut data = std::fs::read(path)?;
     if super::fbx_ascii::is_ascii(&data) {
         data = super::fbx_ascii::to_binary(&data).context("couldn't read this ASCII FBX file")?;
+    } else if data.starts_with(b"Kaydara FBX Binary")
+        && let Some(v) = data.get(23..27)
+    {
+        let v = u32::from_le_bytes(v.try_into().unwrap_or_default());
+        ensure!(
+            v >= 7000,
+            "this is FBX {}.{}, older than FBX 7, which this reader and Blender cannot read",
+            v / 1000,
+            v % 1000 / 100
+        );
     }
     let fbxcel::tree::any::AnyTree::V7400(_, tree, _) =
         fbxcel::tree::any::AnyTree::from_seekable_reader(std::io::Cursor::new(data))
@@ -236,6 +267,13 @@ pub(crate) fn load(path: &Path, assets: &dyn Assets) -> Result<Mesh> {
         bail!("unsupported FBX version")
     };
     let rootnode = tree.root();
+    let creator = |n: Option<NodeHandle<'_>>| {
+        n.and_then(|n| n.first_child_by_name("Creator"))
+            .and_then(|c| c.attributes().first().and_then(string).map(str::to_owned))
+            .unwrap_or_default()
+    };
+    let linear = creator(Some(rootnode)).contains("Blender")
+        || creator(rootnode.first_child_by_name("FBXHeaderExtension")).contains("Blender");
     let objects_node = rootnode
         .first_child_by_name("Objects")
         .context("FBX has no Objects")?;
@@ -367,8 +405,15 @@ pub(crate) fn load(path: &Path, assets: &dyn Assets) -> Result<Mesh> {
                 let idx = if let Some(&i) = material_index.get(mid) {
                     i
                 } else {
-                    let mat =
-                        read_material(*mid, &objs, dir, assets, &mut mesh.images, &mut image_index);
+                    let mat = read_material(
+                        *mid,
+                        &objs,
+                        linear,
+                        dir,
+                        assets,
+                        &mut mesh.images,
+                        &mut image_index,
+                    );
                     mesh.materials.push(mat);
                     material_index.insert(*mid, mesh.materials.len() - 1);
                     mesh.materials.len() - 1
@@ -427,16 +472,24 @@ fn world_of(id: i64, objs: &Objects<'_>, cache: &mut HashMap<i64, M4>) -> M4 {
         }
         t
     };
-    let local = mul(
-        &translate(vec3(&p, "Lcl Translation", [0.0; 3])),
-        &mul(
-            &r_pre,
-            &mul(
-                &rotate(vec3(&p, "Lcl Rotation", [0.0; 3]), order),
-                &mul(&r_post_inv, &scale(vec3(&p, "Lcl Scaling", [1.0; 3]))),
-            ),
-        ),
-    );
+    // T * Roff * Rp * Rpre * R * Rpost^-1 * Rp^-1 * Soff * Sp * S * Sp^-1, the FBX SDK's order.
+    let rp = vec3(&p, "RotationPivot", [0.0; 3]);
+    let sp = vec3(&p, "ScalingPivot", [0.0; 3]);
+    let local = [
+        translate(vec3(&p, "Lcl Translation", [0.0; 3])),
+        translate(vec3(&p, "RotationOffset", [0.0; 3])),
+        translate(rp),
+        r_pre,
+        rotate(vec3(&p, "Lcl Rotation", [0.0; 3]), order),
+        r_post_inv,
+        translate(rp.map(|c| -c)),
+        translate(vec3(&p, "ScalingOffset", [0.0; 3])),
+        translate(sp),
+        scale(vec3(&p, "Lcl Scaling", [1.0; 3])),
+        translate(sp.map(|c| -c)),
+    ]
+    .iter()
+    .fold(IDENTITY, |acc, m| mul(&acc, m));
     let parent = objs
         .parents
         .get(&id)
@@ -461,6 +514,7 @@ fn world_of(id: i64, objs: &Objects<'_>, cache: &mut HashMap<i64, M4>) -> M4 {
 fn read_material(
     id: i64,
     objs: &Objects<'_>,
+    linear: bool,
     dir: &Path,
     assets: &dyn Assets,
     images: &mut Vec<Image>,
@@ -477,21 +531,30 @@ fn read_material(
         .next()
         .unwrap_or("material")
         .to_owned();
-    let d = vec3(&p, "DiffuseColor", vec3(&p, "Diffuse", [0.8, 0.8, 0.8]));
+    let to_linear = |c: [f64; 3]| {
+        c.map(|v| {
+            let v = v.clamp(0.0, 1.0) as f32;
+            if linear { v } else { srgb_to_linear(v) }
+        })
+    };
+    let d = to_linear(vec3(&p, "DiffuseColor", vec3(&p, "Diffuse", [0.8, 0.8, 0.8])));
     let alpha = scalar(&p, "Opacity").unwrap_or_else(|| {
         1.0 - scalar(&p, "TransparencyFactor")
             .unwrap_or(0.0)
             .clamp(0.0, 1.0)
     });
-    let mut mat = Material::plain(
-        &name,
-        [
-            d[0] as f32,
-            d[1] as f32,
-            d[2] as f32,
-            alpha.clamp(0.0, 1.0) as f32,
-        ],
-    );
+    let mut mat = Material::plain(&name, [d[0], d[1], d[2], alpha.clamp(0.0, 1.0) as f32]);
+    // The emissive color is a color (sRGB unless Blender's); its factor is a linear intensity.
+    let factor = scalar(&p, "EmissiveFactor").unwrap_or(1.0).max(0.0) as f32;
+    mat.emissive = to_linear(vec3(&p, "EmissiveColor", vec3(&p, "Emissive", [0.0; 3]))).map(|c| c * factor);
+    // A Phong exponent as roughness the way Blender's importer maps it (and its exporter inverts): 1 - sqrt(n) / 10.
+    if let Some(n) = scalar(&p, "Shininess").or_else(|| scalar(&p, "ShininessExponent")) {
+        mat.roughness = (1.0 - n.clamp(0.0, 100.0).sqrt() / 10.0) as f32;
+    }
+    // Blender keeps its metallic in ReflectionFactor; other tools' reflectivity is a mirror blend, not metal.
+    if linear && let Some(m) = scalar(&p, "ReflectionFactor") {
+        mat.metallic = m.clamp(0.0, 1.0) as f32;
+    }
     for (tex, prop) in objs.children.get(&id).cloned().unwrap_or_default() {
         let slot = prop.to_lowercase();
         let is_color =
@@ -547,8 +610,8 @@ fn texture_image(id: i64, objs: &Objects<'_>, dir: &Path, assets: &dyn Assets) -
         .and_then(|p| assets.load_image(&p))
 }
 
-/// Vertices already emitted for a primitive, by (control point, normal index, uv index).
-type Seen = HashMap<(usize, usize, usize), u32>;
+/// Vertices already emitted for a primitive, by (control point, normal index, uv index, color index).
+type Seen = HashMap<(usize, usize, usize, usize), u32>;
 
 /// Append one geometry's triangles, transformed by `m`, split by material.
 fn add_geometry(geom: NodeHandle<'_>, m: &M4, materials: &[usize], mesh: &mut Mesh) -> Result<()> {
@@ -558,6 +621,10 @@ fn add_geometry(geom: NodeHandle<'_>, m: &M4, materials: &[usize], mesh: &mut Me
         .context("bad polygons")?;
     let normals = Layer::read(geom, "LayerElementNormal", "Normals", "NormalsIndex", 3);
     let uvs = Layer::read(geom, "LayerElementUV", "UV", "UVIndex", 2);
+    let colors = Layer::read(geom, "LayerElementColor", "Colors", "ColorIndex", 4);
+    let nm = normal_matrix(m);
+    let mut tris = Vec::new();
+    let mut corner_pos = Vec::new();
     let mat_layer = geom
         .children_by_name("LayerElementMaterial")
         .next()
@@ -594,9 +661,15 @@ fn add_geometry(geom: NodeHandle<'_>, m: &M4, materials: &[usize], mesh: &mut Me
                 )
             })
             .collect();
+        poly_start = k + 1;
+        poly += 1;
+        // A polygon naming a control point that isn't there, or too few to make a triangle, is left out.
+        if corners.len() < 3 || corners.iter().any(|&(_, cp)| cp >= verts.len() / 3) {
+            continue;
+        }
         let slot = mat_layer
             .as_ref()
-            .and_then(|l| l.get(k, 0, poly))
+            .and_then(|l| l.get(k, 0, poly - 1))
             .map_or(0, |(_, v)| v[0] as usize);
         let material = materials.get(slot).copied().unwrap_or(usize::MAX);
         let (prim, seen) = prims.entry(material).or_insert_with(|| {
@@ -609,41 +682,46 @@ fn add_geometry(geom: NodeHandle<'_>, m: &M4, materials: &[usize], mesh: &mut Me
             )
         });
         let mut ids = Vec::with_capacity(corners.len());
+        corner_pos.clear();
         for &(pv, cp) in &corners {
-            let Some(pos) = verts.get(cp * 3..cp * 3 + 3) else {
-                bail!("polygon points past the vertex list")
-            };
-            let n = normals.as_ref().and_then(|l| l.get(pv, cp, poly));
-            let t = uvs.as_ref().and_then(|l| l.get(pv, cp, poly));
+            let pos = &verts[cp * 3..cp * 3 + 3];
+            corner_pos.push([pos[0] as f32, pos[1] as f32, pos[2] as f32]);
+            let n = normals.as_ref().and_then(|l| l.get(pv, cp, poly - 1));
+            let t = uvs.as_ref().and_then(|l| l.get(pv, cp, poly - 1));
+            let c = colors.as_ref().and_then(|l| l.get(pv, cp, poly - 1));
             let key = (
                 cp,
                 n.map_or(usize::MAX, |x| x.0),
                 t.map_or(usize::MAX, |x| x.0),
+                c.map_or(usize::MAX, |x| x.0),
             );
             let id = *seen.entry(key).or_insert_with(|| {
                 let p = apply(m, [pos[0], pos[1], pos[2]]);
                 prim.positions.push(p.map(|c| c as f32));
                 if let Some((_, nv)) = n {
                     prim.normals
-                        .push(apply_dir(m, [nv[0], nv[1], nv[2]]).map(|c| c as f32));
+                        .push(apply_dir(&nm, [nv[0], nv[1], nv[2]]).map(|c| c as f32));
                 }
                 if let Some((_, tv)) = t {
                     // FBX's texture origin is bottom-left, glTF's top-left.
                     prim.uvs.push([tv[0] as f32, 1.0 - tv[1] as f32]);
                 }
+                if let Some((_, cv)) = c {
+                    let [r, g, b, a] = [cv[0], cv[1], cv[2], cv[3]].map(|v| v.clamp(0.0, 1.0) as f32);
+                    prim.colors
+                        .push([srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), a]);
+                }
                 u32::try_from(prim.positions.len() - 1).unwrap_or(u32::MAX)
             });
             ids.push(id);
         }
-        for i in 1..ids.len().saturating_sub(1) {
-            if flip {
-                prim.indices.extend([ids[0], ids[i + 1], ids[i]]);
-            } else {
-                prim.indices.extend([ids[0], ids[i], ids[i + 1]]);
-            }
+        tris.clear();
+        triangulate(&corner_pos, &mut tris);
+        for &[a, b, c] in &tris {
+            let [a, b, c] = [a, b, c].map(|i| ids[i as usize]);
+            prim.indices
+                .extend(if flip { [a, c, b] } else { [a, b, c] });
         }
-        poly_start = k + 1;
-        poly += 1;
     }
     let mut keys: Vec<usize> = prims.keys().copied().collect();
     keys.sort_unstable();
@@ -657,6 +735,9 @@ fn add_geometry(geom: NodeHandle<'_>, m: &M4, materials: &[usize], mesh: &mut Me
         }
         if prim.uvs.len() != prim.positions.len() {
             prim.uvs.clear();
+        }
+        if prim.colors.len() != prim.positions.len() {
+            prim.colors.clear();
         }
         mesh.prims.push(prim);
     }

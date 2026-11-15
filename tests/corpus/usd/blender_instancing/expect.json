@@ -1,0 +1,20 @@
+{
+  "spec": "OpenUSD as Blender's exporter writes it: linked duplicates written as instances",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.wm.usd_export), tools/corpus/blender_export.py",
+  "triangles": 36,
+  "bounds": {
+    "min": [
+      -1.0,
+      -1.0,
+      -1.0
+    ],
+    "max": [
+      7.0,
+      1.0,
+      1.0
+    ]
+  },
+  "area": 72.0,
+  "faces_outward": false,
+  "winding_matches_normals": true
+}

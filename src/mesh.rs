@@ -16,18 +16,27 @@ pub struct Prim {
     pub normals: Vec<[f32; 3]>,
     /// Texture coordinates, glTF convention (origin top-left); empty when the model has none.
     pub uvs: Vec<[f32; 2]>,
+    /// Vertex colors, linear RGBA; empty when the model has none.
+    pub colors: Vec<[f32; 4]>,
     pub indices: Vec<u32>,
     pub material: usize,
 }
 
-/// A material: a base color, optionally textured, and an optional normal map.
+/// A material: a base color, optionally textured, an optional normal map, and the metallic-roughness scalars.
 #[derive(Debug, Clone)]
 pub struct Material {
     pub name: String,
+    /// Linear RGBA.
     pub color: [f32; 4],
     /// Index into `Mesh::images`.
     pub color_image: Option<usize>,
     pub normal_image: Option<usize>,
+    /// Linear RGB light given off.
+    pub emissive: [f32; 3],
+    pub metallic: f32,
+    pub roughness: f32,
+    /// Seen from both sides rather than culled from behind.
+    pub double_sided: bool,
 }
 
 impl Material {
@@ -38,6 +47,10 @@ impl Material {
             color,
             color_image: None,
             normal_image: None,
+            emissive: [0.0; 3],
+            metallic: 0.0,
+            roughness: 0.85,
+            double_sided: false,
         }
     }
 }
@@ -140,7 +153,7 @@ pub(crate) fn gray_soup(tris: &[[[f32; 3]; 3]]) -> Mesh {
     single(soup(tris))
 }
 
-fn face_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
+pub(crate) fn face_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
     let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
     let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
     let n = [
@@ -251,6 +264,12 @@ pub fn to_glb(mesh: &Mesh) -> Result<Vec<u8>> {
             accessors.push(json!({ "bufferView": uv, "componentType": 5126, "count": p.uvs.len(), "type": "VEC2" }));
             attributes["TEXCOORD_0"] = json!(accessors.len() - 1);
         }
+        if p.colors.len() == p.positions.len() {
+            let clamped: Vec<f32> = p.colors.as_flattened().iter().map(|c| c.clamp(0.0, 1.0)).collect();
+            let cv = push_view(&mut bin, &f32s(&clamped), Some(34962));
+            accessors.push(json!({ "bufferView": cv, "componentType": 5126, "count": p.colors.len(), "type": "VEC4" }));
+            attributes["COLOR_0"] = json!(accessors.len() - 1);
+        }
         primitives.push(json!({ "attributes": attributes, "indices": a + 2, "material": p.material.min(mesh.materials.len().saturating_sub(1)) }));
     }
     ensure!(!primitives.is_empty(), "nothing to draw");
@@ -263,7 +282,12 @@ pub fn to_glb(mesh: &Mesh) -> Result<Vec<u8>> {
         .materials
         .iter()
         .map(|m| {
-            let mut pbr = json!({ "baseColorFactor": m.color, "metallicFactor": 0.0, "roughnessFactor": 0.85 });
+            let color = m.color.map(|c| c.clamp(0.0, 1.0));
+            let mut pbr = json!({
+                "baseColorFactor": color,
+                "metallicFactor": m.metallic.clamp(0.0, 1.0),
+                "roughnessFactor": m.roughness.clamp(0.0, 1.0),
+            });
             if let Some(i) = m.color_image.filter(|&i| i < images.len()) {
                 pbr["baseColorTexture"] = json!({ "index": i });
             }
@@ -273,6 +297,12 @@ pub fn to_glb(mesh: &Mesh) -> Result<Vec<u8>> {
             }
             if m.color[3] < 1.0 {
                 mat["alphaMode"] = json!("BLEND");
+            }
+            if m.emissive.iter().any(|&e| e > 0.0) {
+                mat["emissiveFactor"] = json!(m.emissive.map(|e| e.clamp(0.0, 1.0)));
+            }
+            if m.double_sided {
+                mat["doubleSided"] = json!(true);
             }
             mat
         })
@@ -314,3 +344,160 @@ pub fn to_glb(mesh: &Mesh) -> Result<Vec<u8>> {
     out.extend(bin);
     Ok(out)
 }
+
+/// Triangulates one polygon face, its corners in order, appending triangles as indices into
+/// `corners` that keep the polygon's winding. Convex polygons (nearly every face) are fanned;
+/// concave ones are ear-clipped in the polygon's plane, so no triangle falls outside the
+/// outline.
+// Shared by the format readers; which ones use it depends on the enabled features.
+#[allow(dead_code)]
+pub(crate) fn triangulate(corners: &[[f32; 3]], out: &mut Vec<[u32; 3]>) {
+    let n = corners.len();
+    let fan = |out: &mut Vec<[u32; 3]>, idx: &[u32]| {
+        for k in 1..idx.len().saturating_sub(1) {
+            out.push([idx[0], idx[k], idx[k + 1]]);
+        }
+    };
+    if n < 3 {
+        return;
+    }
+    if n == 3 {
+        out.push([0, 1, 2]);
+        return;
+    }
+    // The plane's normal (Newell), then 2D coordinates along its two other axes.
+    let mut nrm = [0f64; 3];
+    for (i, a) in corners.iter().enumerate() {
+        let b = corners[(i + 1) % n];
+        let (a, b) = (a.map(f64::from), b.map(f64::from));
+        nrm[0] += (a[1] - b[1]) * (a[2] + b[2]);
+        nrm[1] += (a[2] - b[2]) * (a[0] + b[0]);
+        nrm[2] += (a[0] - b[0]) * (a[1] + b[1]);
+    }
+    let axis = (0..3)
+        .max_by(|&i, &j| nrm[i].abs().total_cmp(&nrm[j].abs()))
+        .unwrap_or(2);
+    let all: Vec<u32> = (0..n as u32).collect();
+    if nrm[axis] == 0.0 || n > 4096 {
+        fan(out, &all);
+        return;
+    }
+    // Project so the polygon winds counter-clockwise in 2D.
+    let (u, v) = match axis {
+        0 => (1, 2),
+        1 => (2, 0),
+        _ => (0, 1),
+    };
+    let flip = nrm[axis] < 0.0;
+    let p: Vec<[f64; 2]> = corners
+        .iter()
+        .map(|c| {
+            let (x, y) = (f64::from(c[u]), f64::from(c[v]));
+            if flip { [y, x] } else { [x, y] }
+        })
+        .collect();
+    let cross = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
+        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    };
+    if (0..n).all(|i| cross(p[i], p[(i + 1) % n], p[(i + 2) % n]) >= 0.0) {
+        fan(out, &all);
+        return;
+    }
+    // Ear clipping: cut off a convex corner whose triangle holds no other corner.
+    let mut idx = all;
+    while idx.len() > 3 {
+        let m = idx.len();
+        let ear = (0..m).find(|&i| {
+            let (a, b, c) = (idx[(i + m - 1) % m], idx[i], idx[(i + 1) % m]);
+            let (pa, pb, pc) = (p[a as usize], p[b as usize], p[c as usize]);
+            if cross(pa, pb, pc) <= 0.0 {
+                return false;
+            }
+            !idx.iter().any(|&q| {
+                if q == a || q == b || q == c {
+                    return false;
+                }
+                let pq = p[q as usize];
+                cross(pa, pb, pq) >= 0.0 && cross(pb, pc, pq) >= 0.0 && cross(pc, pa, pq) >= 0.0
+            })
+        });
+        let Some(i) = ear else {
+            // Self-intersecting or degenerate: nothing better to do than fan what's left.
+            break;
+        };
+        out.push([idx[(i + m - 1) % m], idx[i], idx[(i + 1) % m]]);
+        idx.remove(i);
+    }
+    fan(out, &idx);
+}
+
+#[cfg(test)]
+mod triangulate_tests {
+    use super::triangulate;
+
+    fn area(c: &[[f32; 3]], t: &[[u32; 3]]) -> f32 {
+        t.iter()
+            .map(|t| {
+                let [a, b, c] = t.map(|i| c[i as usize]);
+                ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])) / 2.0
+            })
+            .sum()
+    }
+
+    #[test]
+    fn concave_and_convex() {
+        let ell = [[2., 1., 0.], [1., 1., 0.], [1., 2., 0.], [0., 2., 0.], [0., 0., 0.], [2., 0., 0.]];
+        let mut t = Vec::new();
+        triangulate(&ell, &mut t);
+        assert_eq!(t.len(), 4);
+        // Signed: every triangle counter-clockwise like the polygon, and they tile it exactly.
+        assert!(t.iter().all(|t| area(&ell, &[*t]) > 0.0));
+        assert_eq!(area(&ell, &t), 3.0);
+        // Clockwise (seen from +z) stays clockwise.
+        let rev: Vec<[f32; 3]> = ell.iter().rev().copied().collect();
+        t.clear();
+        triangulate(&rev, &mut t);
+        assert_eq!(area(&rev, &t), -3.0);
+        let quad = [[0., 0., 0.], [1., 0., 0.], [1., 1., 0.], [0., 1., 0.]];
+        t.clear();
+        triangulate(&quad, &mut t);
+        assert_eq!(t, [[0, 1, 2], [0, 2, 3]]);
+    }
+}
+
+/// A multiply-rotate hasher (the Fx hash) for small integer keys: much faster than the
+/// default SipHash, and keys here come from the file being read, not from an attacker who can
+/// see the hash.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct FxHasher(u64);
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut b = [0u8; 8];
+            b[..chunk.len()].copy_from_slice(chunk);
+            self.write_u64(u64::from_le_bytes(b));
+        }
+    }
+    #[inline]
+    fn write_u32(&mut self, n: u32) {
+        self.write_u64(n as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+    #[inline]
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// A `HashMap` with [`FxHasher`].
+pub(crate) type FastMap<K, V> =
+    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<FxHasher>>;

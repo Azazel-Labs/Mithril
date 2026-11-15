@@ -1,7 +1,8 @@
 //! Autodesk 3DS, read here rather than by Blender, whose 3DS importer has been an extension (not shipped) since 4.2.
 //! A 3DS file is nested chunks (`u16` id, `u32` length counting its 6-byte header). The meshes are under the editor
-//! chunk, their vertices already in world space; materials have a diffuse color, a transparency and maybe a texture
-//! named by file. Smoothing groups decide which faces share normals. 3DS is Z up; glTF is Y up.
+//! chunk, their vertices already in world space (the mesh matrix only records how they got there); materials have a
+//! diffuse color, a transparency and maybe a texture named by file. Smoothing groups are bit masks: faces sharing a bit
+//! share normals at their common corners. 3DS is Z up; glTF is Y up.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -9,9 +10,11 @@ use std::path::Path;
 use crate::Result;
 
 use crate::assets::Assets;
-use crate::mesh::{GRAY, Image, MAX_TRIANGLES, Material, Mesh, Prim};
+use crate::mesh::{FastMap, GRAY, Image, MAX_TRIANGLES, Material, Mesh, Prim, face_normal};
 
 const MAIN: u16 = 0x4D4D;
+/// A 3D Studio project file, which holds the same editor chunk.
+const PROJECT: u16 = 0xC23D;
 const EDITOR: u16 = 0x3D3D;
 const OBJECT: u16 = 0x4000;
 const TRIMESH: u16 = 0x4100;
@@ -23,7 +26,10 @@ const SMOOTHING: u16 = 0x4150;
 const MATERIAL: u16 = 0xAFFF;
 const MAT_NAME: u16 = 0xA000;
 const MAT_DIFFUSE: u16 = 0xA020;
+const MAT_SHININESS: u16 = 0xA040;
 const MAT_TRANSPARENCY: u16 = 0xA050;
+const MAT_TWO_SIDE: u16 = 0xA081;
+const MAT_SELF_ILPCT: u16 = 0xA084;
 const MAT_TEXTURE: u16 = 0xA200;
 const MAP_FILE: u16 = 0xA300;
 const COLOR_F32: u16 = 0x0010;
@@ -33,14 +39,16 @@ const COLOR_F32_GAMMA: u16 = 0x0013;
 const PERCENT_U16: u16 = 0x0030;
 const PERCENT_F32: u16 = 0x0031;
 
-/// The chunks in `data`, as (id, body). Stops at one that runs past the end.
+/// The chunks in `data`, as (id, body). A chunk claiming more than is left (a wrong length, a cut-off file) gets
+/// what is left; the readers below take only whole records from it.
 fn chunks(mut data: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
     std::iter::from_fn(move || {
         let id = u16::from_le_bytes(data.get(..2)?.try_into().ok()?);
         let len = u32::from_le_bytes(data.get(2..6)?.try_into().ok()?) as usize;
-        if len < 6 || len > data.len() {
+        if len < 6 {
             return None;
         }
+        let len = len.min(data.len());
         let body = &data[6..len];
         data = &data[len..];
         Some((id, body))
@@ -64,23 +72,28 @@ fn cstr(d: &[u8]) -> (String, &[u8]) {
     )
 }
 
-/// A color chunk's value as linear RGB.
+/// A color chunk's value as linear RGB. Every form holds the color picker's values, which are sRGB. 3D Studio R3
+/// added "linear" twins (0x0012, 0x0013) that 3ds Max writes beside the plain ones, normally equal; the plain one is
+/// the color shown, so it wins.
 fn color(d: &[u8]) -> Option<[f32; 3]> {
-    let mut best = None;
+    let mut best: Option<(u8, [f32; 3])> = None;
     for (id, b) in chunks(d) {
-        let c = match id {
-            COLOR_U8 | COLOR_U8_GAMMA if b.len() >= 3 => {
-                [b[0], b[1], b[2]].map(|v| crate::mesh::srgb_to_linear(f32::from(v) / 255.0))
-            }
-            COLOR_F32 | COLOR_F32_GAMMA => [f32_at(b, 0)?, f32_at(b, 4)?, f32_at(b, 8)?],
+        let (rank, c) = match id {
+            COLOR_U8 | COLOR_U8_GAMMA if b.len() >= 3 => (
+                u8::from(id != COLOR_U8) * 2,
+                [b[0], b[1], b[2]].map(|v| f32::from(v) / 255.0),
+            ),
+            COLOR_F32 | COLOR_F32_GAMMA => (
+                1 + u8::from(id != COLOR_F32) * 2,
+                [f32_at(b, 0)?, f32_at(b, 4)?, f32_at(b, 8)?],
+            ),
             _ => continue,
         };
-        // The plain 8-bit color is what most tools mean; take it over the others.
-        if id == COLOR_U8 || best.is_none() {
-            best = Some(c);
+        if best.is_none_or(|(r, _)| rank < r) {
+            best = Some((rank, c));
         }
     }
-    best
+    best.map(|(_, c)| c.map(|v| crate::mesh::srgb_to_linear(v.clamp(0.0, 1.0))))
 }
 
 fn percent(d: &[u8]) -> Option<f32> {
@@ -96,6 +109,9 @@ struct Mat {
     color: [f32; 3],
     alpha: f32,
     texture: Option<String>,
+    glossiness: Option<f32>,
+    self_illum: f32,
+    two_sided: bool,
 }
 
 fn material(d: &[u8]) -> Mat {
@@ -104,12 +120,18 @@ fn material(d: &[u8]) -> Mat {
         color: [GRAY[0], GRAY[1], GRAY[2]],
         alpha: 1.0,
         texture: None,
+        glossiness: None,
+        self_illum: 0.0,
+        two_sided: false,
     };
     for (id, b) in chunks(d) {
         match id {
             MAT_NAME => m.name = cstr(b).0,
             MAT_DIFFUSE => m.color = color(b).unwrap_or(m.color),
             MAT_TRANSPARENCY => m.alpha = 1.0 - percent(b).unwrap_or(0.0).clamp(0.0, 1.0),
+            MAT_SHININESS => m.glossiness = percent(b).map(|p| p.clamp(0.0, 1.0)),
+            MAT_SELF_ILPCT => m.self_illum = percent(b).unwrap_or(0.0).clamp(0.0, 1.0),
+            MAT_TWO_SIDE => m.two_sided = true,
             MAT_TEXTURE => {
                 m.texture = chunks(b)
                     .find(|&(id, _)| id == MAP_FILE)
@@ -196,7 +218,10 @@ fn y_up(p: [f32; 3]) -> [f32; 3] {
 
 pub(crate) fn load(path: &Path, assets: &dyn Assets) -> Result<Mesh> {
     let data = std::fs::read(path)?;
-    let main = chunks(&data).find(|&(id, _)| id == MAIN).map(|(_, b)| b);
+    let main = chunks(&data)
+        .next()
+        .filter(|&(id, _)| id == MAIN || id == PROJECT)
+        .map(|(_, b)| b);
     let Some(main) = main else {
         bail!("not a 3DS file")
     };
@@ -219,10 +244,14 @@ pub(crate) fn load(path: &Path, assets: &dyn Assets) -> Result<Mesh> {
         });
         // A texture shows as painted, not tinted by the color under it.
         let rgb = if image.is_some() { [1.0; 3] } else { m.color };
+        let plain = Material::plain(&m.name, [rgb[0], rgb[1], rgb[2], m.alpha]);
         by_name.insert(m.name.clone(), mesh.materials.len());
         mesh.materials.push(Material {
             color_image: image,
-            ..Material::plain(&m.name, [rgb[0], rgb[1], rgb[2], m.alpha])
+            emissive: m.color.map(|c| c * m.self_illum),
+            roughness: m.glossiness.map_or(plain.roughness, |g| 1.0 - g),
+            double_sided: m.two_sided,
+            ..plain
         });
     }
 
@@ -260,8 +289,9 @@ pub(crate) fn load(path: &Path, assets: &dyn Assets) -> Result<Mesh> {
     Ok(mesh)
 }
 
-/// A trimesh's faces, into the prims of their materials. Face corners share a vertex when they share a position
-/// and a smoothing group; a face in no group gets its own, so it shows flat.
+/// A trimesh's faces, into the prims of their materials. A corner's normal averages the faces around its vertex that
+/// share a smoothing bit with its own face, each weighed by its angle there (so the triangulation doesn't matter); a
+/// face in no group is flat. Corners share a vertex when material, position and normal agree.
 fn add_faces(
     t: &Trimesh,
     face_mat: &[Option<usize>],
@@ -269,28 +299,66 @@ fn add_faces(
     materials: &mut Vec<Material>,
 ) {
     let pos: Vec<[f32; 3]> = t.vertices.iter().map(|&p| y_up(p)).collect();
-    let has_uvs = t.uvs.len() == t.vertices.len() && !t.uvs.is_empty();
-    // (prim material, vertex, smoothing group or a face of its own) → index in the prim.
-    let mut seen: HashMap<(usize, u16, u64), u32> = HashMap::new();
-    let mut sums: HashMap<(usize, u32), [f32; 3]> = HashMap::new();
+    let has_uvs = !t.uvs.is_empty() && t.uvs.len() >= t.vertices.len();
+    let n = pos.len();
+    let whole = |f: &[u16; 3]| f.iter().all(|&i| usize::from(i) < n);
+    let group = |f: usize| t.smoothing.get(f).copied().unwrap_or(0);
+
+    // Each face's unit normal and its angle at each corner.
+    let mut unit = vec![[0.0f32; 3]; t.faces.len()];
+    let mut angle = vec![[0.0f32; 3]; t.faces.len()];
     for (f, face) in t.faces.iter().enumerate() {
-        let Some(corners) = face
-            .iter()
-            .map(|&i| pos.get(i as usize).copied())
-            .collect::<Option<Vec<_>>>()
-        else {
+        if !whole(face) {
             continue;
-        };
-        let (a, b, c) = (corners[0], corners[1], corners[2]);
-        let (u, v) = (
-            [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
-            [c[0] - a[0], c[1] - a[1], c[2] - a[2]],
-        );
-        let n = [
-            u[1] * v[2] - u[2] * v[1],
-            u[2] * v[0] - u[0] * v[2],
-            u[0] * v[1] - u[1] * v[0],
-        ];
+        }
+        let p = face.map(|i| pos[usize::from(i)]);
+        let len = |v: [f32; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        let fnrm = face_normal(p[0], p[1], p[2]);
+        if len(fnrm) > 0.0 {
+            unit[f] = fnrm.map(|c| c / len(fnrm));
+        }
+        for k in 0..3 {
+            let (a, b, c) = (p[k], p[(k + 1) % 3], p[(k + 2) % 3]);
+            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let dot = u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+            angle[f][k] = len(face_normal(a, b, c)).atan2(dot);
+        }
+    }
+
+    // The faces around each vertex, as (face, corner), in compressed rows; only built when some face is smoothed.
+    let smoothed = t
+        .faces
+        .iter()
+        .enumerate()
+        .any(|(f, face)| whole(face) && group(f) != 0);
+    let mut start = vec![0u32; n + 1];
+    let mut around: Vec<(u32, u8)> = Vec::new();
+    if smoothed {
+        for face in t.faces.iter().filter(|f| whole(f)) {
+            for &i in face {
+                start[usize::from(i) + 1] += 1;
+            }
+        }
+        for i in 0..n {
+            start[i + 1] += start[i];
+        }
+        let mut fill = start.clone();
+        around = vec![(0, 0); start[n] as usize];
+        for (f, face) in t.faces.iter().enumerate().filter(|(_, f)| whole(f)) {
+            for (k, &i) in face.iter().enumerate() {
+                let slot = &mut fill[usize::from(i)];
+                around[*slot as usize] = (f as u32, k as u8);
+                *slot += 1;
+            }
+        }
+    }
+
+    let mut seen: FastMap<(usize, u16, [u32; 3]), u32> = FastMap::default();
+    for (f, face) in t.faces.iter().enumerate() {
+        if !whole(face) {
+            continue;
+        }
         let mat = face_mat[f].unwrap_or_else(|| {
             if materials.last().is_none_or(|m| m.name != "default") {
                 materials.push(Material::plain("default", GRAY));
@@ -301,34 +369,43 @@ fn add_faces(
             material: mat,
             ..Prim::default()
         });
-        let group = match t.smoothing.get(f) {
-            Some(&g) if g != 0 => u64::from(g),
-            _ => (1 << 32) | f as u64,
-        };
+        let g = group(f);
         for &vi in face {
-            let idx = *seen.entry((mat, vi, group)).or_insert_with(|| {
-                prim.positions.push(pos[vi as usize]);
-                if has_uvs {
-                    let [s, tv] = t.uvs[vi as usize];
-                    prim.uvs.push([s, 1.0 - tv]);
+            let mut nrm = unit[f];
+            if g != 0 {
+                let v = usize::from(vi);
+                let mut sum = [0.0f32; 3];
+                for &(o, k) in &around[start[v] as usize..start[v + 1] as usize] {
+                    let o = o as usize;
+                    if o == f || group(o) & g != 0 {
+                        let w = angle[o][usize::from(k)];
+                        for c in 0..3 {
+                            sum[c] += unit[o][c] * w;
+                        }
+                    }
                 }
-                (prim.positions.len() - 1) as u32
-            });
-            let sum = sums.entry((mat, idx)).or_insert([0.0; 3]);
-            for k in 0..3 {
-                sum[k] += n[k];
+                let len = (sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]).sqrt();
+                if len > 0.0 {
+                    nrm = sum.map(|c| c / len);
+                }
             }
+            if nrm == [0.0; 3] {
+                nrm = [0.0, 1.0, 0.0];
+            }
+            // -0.0 + 0.0 is 0.0: one key for both zeros.
+            let nrm = nrm.map(|c| c + 0.0);
+            let idx = *seen
+                .entry((mat, vi, nrm.map(f32::to_bits)))
+                .or_insert_with(|| {
+                    prim.positions.push(pos[usize::from(vi)]);
+                    prim.normals.push(nrm);
+                    if has_uvs {
+                        let [s, tv] = t.uvs[usize::from(vi)];
+                        prim.uvs.push([s, 1.0 - tv]);
+                    }
+                    (prim.positions.len() - 1) as u32
+                });
             prim.indices.push(idx);
-        }
-    }
-    for ((mat, idx), n) in sums {
-        let prim = prims.get_mut(&mat).expect("prim made above");
-        if prim.normals.len() < prim.positions.len() {
-            prim.normals.resize(prim.positions.len(), [0.0, 1.0, 0.0]);
-        }
-        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-        if len > 0.0 {
-            prim.normals[idx as usize] = [n[0] / len, n[1] / len, n[2] / len];
         }
     }
 }

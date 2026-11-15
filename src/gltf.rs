@@ -966,13 +966,7 @@ mod tests {
 
     /// A grid with normals, UVs and a (fake) PNG texture, as a GLB.
     fn grid_glb(n: u32) -> Vec<u8> {
-        let mut prim = Prim {
-            positions: Vec::new(),
-            normals: Vec::new(),
-            uvs: Vec::new(),
-            indices: Vec::new(),
-            material: 0,
-        };
+        let mut prim = Prim::default();
         for y in 0..=n {
             for x in 0..=n {
                 let (u, v) = (x as f32 / n as f32, y as f32 / n as f32);

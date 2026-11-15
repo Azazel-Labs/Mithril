@@ -1,0 +1,26 @@
+{
+  "spec": "Wavefront OBJ + MTL as Blender's exporter writes them: one concave 10-sided polygon",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.wm.obj_export), tools/corpus/blender_export.py",
+  "triangles": 8,
+  "bounds": {
+    "min": [
+      -0.9511,
+      0.0,
+      -1.0
+    ],
+    "max": [
+      0.9511,
+      0.0,
+      0.809
+    ]
+  },
+  "area": 1.1756,
+  "normals_in": [
+    [
+      0,
+      1,
+      0
+    ]
+  ],
+  "winding_matches_normals": true
+}

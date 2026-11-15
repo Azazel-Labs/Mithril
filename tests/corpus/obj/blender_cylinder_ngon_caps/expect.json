@@ -1,0 +1,19 @@
+{
+  "spec": "Wavefront OBJ + MTL as Blender's exporter writes them: 32-sided n-gon caps",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.wm.obj_export), tools/corpus/blender_export.py",
+  "triangles": 124,
+  "bounds": {
+    "min": [
+      -1.0,
+      -1.0,
+      -1.0
+    ],
+    "max": [
+      1.0,
+      1.0,
+      1.0
+    ]
+  },
+  "area": 18.7891,
+  "winding_matches_normals": true
+}

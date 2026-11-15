@@ -1,7 +1,8 @@
 //! 3MF, the 3D-printing format: a zip of XML models. Read here: meshes, components (in the same model or another
-//! part of the zip) and the build's placed items; the colors of the 3MF materials extension (base materials and
-//! color groups); and what slicers keep beside them: the filaments' colors, which filament each object and part
-//! prints in (Bambu Studio, `OrcaSlicer`, `PrusaSlicer`), and the filaments painted onto triangles.
+//! part of the zip) and the build's placed items, in the model's unit (scaled to glTF's metres); the 3MF materials
+//! extension's base materials, color groups (per triangle or blended across one) and 2D textures; and what slicers
+//! keep beside them: the filaments' colors, which filament each object and part prints in (Bambu Studio,
+//! `OrcaSlicer`, `PrusaSlicer`), and the filaments painted onto triangles.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -13,7 +14,7 @@ use quick_xml::events::{BytesStart, Event};
 use serde_json::{Map, Value, json};
 use zip::ZipArchive;
 
-use crate::mesh::{MAX_TRIANGLES, Mesh};
+use crate::mesh::{GRAY, Image, MAX_TRIANGLES, Material, Mesh, Prim, face_normal, srgb_to_linear};
 
 /// A 3MF transform: the first three columns of a 4x4 matrix, row by row (points are row vectors).
 type Mat = [f32; 12];
@@ -36,7 +37,10 @@ const FALLBACK: [[u8; 3]; 6] = [
 struct Tri {
     v: [u32; 3],
     pid: Option<u32>,
+    /// The property of each corner in the group (p2 and p3 default to p1).
     p1: Option<u32>,
+    p2: Option<u32>,
+    p3: Option<u32>,
     /// The filament painted on it (0: none, the part's own).
     paint: u8,
 }
@@ -56,14 +60,44 @@ struct Object {
     components: Vec<Component>,
 }
 
+/// A property group of the materials extension.
+enum Group {
+    /// Base materials or a color group: each entry's color (sRGB, with alpha).
+    Colors(Vec<Option<[u8; 4]>>),
+    /// A 2D texture's coordinates (origin bottom-left).
+    Coords { texture: u32, uvs: Vec<[f32; 2]> },
+}
+
+/// A build item: an object (in another model file, by the production extension) placed by a transform.
+struct Item {
+    path: Option<String>,
+    id: u32,
+    transform: Mat,
+}
+
 /// One model file of the zip.
 #[derive(Default)]
 struct Part {
     objects: HashMap<u32, Object>,
-    /// Base materials and color groups by resource id: each entry's color (sRGB).
-    colors: HashMap<u32, Vec<Option<[u8; 3]>>>,
-    build: Vec<(u32, Mat)>,
+    groups: HashMap<u32, Group>,
+    /// 2D textures by resource id: the zip part holding the image.
+    textures: HashMap<u32, String>,
+    build: Vec<Item>,
     application: Option<String>,
+    unit: Option<String>,
+}
+
+/// Metres per unit, for the units the core specification allows (millimetres when unsaid).
+fn metres(unit: Option<&str>) -> Option<f32> {
+    Some(match unit.unwrap_or("millimeter") {
+        "micron" => 1e-6,
+        "millimeter" => 1e-3,
+        "centimeter" => 1e-2,
+        "inch" => 0.0254,
+        "foot" => 0.3048,
+        "meter" => 1.0,
+        _ => return None,
+    })
 }
 
 /// What a slicer project says about filaments: their colors, and which one each object, part (Bambu Studio,
@@ -121,47 +155,108 @@ pub(crate) fn load(path: &Path) -> Result<(Option<Mesh>, Map<String, Value>)> {
                     .map(norm),
             );
         }
+        todo.extend(part.build.iter().filter_map(|i| i.path.as_deref()).map(norm));
         parts.insert(key, part);
     }
     let slicer = read_slicer(&mut zip, &names);
     let main = &parts[&root];
     ensure!(!main.build.is_empty(), "this 3MF builds nothing");
+    let unit = main.unit.clone().unwrap_or_else(|| "millimeter".to_owned());
+    let Some(scale) = metres(Some(&unit)) else {
+        bail!("unknown 3MF unit {unit:?}")
+    };
 
     let mut out = Emit {
         parts: &parts,
         slicer: &slicer,
-        tris: Vec::new(),
-        colors: Vec::new(),
+        scale,
+        looks: HashMap::new(),
+        prims: Vec::new(),
+        textures: Vec::new(),
+        triangles: 0,
+        distinct: HashSet::new(),
     };
-    for (id, m) in &main.build {
-        out.emit(&root, *id, m, *id, slicer.objects.get(id).copied(), 0)?;
+    for item in &main.build {
+        let key = item.path.as_deref().map_or_else(|| root.clone(), norm);
+        let filament = slicer.objects.get(&item.id).copied();
+        out.emit(&key, item.id, &item.transform, item.id, filament, 0)?;
     }
-    ensure!(!out.tris.is_empty(), "this 3MF has no triangles");
+    ensure!(out.triangles > 0, "this 3MF has no triangles");
 
     let mut facts = Map::new();
-    facts.insert("triangles".into(), json!(out.tris.len()));
+    facts.insert("triangles".into(), json!(out.triangles));
     facts.insert("objects".into(), json!(main.build.len()));
-    let distinct: HashSet<[u8; 3]> = out.colors.iter().flatten().copied().collect();
-    if distinct.len() > 1 {
-        facts.insert("colors".into(), json!(distinct.len()));
+    facts.insert("unit".into(), json!(unit));
+    if out.distinct.len() > 1 {
+        facts.insert("colors".into(), json!(out.distinct.len()));
     }
     if let Some(app) = main.application.as_ref().filter(|a| !a.is_empty()) {
         facts.insert("application".into(), json!(app));
     }
-    let mesh = if out.colors.iter().all(Option::is_none) {
-        crate::mesh::gray_soup(&out.tris)
-    } else {
-        crate::mesh::colored_soup(&out.tris, &out.colors)
-    };
+
+    let mut mesh = Mesh::default();
+    let mut images: HashMap<usize, Option<usize>> = HashMap::new();
+    for (look, mut prim) in out.prims {
+        prim.material = mesh.materials.len();
+        let lin = |c: [u8; 4]| {
+            let [r, g, b] = [c[0], c[1], c[2]].map(|v| srgb_to_linear(f32::from(v) / 255.0));
+            [r, g, b, f32::from(c[3]) / 255.0]
+        };
+        let material = match look {
+            Look::Plain => Material::plain("default", GRAY),
+            Look::Color(c) => Material::plain(&format!("color_{}", prim.material), lin(c)),
+            Look::Vertex => Material::plain("vertex_colors", [1.0; 4]),
+            Look::Texture(t) => {
+                let image = *images.entry(t).or_insert_with(|| {
+                    let real = names.get(&out.textures[t])?;
+                    let mut bytes = Vec::new();
+                    zip.by_name(real)
+                        .ok()?
+                        .take(MAX_PART)
+                        .read_to_end(&mut bytes)
+                        .ok()?;
+                    mesh.images.push(Image::png_or_jpeg(&bytes)?);
+                    Some(mesh.images.len() - 1)
+                });
+                match image {
+                    Some(i) => Material {
+                        color_image: Some(i),
+                        ..Material::plain(&format!("texture_{t}"), [1.0; 4])
+                    },
+                    None => Material::plain(&format!("texture_{t}"), GRAY),
+                }
+            }
+        };
+        mesh.materials.push(material);
+        mesh.prims.push(prim);
+    }
     Ok((Some(mesh), facts))
 }
 
-/// The build's objects as placed triangles, each with its color.
+/// How a triangle looks, which decides its primitive.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Look {
+    Plain,
+    Color([u8; 4]),
+    /// Colors blended across it from its corners.
+    Vertex,
+    /// Textured: an index into `Emit::textures`.
+    Texture(usize),
+}
+
+/// The build's objects as placed triangles, gathered into a primitive per look.
 struct Emit<'a> {
     parts: &'a HashMap<String, Part>,
     slicer: &'a Slicer,
-    tris: Vec<[[f32; 3]; 3]>,
-    colors: Vec<Option<[u8; 3]>>,
+    /// Metres per model unit.
+    scale: f32,
+    looks: HashMap<Look, usize>,
+    prims: Vec<(Look, Prim)>,
+    /// The zip parts of the textures used.
+    textures: Vec<String>,
+    triangles: usize,
+    /// The colors shown, for the facts.
+    distinct: HashSet<[u8; 3]>,
 }
 impl Emit<'_> {
     /// Object `id` of model `key` placed by `m`, inside the build item for object `item` (the one slicers' settings
@@ -176,7 +271,8 @@ impl Emit<'_> {
         depth: u32,
     ) -> Result<()> {
         ensure!(depth < 16, "this 3MF's components nest too deep");
-        let Some(part) = self.parts.get(key) else {
+        let parts = self.parts;
+        let Some(part) = parts.get(key) else {
             return Ok(());
         };
         let Some(o) = part.objects.get(&id) else {
@@ -193,9 +289,10 @@ impl Emit<'_> {
             None
         };
         let mirrored = det(m) < 0.0;
+        let s = self.scale;
         for (i, t) in o.tris.iter().enumerate() {
             ensure!(
-                self.tris.len() < MAX_TRIANGLES,
+                self.triangles < MAX_TRIANGLES,
                 "too many triangles to preview"
             );
             let [Some(a), Some(b), Some(c)] = t.v.map(|k| o.verts.get(k as usize)) else {
@@ -204,10 +301,8 @@ impl Emit<'_> {
             // 3MF is Z-up (the build plate is XY), glTF Y-up.
             let up = |p: [f32; 3]| {
                 let [x, y, z] = apply(m, p);
-                [x, z, -y]
+                [x * s, z * s, -y * s]
             };
-            let (a, b, c) = (up(*a), up(*b), up(*c));
-            self.tris.push(if mirrored { [a, c, b] } else { [a, b, c] });
             let i = u32::try_from(i).unwrap_or(u32::MAX);
             let volume =
                 volumes.and_then(|vs| vs.iter().find(|v| (v.0..=v.1).contains(&i)).map(|v| v.2));
@@ -216,19 +311,98 @@ impl Emit<'_> {
             } else {
                 volume.or(filament)
             };
-            let own = t
-                .pid
-                .or(o.pid)
-                .and_then(|g| part.colors.get(&g))
-                .and_then(|g| {
-                    g.get(t.p1.or(o.pindex).unwrap_or(0) as usize)
-                        .copied()
-                        .flatten()
-                });
-            self.colors
-                .push(filament.map(|n| self.slicer.filament(n)).or(own));
+            let (look, uvs, colors) = match filament {
+                Some(n) => {
+                    let [r, g, b] = self.slicer.filament(n);
+                    (Look::Color([r, g, b, 255]), None, None)
+                }
+                None => self.properties(part, o, t),
+            };
+            match look {
+                Look::Color(c) => {
+                    self.distinct.insert([c[0], c[1], c[2]]);
+                }
+                Look::Vertex => {
+                    for c in colors.iter().flatten() {
+                        self.distinct.insert([c[0], c[1], c[2]]);
+                    }
+                }
+                _ => {}
+            }
+            // A mirroring transform turns faces inside out unless the winding turns too.
+            let order = if mirrored { [0, 2, 1] } else { [0, 1, 2] };
+            let pos = [up(*a), up(*b), up(*c)];
+            let pi = match self.looks.get(&look) {
+                Some(&pi) => pi,
+                None => {
+                    self.prims.push((look, Prim::default()));
+                    self.looks.insert(look, self.prims.len() - 1);
+                    self.prims.len() - 1
+                }
+            };
+            let p = &mut self.prims[pi].1;
+            let n = face_normal(pos[order[0]], pos[order[1]], pos[order[2]]);
+            for k in order {
+                p.indices
+                    .push(u32::try_from(p.positions.len()).unwrap_or(u32::MAX));
+                p.positions.push(pos[k]);
+                p.normals.push(n);
+                if let Some(uv) = &uvs {
+                    p.uvs.push([uv[k][0], 1.0 - uv[k][1]]);
+                }
+                if let Some(cs) = &colors {
+                    let c = cs[k];
+                    let [r, g, b] = [c[0], c[1], c[2]].map(|v| srgb_to_linear(f32::from(v) / 255.0));
+                    p.colors.push([r, g, b, f32::from(c[3]) / 255.0]);
+                }
+            }
+            self.triangles += 1;
         }
         Ok(())
+    }
+
+    /// A triangle's look from the materials extension: its property group (its own, else its object's) and the
+    /// entry for each corner (p1, p2 and p3; else the object's pindex).
+    #[allow(clippy::type_complexity)]
+    fn properties(
+        &mut self,
+        part: &Part,
+        o: &Object,
+        t: &Tri,
+    ) -> (Look, Option<[[f32; 2]; 3]>, Option<[[u8; 4]; 3]>) {
+        let plain = (Look::Plain, None, None);
+        let Some(group) = t.pid.or(o.pid).and_then(|g| part.groups.get(&g)) else {
+            return plain;
+        };
+        let p1 = t.p1.or(o.pindex).unwrap_or(0) as usize;
+        let at = [p1, t.p2.map_or(p1, |v| v as usize), t.p3.map_or(p1, |v| v as usize)];
+        match group {
+            Group::Colors(cs) => {
+                let c = at.map(|i| cs.get(i).copied().flatten());
+                if c[0] == c[1] && c[1] == c[2] {
+                    (c[0].map_or(Look::Plain, Look::Color), None, None)
+                } else {
+                    let gray = GRAY.map(|v| (v * 255.0) as u8);
+                    (Look::Vertex, None, Some(c.map(|c| c.unwrap_or(gray))))
+                }
+            }
+            Group::Coords { texture, uvs } => {
+                let (Some(path), [Some(a), Some(b), Some(c)]) =
+                    (part.textures.get(texture), at.map(|i| uvs.get(i).copied()))
+                else {
+                    return plain;
+                };
+                let key = norm(path);
+                let t = match self.textures.iter().position(|k| *k == key) {
+                    Some(t) => t,
+                    None => {
+                        self.textures.push(key);
+                        self.textures.len() - 1
+                    }
+                };
+                (Look::Texture(t), Some([a, b, c]), None)
+            }
+        }
     }
 }
 
@@ -307,13 +481,18 @@ fn transform(v: &[u8]) -> Mat {
 }
 
 /// `#RRGGBB` or `#RRGGBBAA`.
-fn hex_color(s: &str) -> Option<[u8; 3]> {
+fn hex_rgba(s: &str) -> Option<[u8; 4]> {
     let h = s.trim().strip_prefix('#')?;
     if h.len() != 6 && h.len() != 8 {
         return None;
     }
     let byte = |i: usize| u8::from_str_radix(h.get(i..i + 2)?, 16).ok();
-    Some([byte(0)?, byte(2)?, byte(4)?])
+    let a = if h.len() == 8 { byte(6)? } else { 255 };
+    Some([byte(0)?, byte(2)?, byte(4)?, a])
+}
+
+fn hex_color(s: &str) -> Option<[u8; 3]> {
+    hex_rgba(s).map(|[r, g, b, _]| [r, g, b])
 }
 
 /// The root model's name, from the package's relationships.
@@ -359,7 +538,7 @@ fn parse_part(r: impl Read, triangles: &mut usize) -> Result<Part> {
                             part.objects.insert(id, o);
                         }
                     }
-                    b"basematerials" | b"colorgroup" => group = None,
+                    b"basematerials" | b"colorgroup" | b"texture2dgroup" => group = None,
                     b"build" => in_build = false,
                     b"metadata" => app_name = false,
                     _ => {}
@@ -374,6 +553,7 @@ fn parse_part(r: impl Read, triangles: &mut usize) -> Result<Part> {
             }
         };
         match e.local_name().as_ref() {
+            b"model" => part.unit = attr(&e, b"unit"),
             b"object" => {
                 let mut o = Object::default();
                 let mut id = None;
@@ -415,6 +595,8 @@ fn parse_part(r: impl Read, triangles: &mut usize) -> Result<Part> {
                         b"v3" => t.v[2] = num(v).unwrap_or(u32::MAX),
                         b"pid" => t.pid = num(v),
                         b"p1" => t.p1 = num(v),
+                        b"p2" => t.p2 = num(v),
+                        b"p3" => t.p3 = num(v),
                         // Bambu Studio and OrcaSlicer; PrusaSlicer (`slic3rpe:`).
                         b"paint_color" | b"mmu_segmentation" => t.paint = paint_state(v),
                         _ => {}
@@ -440,35 +622,68 @@ fn parse_part(r: impl Read, triangles: &mut usize) -> Result<Part> {
                     o.components.push(c);
                 }
             }
-            b"basematerials" | b"colorgroup" => {
-                group = attr(&e, b"id")
-                    .and_then(|v| v.parse().ok())
-                    .filter(|_| !empty);
+            kind @ (b"basematerials" | b"colorgroup" | b"texture2dgroup") => {
+                group = attr(&e, b"id").and_then(|v| v.parse().ok());
                 if let Some(g) = group {
-                    part.colors.entry(g).or_default();
+                    let new = if kind == b"texture2dgroup" {
+                        let texture = attr(&e, b"texid").and_then(|v| v.parse().ok());
+                        Group::Coords {
+                            texture: texture.unwrap_or(u32::MAX),
+                            uvs: Vec::new(),
+                        }
+                    } else {
+                        Group::Colors(Vec::new())
+                    };
+                    part.groups.insert(g, new);
+                }
+                if empty {
+                    group = None;
                 }
             }
             name @ (b"base" | b"color") => {
-                if let Some(g) = group {
+                if let Some(Group::Colors(cs)) = group.and_then(|g| part.groups.get_mut(&g)) {
                     let key: &[u8] = if name == b"base" {
                         b"displaycolor"
                     } else {
                         b"color"
                     };
-                    let c = attr(&e, key).and_then(|v| hex_color(&v));
-                    part.colors.entry(g).or_default().push(c);
+                    cs.push(attr(&e, key).and_then(|v| hex_rgba(&v)));
+                }
+            }
+            b"tex2coord" => {
+                if let Some(Group::Coords { uvs, .. }) = group.and_then(|g| part.groups.get_mut(&g)) {
+                    let mut uv = [0.0f32; 2];
+                    each_attr(&e, |k, v| match k {
+                        b"u" => uv[0] = num(v).unwrap_or(0.0),
+                        b"v" => uv[1] = num(v).unwrap_or(0.0),
+                        _ => {}
+                    });
+                    uvs.push(uv);
+                }
+            }
+            b"texture2d" => {
+                if let (Some(id), Some(path)) = (
+                    attr(&e, b"id").and_then(|v| v.parse().ok()),
+                    attr(&e, b"path"),
+                ) {
+                    part.textures.insert(id, path);
                 }
             }
             b"build" => in_build = !empty,
             b"item" if in_build => {
-                let (mut id, mut m) = (None, IDENTITY);
+                let (mut id, mut transform_, mut path) = (None, IDENTITY, None);
                 each_attr(&e, |k, v| match k {
                     b"objectid" => id = num(v),
-                    b"transform" => m = transform(v),
+                    b"transform" => transform_ = transform(v),
+                    b"path" => path = Some(String::from_utf8_lossy(v).into_owned()),
                     _ => {}
                 });
                 if let Some(id) = id {
-                    part.build.push((id, m));
+                    part.build.push(Item {
+                        path,
+                        id,
+                        transform: transform_,
+                    });
                 }
             }
             b"metadata" => {
@@ -694,8 +909,8 @@ mod tests {
         assert_eq!(facts["colors"], 2);
         assert_eq!(facts["application"], "Test Exporter");
         assert_eq!(colors(&mesh), [[255, 0, 0], [0, 0, 255]]);
-        // The first item moved 100 along x.
-        assert!(mesh.prims[0].positions.iter().any(|p| p[0] >= 100.0));
+        // The first item moved 100 mm along x.
+        assert!(mesh.prims[0].positions.iter().any(|p| p[0] >= 0.1));
     }
 
     #[test]

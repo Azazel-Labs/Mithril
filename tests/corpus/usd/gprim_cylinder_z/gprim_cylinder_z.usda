@@ -1,0 +1,15 @@
+#usda 1.0
+(
+    upAxis = "Y"
+    metersPerUnit = 1.0
+)
+
+def Xform "Root"
+{
+    def Cylinder "Can"
+    {
+        double radius = 1
+        double height = 4
+        uniform token axis = "Z"
+    }
+}

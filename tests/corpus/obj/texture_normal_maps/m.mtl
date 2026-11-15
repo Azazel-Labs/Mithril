@@ -1,0 +1,4 @@
+newmtl bump
+map_Bump -bm 0.5 n1.png
+newmtl norm
+norm n2.png

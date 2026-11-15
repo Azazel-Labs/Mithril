@@ -1,0 +1,54 @@
+{
+  "spec": "PLY as Blender's exporter writes it: ascii, normals, UVs, sRGB vertex colors",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.wm.ply_export), tools/corpus/blender_export.py",
+  "triangles": 2,
+  "bounds": {
+    "min": [
+      -1.0,
+      -1.0,
+      0.0
+    ],
+    "max": [
+      1.0,
+      1.0,
+      0.0
+    ]
+  },
+  "area": 4.0,
+  "uvs": true,
+  "colors": true,
+  "normals_in": [
+    [
+      0,
+      0,
+      1
+    ]
+  ],
+  "tolerance": 0.01,
+  "colors_include": [
+    [
+      1.0,
+      0.0,
+      0.0,
+      1
+    ],
+    [
+      0.0,
+      1.0,
+      0.0,
+      1
+    ],
+    [
+      0.0,
+      0.0,
+      1.0,
+      1
+    ],
+    [
+      0.214,
+      0.214,
+      0.214,
+      1
+    ]
+  ]
+}

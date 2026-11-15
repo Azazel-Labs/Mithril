@@ -1,0 +1,20 @@
+{
+  "spec": "binary FBX 7.4 as Blender's exporter writes it: Y up, X forward",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.export_scene.fbx), tools/corpus/blender_export.py",
+  "triangles": 12,
+  "bounds": {
+    "min": [
+      -2.0208,
+      -0.4635,
+      -4.3798
+    ],
+    "max": [
+      4.0208,
+      6.4635,
+      0.3798
+    ]
+  },
+  "area": 88.0,
+  "winding_matches_normals": true,
+  "faces_outward": true
+}
