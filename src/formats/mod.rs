@@ -101,10 +101,7 @@ impl<'a> Input<'a> {
     /// The model in the file at `path`.
     #[cfg(feature = "fs")]
     pub fn file(path: &'a Path) -> Self {
-        Self {
-            path,
-            data: Data::File,
-        }
+        Self { path, data: Data::File }
     }
 
     /// A model in memory, named `name`.
@@ -146,9 +143,7 @@ impl<'a> Input<'a> {
             Data::File => {
                 use std::io::Read as _;
                 let mut head = Vec::new();
-                std::fs::File::open(self.path)?
-                    .take(n as u64)
-                    .read_to_end(&mut head)?;
+                std::fs::File::open(self.path)?.take(n as u64).read_to_end(&mut head)?;
                 Ok(Cow::Owned(head))
             }
         }
@@ -183,10 +178,7 @@ fn read(input: Input<'_>, ext: &str, assets: &dyn Assets) -> Result<Loaded> {
     let counted = |m: Mesh| {
         let mut facts = Map::new();
         facts.insert("triangles".into(), json!(m.triangles()));
-        Loaded {
-            mesh: Some(m),
-            facts,
-        }
+        Loaded { mesh: Some(m), facts }
     };
     let _ = (&counted, input, assets);
     match ext {
@@ -205,9 +197,7 @@ fn read(input: Input<'_>, ext: &str, assets: &dyn Assets) -> Result<Loaded> {
             Ok(counted(mesh))
         }
         #[cfg(feature = "usd")]
-        "usd" | "usda" | "usdc" | "usdz" => {
-            Ok(usd::load(input, assets)?.map_or_else(Loaded::default, counted))
-        }
+        "usd" | "usda" | "usdc" | "usdz" => Ok(usd::load(input, assets)?.map_or_else(Loaded::default, counted)),
         #[cfg(feature = "obj")]
         "obj" => Ok(counted(colors_and_textures(
             obj::obj(input, assets)?,
@@ -279,20 +269,13 @@ fn guess_color_texture(mesh: &mut Mesh, path: &Path, assets: &dyn Assets) {
     if !has_uvs || mesh.materials.iter().any(|m| m.color_image.is_some()) {
         return;
     }
-    let Some(img) = assets
-        .color_texture_for(path)
-        .and_then(|p| assets.load_image(&p))
-    else {
+    let Some(img) = assets.color_texture_for(path).and_then(|p| assets.load_image(&p)) else {
         return;
     };
     mesh.images.push(img);
     let i = mesh.images.len() - 1;
     for (n, m) in mesh.materials.iter_mut().enumerate() {
-        if mesh
-            .prims
-            .iter()
-            .any(|p| p.material == n && !p.uvs.is_empty())
-        {
+        if mesh.prims.iter().any(|p| p.material == n && !p.uvs.is_empty()) {
             m.color_image = Some(i);
             m.color[..3].copy_from_slice(&[1.0, 1.0, 1.0]);
         }
@@ -328,7 +311,10 @@ mod tests {
         let bytes = std::fs::read(path).unwrap();
         let in_memory = super::load_bytes(&bytes, &name, ext, &memory).unwrap();
         let glb = |m: &Option<Mesh>| m.as_ref().map(|m| to_glb(m).unwrap());
-        assert!(glb(&loaded.mesh) == glb(&in_memory.mesh), "{name} reads differently from memory");
+        assert!(
+            glb(&loaded.mesh) == glb(&in_memory.mesh),
+            "{name} reads differently from memory"
+        );
         assert_eq!(loaded.facts, in_memory.facts, "{name} reads differently from memory");
         (loaded.mesh, loaded.facts)
     }
@@ -363,11 +349,7 @@ vt 0 1
 
     #[test]
     fn missing_feature_and_unknown_extension() {
-        let err = |ext| {
-            load(Path::new("x"), ext, &Folder::new("."))
-                .unwrap_err()
-                .to_string()
-        };
+        let err = |ext| load(Path::new("x"), ext, &Folder::new(".")).unwrap_err().to_string();
         assert!(err("dae").contains("not a model format"));
         #[cfg(not(feature = "usd"))]
         assert!(err("usdz").contains("without the `usd` feature"));
@@ -465,12 +447,7 @@ vt 0 1
         xyzi.extend_from_slice(&[0, 0, 0, 1, 1, 0, 0, 2]);
         let mut rgba = vec![0u8; 1024];
         rgba[..8].copy_from_slice(&[255, 0, 0, 255, 0, 0, 255, 255]);
-        let children = [
-            chunk(b"SIZE", &size),
-            chunk(b"XYZI", &xyzi),
-            chunk(b"RGBA", &rgba),
-        ]
-        .concat();
+        let children = [chunk(b"SIZE", &size), chunk(b"XYZI", &xyzi), chunk(b"RGBA", &rgba)].concat();
         let mut file = b"VOX ".to_vec();
         file.extend_from_slice(&150u32.to_le_bytes());
         file.extend_from_slice(b"MAIN");
@@ -516,8 +493,7 @@ vt 0 1
             "newmtl Rock\nKd 0.5 0.5 0.5\nmap_Kd rock.tga\nnewmtl Plain\nKd 0.5 0.5 0.5\n",
         )
         .unwrap();
-        let obj =
-            format!("mtllib a.mtl\n{QUAD}usemtl Rock\nf 1/1 2/2 3/3\nusemtl Plain\nf 1 3 4\n");
+        let obj = format!("mtllib a.mtl\n{QUAD}usemtl Rock\nf 1/1 2/2 3/3\nusemtl Plain\nf 1 3 4\n");
         std::fs::write(dir.path().join("a.obj"), &obj).unwrap();
         let (m, _) = load_in(&dir.path().join("a.obj"), "obj", dir.path());
         let m = m.unwrap();
@@ -530,12 +506,7 @@ vt 0 1
         // Blender writes linear values: kept as they are.
         std::fs::write(dir.path().join("a.obj"), format!("# Blender 4.2\n{obj}")).unwrap();
         let (m, _) = load_in(&dir.path().join("a.obj"), "obj", dir.path());
-        let plain = m
-            .unwrap()
-            .materials
-            .into_iter()
-            .find(|x| x.name == "Plain")
-            .unwrap();
+        let plain = m.unwrap().materials.into_iter().find(|x| x.name == "Plain").unwrap();
         assert!((plain.color[0] - 0.5).abs() < 1e-6);
     }
 
@@ -544,30 +515,16 @@ vt 0 1
     fn obj_without_textures_takes_one_by_name() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("Textures")).unwrap();
-        std::fs::write(
-            dir.path().join("Textures/Barrel_Normal.png"),
-            png([128, 128, 255]),
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("Textures/Barrel_Albedo.png"),
-            png([200, 100, 50]),
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("Textures/Barrel_Normal.png"), png([128, 128, 255])).unwrap();
+        std::fs::write(dir.path().join("Textures/Barrel_Albedo.png"), png([200, 100, 50])).unwrap();
         std::fs::write(dir.path().join("Textures/Barrels.png"), png([0, 0, 0])).unwrap();
-        std::fs::write(
-            dir.path().join("Barrel.obj"),
-            format!("{QUAD}f 1/1 2/2 3/3 4/4\n"),
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("Barrel.obj"), format!("{QUAD}f 1/1 2/2 3/3 4/4\n")).unwrap();
         let (m, _) = load_in(&dir.path().join("Barrel.obj"), "obj", dir.path());
         let m = m.unwrap();
         assert_eq!(m.images.len(), 1);
         assert_eq!(m.materials[0].color_image, Some(0));
         assert_eq!(m.materials[0].color, [1.0, 1.0, 1.0, 1.0]);
-        let px = image::load_from_memory(&m.images[0].bytes)
-            .unwrap()
-            .to_rgb8();
+        let px = image::load_from_memory(&m.images[0].bytes).unwrap().to_rgb8();
         assert_eq!(px.get_pixel(0, 0).0, [200, 100, 50]);
     }
 

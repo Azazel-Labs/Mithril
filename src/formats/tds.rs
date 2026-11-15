@@ -160,13 +160,7 @@ fn trimesh(d: &[u8]) -> Trimesh {
             VERTICES => {
                 let n = u16_at(b, 0).unwrap_or(0) as usize;
                 t.vertices = (0..n)
-                    .map_while(|i| {
-                        Some([
-                            f32_at(b, 2 + i * 12)?,
-                            f32_at(b, 6 + i * 12)?,
-                            f32_at(b, 10 + i * 12)?,
-                        ])
-                    })
+                    .map_while(|i| Some([f32_at(b, 2 + i * 12)?, f32_at(b, 6 + i * 12)?, f32_at(b, 10 + i * 12)?]))
                     .collect();
             }
             UVS => {
@@ -221,12 +215,8 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets) -> Result<Mesh>
         .next()
         .filter(|&(id, _)| id == MAIN || id == PROJECT)
         .map(|(_, b)| b);
-    let Some(main) = main else {
-        bail!("not a 3DS file")
-    };
-    let editor = chunks(main)
-        .find(|&(id, _)| id == EDITOR)
-        .map_or(&[][..], |(_, b)| b);
+    let Some(main) = main else { bail!("not a 3DS file") };
+    let editor = chunks(main).find(|&(id, _)| id == EDITOR).map_or(&[][..], |(_, b)| b);
 
     let mut mesh = Mesh::default();
     let mut by_name: HashMap<String, usize> = HashMap::new();
@@ -262,10 +252,7 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets) -> Result<Mesh>
         for (_, tri) in chunks(rest).filter(|&(id, _)| id == TRIMESH) {
             let t = trimesh(tri);
             triangles += t.faces.len();
-            ensure!(
-                triangles <= MAX_TRIANGLES,
-                "more than {MAX_TRIANGLES} triangles"
-            );
+            ensure!(triangles <= MAX_TRIANGLES, "more than {MAX_TRIANGLES} triangles");
             let mut face_mat = vec![None; t.faces.len()];
             for (name, faces) in &t.materials {
                 let m = by_name.get(name).copied();
@@ -279,10 +266,7 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets) -> Result<Mesh>
         }
     }
     ensure!(triangles > 0, "this 3DS file has no meshes");
-    let mut prims: Vec<Prim> = prims
-        .into_values()
-        .filter(|p| !p.indices.is_empty())
-        .collect();
+    let mut prims: Vec<Prim> = prims.into_values().filter(|p| !p.indices.is_empty()).collect();
     prims.sort_by_key(|p| p.material);
     mesh.prims = prims;
     Ok(mesh)
@@ -291,12 +275,7 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets) -> Result<Mesh>
 /// A trimesh's faces, into the prims of their materials. A corner's normal averages the faces around its vertex that
 /// share a smoothing bit with its own face, each weighed by its angle there (so the triangulation doesn't matter); a
 /// face in no group is flat. Corners share a vertex when material, position and normal agree.
-fn add_faces(
-    t: &Trimesh,
-    face_mat: &[Option<usize>],
-    prims: &mut HashMap<usize, Prim>,
-    materials: &mut Vec<Material>,
-) {
+fn add_faces(t: &Trimesh, face_mat: &[Option<usize>], prims: &mut HashMap<usize, Prim>, materials: &mut Vec<Material>) {
     let pos: Vec<[f32; 3]> = t.vertices.iter().map(|&p| y_up(p)).collect();
     let has_uvs = !t.uvs.is_empty() && t.uvs.len() >= t.vertices.len();
     let n = pos.len();
@@ -326,11 +305,7 @@ fn add_faces(
     }
 
     // The faces around each vertex, as (face, corner), in compressed rows; only built when some face is smoothed.
-    let smoothed = t
-        .faces
-        .iter()
-        .enumerate()
-        .any(|(f, face)| whole(face) && group(f) != 0);
+    let smoothed = t.faces.iter().enumerate().any(|(f, face)| whole(face) && group(f) != 0);
     let mut start = vec![0u32; n + 1];
     let mut around: Vec<(u32, u8)> = Vec::new();
     if smoothed {
@@ -393,17 +368,15 @@ fn add_faces(
             }
             // -0.0 + 0.0 is 0.0: one key for both zeros.
             let nrm = nrm.map(|c| c + 0.0);
-            let idx = *seen
-                .entry((mat, vi, nrm.map(f32::to_bits)))
-                .or_insert_with(|| {
-                    prim.positions.push(pos[usize::from(vi)]);
-                    prim.normals.push(nrm);
-                    if has_uvs {
-                        let [s, tv] = t.uvs[usize::from(vi)];
-                        prim.uvs.push([s, 1.0 - tv]);
-                    }
-                    (prim.positions.len() - 1) as u32
-                });
+            let idx = *seen.entry((mat, vi, nrm.map(f32::to_bits))).or_insert_with(|| {
+                prim.positions.push(pos[usize::from(vi)]);
+                prim.normals.push(nrm);
+                if has_uvs {
+                    let [s, tv] = t.uvs[usize::from(vi)];
+                    prim.uvs.push([s, 1.0 - tv]);
+                }
+                (prim.positions.len() - 1) as u32
+            });
             prim.indices.push(idx);
         }
     }
@@ -429,10 +402,7 @@ mod tests {
     fn square() -> Vec<u8> {
         let mut mat = chunk(MAT_NAME, b"Red\0");
         mat.extend(chunk(MAT_DIFFUSE, &chunk(COLOR_U8, &[255, 0, 0])));
-        mat.extend(chunk(
-            MAT_TRANSPARENCY,
-            &chunk(PERCENT_U16, &25u16.to_le_bytes()),
-        ));
+        mat.extend(chunk(MAT_TRANSPARENCY, &chunk(PERCENT_U16, &25u16.to_le_bytes())));
 
         let mut verts = 4u16.to_le_bytes().to_vec();
         verts.extend(f32s(&[0., 0., 0., 2., 0., 0., 2., 2., 0., 0., 2., 0.]));
@@ -448,10 +418,7 @@ mod tests {
         faces.extend(chunk(FACE_MATERIAL, &fm));
         faces.extend(chunk(
             SMOOTHING,
-            &[1u32, 1]
-                .iter()
-                .flat_map(|x| x.to_le_bytes())
-                .collect::<Vec<_>>(),
+            &[1u32, 1].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>(),
         ));
         let mut tri = chunk(VERTICES, &verts);
         tri.extend(chunk(UVS, &uvs));
@@ -494,15 +461,8 @@ mod tests {
             floor.positions
         );
         assert!(floor.positions.contains(&[2.0, 0.0, -2.0]));
-        assert!(
-            floor.normals.iter().all(|n| n[1] > 0.99),
-            "{:?}",
-            floor.normals
-        );
-        assert!(
-            floor.uvs.contains(&[0.0, 1.0]),
-            "V flipped to glTF's origin"
-        );
+        assert!(floor.normals.iter().all(|n| n[1] > 0.99), "{:?}", floor.normals);
+        assert!(floor.uvs.contains(&[0.0, 1.0]), "V flipped to glTF's origin");
         let wall = &mesh.prims[1];
         assert_eq!(mesh.materials[wall.material].name, "default");
         assert_eq!(wall.positions.len(), 3);

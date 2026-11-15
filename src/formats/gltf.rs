@@ -165,9 +165,7 @@ struct Reader<'a> {
 }
 
 fn list<'v>(obj: &'v Map<String, Value>, key: &str) -> &'v [Value] {
-    obj.get(key)
-        .and_then(Value::as_array)
-        .map_or(&[], Vec::as_slice)
+    obj.get(key).and_then(Value::as_array).map_or(&[], Vec::as_slice)
 }
 
 fn index(v: &Value, key: &str) -> Option<usize> {
@@ -194,7 +192,10 @@ fn checked(rel: &str) -> Result<&str> {
         && Path::new(rel)
             .components()
             .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
-    ensure!(safe, "refusing to read {rel:?}: not a relative path inside the model's folder");
+    ensure!(
+        safe,
+        "refusing to read {rel:?}: not a relative path inside the model's folder"
+    );
     Ok(rel)
 }
 
@@ -205,7 +206,9 @@ fn external<'a>(input: Input<'a>, assets: &'a dyn Assets, uri: &str) -> Result<C
     let p = input.dir().join(checked(&rel)?);
     #[cfg(feature = "fs")]
     if input.bytes().is_none() {
-        return Ok(Cow::Owned(std::fs::read(&p).map_err(|e| invalid!("glTF buffer {rel:?}: {e}"))?));
+        return Ok(Cow::Owned(
+            std::fs::read(&p).map_err(|e| invalid!("glTF buffer {rel:?}: {e}"))?,
+        ));
     }
     assets
         .read(&p)
@@ -356,9 +359,7 @@ impl<'a> Reader<'a> {
             let plain = if bytes.starts_with(b"glTF") {
                 container::decompress(&bytes)?
             } else {
-                container::pack_glb_decompressed(&bytes, |uri| {
-                    external(input, assets, uri).map(Cow::into_owned)
-                })?
+                container::pack_glb_decompressed(&bytes, |uri| external(input, assets, uri).map(Cow::into_owned))?
             };
             drop(bytes);
             (json, bin) = glb_in_memory(Cow::Owned(plain))?;
@@ -393,9 +394,7 @@ impl<'a> Reader<'a> {
             let b = self.get("buffers", i)?.clone();
             let declared = b.get("byteLength").and_then(Value::as_u64).unwrap_or(0);
             let buf = match b.get("uri").and_then(Value::as_str) {
-                Some(uri) if uri.starts_with("data:") => {
-                    Buf::Mem(Cow::Owned(container::data_uri(uri)?.1))
-                }
+                Some(uri) if uri.starts_with("data:") => Buf::Mem(Cow::Owned(container::data_uri(uri)?.1)),
                 #[cfg(feature = "fs")]
                 Some(uri) if self.input.bytes().is_none() => {
                     let rel = container::percent_decode(uri);
@@ -439,7 +438,10 @@ impl<'a> Reader<'a> {
     fn view_bytes(&mut self, i: usize) -> Result<Vec<u8>> {
         let (buffer, offset, len, _) = self.view(i)?;
         let b = self.buf(buffer)?;
-        ensure!(offset.saturating_add(len) <= b.len(), "glTF buffer view runs past its buffer");
+        ensure!(
+            offset.saturating_add(len) <= b.len(),
+            "glTF buffer view runs past its buffer"
+        );
         let mut out = vec![0; len as usize];
         b.read_at(offset, &mut out)?;
         Ok(out)
@@ -484,7 +486,10 @@ impl<'a> Reader<'a> {
         let (buffer, voff, vlen, stride) = self.view(view)?;
         let esize = a.esize();
         let stride = stride.filter(|&s| s > 0).unwrap_or(esize);
-        ensure!(stride >= esize, "glTF buffer view stride {stride} is under an element's {esize} bytes");
+        ensure!(
+            stride >= esize,
+            "glTF buffer view stride {stride} is under an element's {esize} bytes"
+        );
         let span = (a.count as u64 - 1)
             .checked_mul(stride as u64)
             .and_then(|s| s.checked_add(a.offset + esize as u64))
@@ -553,9 +558,7 @@ impl<'a> Reader<'a> {
                 }),
                 (5121, true) => put(out, bytes, stride, cs, m, |b| f32::from(b[0]) / 255.0),
                 (5121, false) => put(out, bytes, stride, cs, m, |b| f32::from(b[0])),
-                (5120, true) => put(out, bytes, stride, cs, m, |b| {
-                    (f32::from(b[0] as i8) / 127.0).max(-1.0)
-                }),
+                (5120, true) => put(out, bytes, stride, cs, m, |b| (f32::from(b[0] as i8) / 127.0).max(-1.0)),
                 (5120, false) => put(out, bytes, stride, cs, m, |b| f32::from(b[0] as i8)),
                 (5123, true) => put(out, bytes, stride, cs, m, |b| {
                     f32::from(u16::from_le_bytes([b[0], b[1]])) / 65535.0
@@ -647,9 +650,14 @@ impl<'a> Reader<'a> {
     /// A sparse accessor's indices, and an accessor for its values.
     fn sparse(&mut self, a: &Acc, s: &Value) -> Result<(Vec<u32>, Acc)> {
         let count = index(s, "count").context("glTF sparse accessor has no count")?;
-        ensure!(count <= a.count, "glTF sparse accessor replaces more elements than it has");
+        ensure!(
+            count <= a.count,
+            "glTF sparse accessor replaces more elements than it has"
+        );
         let part = |key: &str| -> Result<(usize, u64)> {
-            let p = s.get(key).with_context(|| format!("glTF sparse accessor has no {key}"))?;
+            let p = s
+                .get(key)
+                .with_context(|| format!("glTF sparse accessor has no {key}"))?;
             Ok((
                 index(p, "bufferView").with_context(|| format!("glTF sparse {key} has no bufferView"))?,
                 p.get("byteOffset").and_then(Value::as_u64).unwrap_or(0),
@@ -657,7 +665,10 @@ impl<'a> Reader<'a> {
         };
         let (iv, ioff) = part("indices")?;
         let ictype = s["indices"].get("componentType").and_then(Value::as_u64).unwrap_or(0);
-        ensure!(matches!(ictype, 5121 | 5123 | 5125), "glTF sparse indices' component type {ictype}");
+        ensure!(
+            matches!(ictype, 5121 | 5123 | 5125),
+            "glTF sparse indices' component type {ictype}"
+        );
         let idx = Acc {
             view: Some(iv),
             offset: ioff,
@@ -692,10 +703,7 @@ impl<'a> Reader<'a> {
                 }
             }
         }
-        let mut stack: Vec<(usize, M4)> = (0..nodes.len())
-            .filter(|&i| !child[i])
-            .map(|i| (i, IDENTITY))
-            .collect();
+        let mut stack: Vec<(usize, M4)> = (0..nodes.len()).filter(|&i| !child[i]).map(|i| (i, IDENTITY)).collect();
         while let Some((i, parent)) = stack.pop() {
             if world[i].is_some() {
                 continue;
@@ -761,7 +769,10 @@ impl<'a> Reader<'a> {
             let same = uses.iter_mut().find(|u| {
                 u.mesh == mesh
                     && u.skin == skin
-                    && u.weights.iter().map(|x| x.to_bits()).eq(weights.iter().map(|x| x.to_bits()))
+                    && u.weights
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .eq(weights.iter().map(|x| x.to_bits()))
             });
             match same {
                 Some(_) if skin.is_some() => {}
@@ -790,13 +801,19 @@ impl<'a> Reader<'a> {
         };
         let get = |k: &str| index(attrs, k);
         let t = get("TRANSLATION").map(|a| self.read(a, [0.0; 3])).transpose()?;
-        let r = get("ROTATION").map(|a| self.read(a, [0.0, 0.0, 0.0, 1.0])).transpose()?;
+        let r = get("ROTATION")
+            .map(|a| self.read(a, [0.0, 0.0, 0.0, 1.0]))
+            .transpose()?;
         let s = get("SCALE").map(|a| self.read(a, [1.0; 3])).transpose()?;
-        let count = [t.as_ref().map(Vec::len), r.as_ref().map(Vec::len), s.as_ref().map(Vec::len)]
-            .into_iter()
-            .flatten()
-            .min()
-            .unwrap_or(0);
+        let count = [
+            t.as_ref().map(Vec::len),
+            r.as_ref().map(Vec::len),
+            s.as_ref().map(Vec::len),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(0);
         ensure!(count <= MAX_TRIANGLES, "glTF node has {count} instances");
         Ok((0..count)
             .map(|k| {
@@ -856,11 +873,27 @@ fn mul(a: &M4, b: &M4) -> M4 {
 /// Translation, rotation (a quaternion x y z w) and scale as one matrix.
 fn trs(t: [f64; 3], q: [f64; 4], s: [f64; 3]) -> M4 {
     let len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
-    let [x, y, z, w] = if len > 0.0 { q.map(|c| c / len) } else { [0.0, 0.0, 0.0, 1.0] };
+    let [x, y, z, w] = if len > 0.0 {
+        q.map(|c| c / len)
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    };
     let r = [
-        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
-        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
-        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        [
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - z * w),
+            2.0 * (x * z + y * w),
+        ],
+        [
+            2.0 * (x * y + z * w),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - x * w),
+        ],
+        [
+            2.0 * (x * z - y * w),
+            2.0 * (y * z + x * w),
+            1.0 - 2.0 * (x * x + y * y),
+        ],
     ];
     let mut m = IDENTITY;
     for col in 0..3 {
@@ -890,8 +923,7 @@ fn local(node: &Value) -> M4 {
 
 /// The upper 3x3's determinant.
 fn det3(m: &M4) -> f64 {
-    m[0] * (m[5] * m[10] - m[9] * m[6]) - m[4] * (m[1] * m[10] - m[9] * m[2])
-        + m[8] * (m[1] * m[6] - m[5] * m[2])
+    m[0] * (m[5] * m[10] - m[9] * m[6]) - m[4] * (m[1] * m[10] - m[9] * m[2]) + m[8] * (m[1] * m[6] - m[5] * m[2])
 }
 
 /// The matrix normals go through: the upper 3x3's cofactors (its inverse transpose, scaled),
@@ -1023,7 +1055,11 @@ impl Reader<'_> {
             Some(i) => self.acc(i)?.count,
             None => self.acc(pos)?.count,
         };
-        let tris = if mode == 4 { corners / 3 } else { corners.saturating_sub(2) };
+        let tris = if mode == 4 {
+            corners / 3
+        } else {
+            corners.saturating_sub(2)
+        };
         let total = tris.saturating_mul(u.transforms.len());
         ensure!(total <= self.budget, "too many triangles to convert");
 
@@ -1124,13 +1160,7 @@ impl Reader<'_> {
 
     /// Poses a skinned primitive: each vertex goes through its joints' matrices, blended by
     /// weight.
-    fn skin(
-        &mut self,
-        skin: usize,
-        attrs: &Value,
-        positions: &mut [[f32; 3]],
-        normals: &mut [[f32; 3]],
-    ) -> Result<()> {
+    fn skin(&mut self, skin: usize, attrs: &Value, positions: &mut [[f32; 3]], normals: &mut [[f32; 3]]) -> Result<()> {
         let s = self.get("skins", skin)?.clone();
         let joints = list_of(&s, "joints");
         let ibm = match index(&s, "inverseBindMatrices") {
@@ -1189,10 +1219,7 @@ impl Reader<'_> {
             return (0, None);
         };
         let mut set = info.get("texCoord").and_then(Value::as_u64).unwrap_or(0);
-        let Some(t) = info
-            .get("extensions")
-            .and_then(|e| e.get("KHR_texture_transform"))
-        else {
+        let Some(t) = info.get("extensions").and_then(|e| e.get("KHR_texture_transform")) else {
             return (set, None);
         };
         if let Some(s) = t.get("texCoord").and_then(Value::as_u64) {
@@ -1235,8 +1262,7 @@ impl Reader<'_> {
                 (None, Some(sg)) => {
                     m.color = f32s(sg.get("diffuseFactor"), [1.0; 4]);
                     m.metallic = 0.0;
-                    m.roughness =
-                        1.0 - sg.get("glossinessFactor").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+                    m.roughness = 1.0 - sg.get("glossinessFactor").and_then(Value::as_f64).unwrap_or(1.0) as f32;
                 }
                 (pbr, _) => {
                     let pbr = pbr.cloned().unwrap_or(Value::Null);
@@ -1380,7 +1406,10 @@ mod tests {
     fn grid(n: u32) -> Mesh {
         let mut prims = Vec::new();
         for m in 0..2u32 {
-            let mut p = Prim { material: m as usize, ..Prim::default() };
+            let mut p = Prim {
+                material: m as usize,
+                ..Prim::default()
+            };
             for y in 0..=n {
                 for x in 0..=n {
                     let (u, v) = (x as f32 / n as f32, y as f32 / n as f32);
@@ -1393,7 +1422,8 @@ mod tests {
             for y in 0..n {
                 for x in 0..n {
                     let i = y * (n + 1) + x;
-                    p.indices.extend_from_slice(&[i, i + n + 1, i + 1, i + 1, i + n + 1, i + n + 2]);
+                    p.indices
+                        .extend_from_slice(&[i, i + n + 1, i + 1, i + 1, i + n + 1, i + n + 2]);
                 }
             }
             prims.push(p);
@@ -1403,7 +1433,11 @@ mod tests {
         red.roughness = 0.25;
         red.emissive = [0.1, 0.2, 0.3];
         red.double_sided = true;
-        Mesh { prims, materials: vec![red, Material::plain("Blue", [0.0, 0.0, 1.0, 0.5])], images: Vec::new() }
+        Mesh {
+            prims,
+            materials: vec![red, Material::plain("Blue", [0.0, 0.0, 1.0, 0.5])],
+            images: Vec::new(),
+        }
     }
 
     /// Each triangle's corners, rotated to start at its smallest, so triangles that begin at
@@ -1434,15 +1468,24 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, bytes).unwrap();
         let ext = name.rsplit('.').next().unwrap();
-        let mesh = crate::formats::load(&path, ext, &Folder::new(dir)).unwrap().mesh.unwrap();
+        let mesh = crate::formats::load(&path, ext, &Folder::new(dir))
+            .unwrap()
+            .mesh
+            .unwrap();
         // From memory, with the folder's files as the assets, it reads the same.
         let mut memory = crate::assets::Memory::new();
         for entry in std::fs::read_dir(dir).unwrap() {
             let p = entry.unwrap().path();
             memory.insert(&p.file_name().unwrap().to_string_lossy(), std::fs::read(&p).unwrap());
         }
-        let in_memory = crate::formats::load_bytes(bytes, name, ext, &memory).unwrap().mesh.unwrap();
-        assert!(to_glb(&mesh).unwrap() == to_glb(&in_memory).unwrap(), "{name} reads differently from memory");
+        let in_memory = crate::formats::load_bytes(bytes, name, ext, &memory)
+            .unwrap()
+            .mesh
+            .unwrap();
+        assert!(
+            to_glb(&mesh).unwrap() == to_glb(&in_memory).unwrap(),
+            "{name} reads differently from memory"
+        );
         mesh
     }
 
@@ -1454,8 +1497,22 @@ mod tests {
         }
         for (ma, mb) in a.materials.iter().zip(&b.materials) {
             assert_eq!(
-                (&ma.name, ma.color, ma.emissive, ma.metallic, ma.roughness, ma.double_sided),
-                (&mb.name, mb.color, mb.emissive, mb.metallic, mb.roughness, mb.double_sided)
+                (
+                    &ma.name,
+                    ma.color,
+                    ma.emissive,
+                    ma.metallic,
+                    ma.roughness,
+                    ma.double_sided
+                ),
+                (
+                    &mb.name,
+                    mb.color,
+                    mb.emissive,
+                    mb.metallic,
+                    mb.roughness,
+                    mb.double_sided
+                )
             );
         }
     }
@@ -1498,7 +1555,9 @@ mod tests {
         let bin = &packed[20 + json_len + 8..];
         json["buffers"][0]["uri"] = "packed.bin".into();
         std::fs::write(dir.path().join("packed.bin"), bin).unwrap();
-        same(&mesh, &load(dir.path(), "packed.gltf", &serde_json::to_vec(&json).unwrap()));
+        same(
+            &mesh,
+            &load(dir.path(), "packed.gltf", &serde_json::to_vec(&json).unwrap()),
+        );
     }
 }
-

@@ -114,10 +114,7 @@ struct Slicer {
 impl Slicer {
     fn filament(&self, n: usize) -> [u8; 3] {
         let i = n.saturating_sub(1);
-        self.filaments
-            .get(i)
-            .copied()
-            .unwrap_or(FALLBACK[i % FALLBACK.len()])
+        self.filaments.get(i).copied().unwrap_or(FALLBACK[i % FALLBACK.len()])
     }
 }
 
@@ -149,12 +146,7 @@ pub(crate) fn load(input: super::Input<'_>) -> Result<(Option<Mesh>, Map<String,
         let reader = zip.by_name(real)?.take(MAX_PART);
         let part = parse_part(reader, &mut triangles).with_context(|| format!("reading {real}"))?;
         for o in part.objects.values() {
-            todo.extend(
-                o.components
-                    .iter()
-                    .filter_map(|c| c.path.as_deref())
-                    .map(norm),
-            );
+            todo.extend(o.components.iter().filter_map(|c| c.path.as_deref()).map(norm));
         }
         todo.extend(part.build.iter().filter_map(|i| i.path.as_deref()).map(norm));
         parts.insert(key, part);
@@ -211,11 +203,7 @@ pub(crate) fn load(input: super::Input<'_>) -> Result<(Option<Mesh>, Map<String,
                 let image = *images.entry(t).or_insert_with(|| {
                     let real = names.get(&out.textures[t])?;
                     let mut bytes = Vec::new();
-                    zip.by_name(real)
-                        .ok()?
-                        .take(MAX_PART)
-                        .read_to_end(&mut bytes)
-                        .ok()?;
+                    zip.by_name(real).ok()?.take(MAX_PART).read_to_end(&mut bytes).ok()?;
                     mesh.images.push(Image::png_or_jpeg(&bytes)?);
                     Some(mesh.images.len() - 1)
                 });
@@ -262,15 +250,7 @@ struct Emit<'a> {
 impl Emit<'_> {
     /// Object `id` of model `key` placed by `m`, inside the build item for object `item` (the one slicers' settings
     /// are kept against), printing in `filament` unless its parts or triangles say otherwise.
-    fn emit(
-        &mut self,
-        key: &str,
-        id: u32,
-        m: &Mat,
-        item: u32,
-        filament: Option<usize>,
-        depth: u32,
-    ) -> Result<()> {
+    fn emit(&mut self, key: &str, id: u32, m: &Mat, item: u32, filament: Option<usize>, depth: u32) -> Result<()> {
         ensure!(depth < 16, "this 3MF's components nest too deep");
         let parts = self.parts;
         let Some(part) = parts.get(key) else {
@@ -284,18 +264,11 @@ impl Emit<'_> {
             let f = self.slicer.parts.get(&(item, c.id)).copied().or(filament);
             self.emit(&sub, c.id, &mul(&c.transform, m), item, f, depth + 1)?;
         }
-        let volumes = if depth == 0 {
-            self.slicer.volumes.get(&id)
-        } else {
-            None
-        };
+        let volumes = if depth == 0 { self.slicer.volumes.get(&id) } else { None };
         let mirrored = det(m) < 0.0;
         let s = self.scale;
         for (i, t) in o.tris.iter().enumerate() {
-            ensure!(
-                self.triangles < MAX_TRIANGLES,
-                "too many triangles to preview"
-            );
+            ensure!(self.triangles < MAX_TRIANGLES, "too many triangles to preview");
             let [Some(a), Some(b), Some(c)] = t.v.map(|k| o.verts.get(k as usize)) else {
                 continue;
             };
@@ -305,8 +278,7 @@ impl Emit<'_> {
                 [x * s, z * s, -y * s]
             };
             let i = u32::try_from(i).unwrap_or(u32::MAX);
-            let volume =
-                volumes.and_then(|vs| vs.iter().find(|v| (v.0..=v.1).contains(&i)).map(|v| v.2));
+            let volume = volumes.and_then(|vs| vs.iter().find(|v| (v.0..=v.1).contains(&i)).map(|v| v.2));
             let filament = if t.paint > 0 {
                 Some(usize::from(t.paint))
             } else {
@@ -344,8 +316,7 @@ impl Emit<'_> {
             let p = &mut self.prims[pi].1;
             let n = face_normal(pos[order[0]], pos[order[1]], pos[order[2]]);
             for k in order {
-                p.indices
-                    .push(u32::try_from(p.positions.len()).unwrap_or(u32::MAX));
+                p.indices.push(u32::try_from(p.positions.len()).unwrap_or(u32::MAX));
                 p.positions.push(pos[k]);
                 p.normals.push(n);
                 if let Some(uv) = &uvs {
@@ -365,12 +336,7 @@ impl Emit<'_> {
     /// A triangle's look from the materials extension: its property group (its own, else its object's) and the
     /// entry for each corner (p1, p2 and p3; else the object's pindex).
     #[allow(clippy::type_complexity)]
-    fn properties(
-        &mut self,
-        part: &Part,
-        o: &Object,
-        t: &Tri,
-    ) -> (Look, Option<[[f32; 2]; 3]>, Option<[[u8; 4]; 3]>) {
+    fn properties(&mut self, part: &Part, o: &Object, t: &Tri) -> (Look, Option<[[f32; 2]; 3]>, Option<[[u8; 4]; 3]>) {
         let plain = (Look::Plain, None, None);
         let Some(group) = t.pid.or(o.pid).and_then(|g| part.groups.get(&g)) else {
             return plain;
@@ -420,16 +386,15 @@ fn mul(a: &Mat, b: &Mat) -> Mat {
     let mut c = [0.0; 12];
     for r in 0..4 {
         for col in 0..3 {
-            c[r * 3 + col] = (0..3).map(|k| a[r * 3 + k] * b[k * 3 + col]).sum::<f32>()
-                + if r == 3 { b[9 + col] } else { 0.0 };
+            c[r * 3 + col] =
+                (0..3).map(|k| a[r * 3 + k] * b[k * 3 + col]).sum::<f32>() + if r == 3 { b[9 + col] } else { 0.0 };
         }
     }
     c
 }
 
 fn det(m: &Mat) -> f32 {
-    m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6])
-        + m[2] * (m[3] * m[7] - m[4] * m[6])
+    m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6])
 }
 
 /// A zip entry name as looked up: no leading slash, lower case (3MF part names aren't case-sensitive).
@@ -437,12 +402,7 @@ fn norm(name: &str) -> String {
     name.trim_start_matches('/').to_ascii_lowercase()
 }
 
-fn text(
-    zip: &mut Zip<'_>,
-    names: &HashMap<String, String>,
-    name: &str,
-    limit: u64,
-) -> Option<String> {
+fn text(zip: &mut Zip<'_>, names: &HashMap<String, String>, name: &str, limit: u64) -> Option<String> {
     let mut s = String::new();
     zip.by_name(names.get(&norm(name))?)
         .ok()?
@@ -643,11 +603,7 @@ fn parse_part(r: impl Read, triangles: &mut usize) -> Result<Part> {
             }
             name @ (b"base" | b"color") => {
                 if let Some(Group::Colors(cs)) = group.and_then(|g| part.groups.get_mut(&g)) {
-                    let key: &[u8] = if name == b"base" {
-                        b"displaycolor"
-                    } else {
-                        b"color"
-                    };
+                    let key: &[u8] = if name == b"base" { b"displaycolor" } else { b"color" };
                     cs.push(attr(&e, key).and_then(|v| hex_rgba(&v)));
                 }
             }
@@ -663,10 +619,7 @@ fn parse_part(r: impl Read, triangles: &mut usize) -> Result<Part> {
                 }
             }
             b"texture2d" => {
-                if let (Some(id), Some(path)) = (
-                    attr(&e, b"id").and_then(|v| v.parse().ok()),
-                    attr(&e, b"path"),
-                ) {
+                if let (Some(id), Some(path)) = (attr(&e, b"id").and_then(|v| v.parse().ok()), attr(&e, b"path")) {
                     part.textures.insert(id, path);
                 }
             }
@@ -688,8 +641,7 @@ fn parse_part(r: impl Read, triangles: &mut usize) -> Result<Part> {
                 }
             }
             b"metadata" => {
-                app_name = !empty
-                    && attr(&e, b"name").is_some_and(|n| n.eq_ignore_ascii_case("Application"));
+                app_name = !empty && attr(&e, b"name").is_some_and(|n| n.eq_ignore_ascii_case("Application"));
             }
             _ => {}
         }
@@ -766,19 +718,8 @@ fn read_slicer(zip: &mut Zip<'_>, names: &HashMap<String, String>) -> Slicer {
     {
         let list = |key: &str| -> Vec<Option<[u8; 3]>> {
             cfg.lines()
-                .find_map(|l| {
-                    l.strip_prefix("; ")?
-                        .strip_prefix(key)?
-                        .trim_start()
-                        .strip_prefix('=')
-                })
-                .map(|v| {
-                    v.trim()
-                        .trim_matches('"')
-                        .split(';')
-                        .map(hex_color)
-                        .collect()
-                })
+                .find_map(|l| l.strip_prefix("; ")?.strip_prefix(key)?.trim_start().strip_prefix('='))
+                .map(|v| v.trim().trim_matches('"').split(';').map(hex_color).collect())
                 .unwrap_or_default()
         };
         let (extruder, filament) = (list("extruder_colour"), list("filament_colour"));
@@ -793,10 +734,7 @@ fn read_slicer(zip: &mut Zip<'_>, names: &HashMap<String, String>) -> Slicer {
             })
             .collect();
     }
-    for name in [
-        "Metadata/model_settings.config",
-        "Metadata/Slic3r_PE_model.config",
-    ] {
+    for name in ["Metadata/model_settings.config", "Metadata/Slic3r_PE_model.config"] {
         if let Some(xml) = text(zip, names, name, MAX_CONFIG) {
             read_assignments(&xml, &mut s);
         }
@@ -831,10 +769,7 @@ fn read_assignments(xml: &str, s: &mut Slicer) {
             b"part" if !empty => part = id(b"id"),
             b"volume" if !empty => volume = id(b"firstid").zip(id(b"lastid")),
             b"metadata" if attr(&e, b"key").as_deref() == Some("extruder") => {
-                let (Some(o), Some(n)) = (
-                    object,
-                    attr(&e, b"value").and_then(|v| v.parse::<usize>().ok()),
-                ) else {
+                let (Some(o), Some(n)) = (object, attr(&e, b"value").and_then(|v| v.parse::<usize>().ok())) else {
                     continue;
                 };
                 if n == 0 {
@@ -862,8 +797,7 @@ mod tests {
         let f = tempfile::Builder::new().suffix(".3mf").tempfile().unwrap();
         let mut zip = zip::ZipWriter::new(f.reopen().unwrap());
         for (name, body) in files {
-            zip.start_file(*name, zip::write::SimpleFileOptions::default())
-                .unwrap();
+            zip.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
             zip.write_all(body.as_bytes()).unwrap();
         }
         zip.finish().unwrap();
@@ -942,10 +876,7 @@ mod tests {
         let (mesh, facts) = load(crate::formats::Input::file(f.path())).unwrap();
         assert_eq!(facts["triangles"], 3);
         // Part 1 in white with one triangle painted green; part 2 in red.
-        assert_eq!(
-            colors(&mesh.unwrap()),
-            [[255, 255, 255], [0, 255, 0], [255, 0, 0]]
-        );
+        assert_eq!(colors(&mesh.unwrap()), [[255, 255, 255], [0, 255, 0], [255, 0, 0]]);
     }
 
     #[test]
@@ -958,8 +889,7 @@ mod tests {
         let cfg = r#"<?xml version="1.0"?><config><object id="1" instances_count="1"><metadata type="object" key="extruder" value="1"/>
             <volume firstid="0" lastid="0"><metadata type="volume" key="extruder" value="2"/></volume>
             <volume firstid="1" lastid="1"></volume></object></config>"#;
-        let settings =
-            "; extruder_colour = \"#0000FF;\"\n; filament_colour = \"#FFFFFF;#FFFF00\"\n";
+        let settings = "; extruder_colour = \"#0000FF;\"\n; filament_colour = \"#FFFFFF;#FFFF00\"\n";
         let f = zip_of(&[
             ("3D/3dmodel.model", &model),
             ("Metadata/Slic3r_PE_model.config", cfg),

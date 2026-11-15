@@ -19,9 +19,7 @@ impl Pcg32 {
 
     pub fn next_u32(&mut self) -> u32 {
         let old = self.state;
-        self.state = old
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(self.inc);
+        self.state = old.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(self.inc);
         let xorshifted = (((old >> 18) ^ old) >> 27) as u32;
         let rot = (old >> 59) as u32;
         xorshifted.rotate_right(rot)

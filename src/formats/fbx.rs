@@ -20,12 +20,7 @@ const MAX_TRIANGLES: usize = 4_000_000;
 
 type M4 = [[f64; 4]; 4];
 
-const IDENTITY: M4 = [
-    [1., 0., 0., 0.],
-    [0., 1., 0., 0.],
-    [0., 0., 1., 0.],
-    [0., 0., 0., 1.],
-];
+const IDENTITY: M4 = [[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.], [0., 0., 0., 1.]];
 
 fn mul(a: &M4, b: &M4) -> M4 {
     let mut r = [[0.0; 4]; 4];
@@ -108,16 +103,11 @@ fn normal_matrix(m: &M4) -> M4 {
 fn apply_dir(m: &M4, d: [f64; 3]) -> [f64; 3] {
     let v = [0, 1, 2].map(|i| m[i][0] * d[0] + m[i][1] * d[1] + m[i][2] * d[2]);
     let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    if len > 0.0 {
-        v.map(|c| c / len)
-    } else {
-        [0.0, 1.0, 0.0]
-    }
+    if len > 0.0 { v.map(|c| c / len) } else { [0.0, 1.0, 0.0] }
 }
 
 fn det3(m: &M4) -> f64 {
-    m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+    m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
         + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
 }
 
@@ -150,11 +140,7 @@ fn num(v: &A) -> Option<f64> {
 }
 
 fn string(v: &A) -> Option<&str> {
-    if let A::String(s) = v {
-        Some(s.as_str())
-    } else {
-        None
-    }
+    if let A::String(s) = v { Some(s.as_str()) } else { None }
 }
 
 fn child_attr<'a>(node: NodeHandle<'a>, name: &str) -> Option<&'a A> {
@@ -195,13 +181,7 @@ struct Layer {
 }
 
 impl Layer {
-    fn read(
-        geom: NodeHandle<'_>,
-        element: &str,
-        values: &str,
-        index: &str,
-        width: usize,
-    ) -> Option<Self> {
+    fn read(geom: NodeHandle<'_>, element: &str, values: &str, index: &str, width: usize) -> Option<Self> {
         let el = geom
             .children_by_name(element)
             .find(|e| e.attributes().first().and_then(num).unwrap_or(0.0) == 0.0)?;
@@ -228,11 +208,7 @@ impl Layer {
             Some(ix) => usize::try_from(*ix.get(i)?).ok()?,
             None => i,
         };
-        Some((
-            i,
-            self.values
-                .get(i * self.width..i * self.width + self.width)?,
-        ))
+        Some((i, self.values.get(i * self.width..i * self.width + self.width)?))
     }
 }
 
@@ -276,9 +252,7 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets) -> Result<Mesh>
     };
     let linear = creator(Some(rootnode)).contains("Blender")
         || creator(rootnode.first_child_by_name("FBXHeaderExtension")).contains("Blender");
-    let objects_node = rootnode
-        .first_child_by_name("Objects")
-        .context("FBX has no Objects")?;
+    let objects_node = rootnode.first_child_by_name("Objects").context("FBX has no Objects")?;
     let mut objs = Objects {
         nodes: HashMap::new(),
         parents: HashMap::new(),
@@ -392,11 +366,7 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets) -> Result<Mesh>
                 .map(|c| {
                     c.iter()
                         .filter(|(id, p)| {
-                            p.is_empty()
-                                && objs
-                                    .nodes
-                                    .get(id)
-                                    .is_some_and(|(n, _)| n.name() == "Material")
+                            p.is_empty() && objs.nodes.get(id).is_some_and(|(n, _)| n.name() == "Material")
                         })
                         .map(|(id, _)| *id)
                         .collect()
@@ -407,15 +377,7 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets) -> Result<Mesh>
                 let idx = if let Some(&i) = material_index.get(mid) {
                     i
                 } else {
-                    let mat = read_material(
-                        *mid,
-                        &objs,
-                        linear,
-                        dir,
-                        assets,
-                        &mut mesh.images,
-                        &mut image_index,
-                    );
+                    let mat = read_material(*mid, &objs, linear, dir, assets, &mut mesh.images, &mut image_index);
                     mesh.materials.push(mat);
                     material_index.insert(*mid, mesh.materials.len() - 1);
                     mesh.materials.len() - 1
@@ -423,19 +385,11 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets) -> Result<Mesh>
                 local_materials.push(idx);
             }
             add_geometry(geom, &m, &local_materials, &mut mesh)?;
-            ensure!(
-                mesh.triangles() <= MAX_TRIANGLES,
-                "too many triangles to convert"
-            );
+            ensure!(mesh.triangles() <= MAX_TRIANGLES, "too many triangles to convert");
         }
     }
     ensure!(!mesh.prims.is_empty(), "FBX has no mesh geometry");
-    if mesh.materials.is_empty()
-        || mesh
-            .prims
-            .iter()
-            .any(|p| p.material >= mesh.materials.len())
-    {
+    if mesh.materials.is_empty() || mesh.prims.iter().any(|p| p.material >= mesh.materials.len()) {
         let gray = mesh.materials.len();
         mesh.materials.push(Material::plain("default", GRAY));
         for p in &mut mesh.prims {
@@ -496,11 +450,8 @@ fn world_of(id: i64, objs: &Objects<'_>, cache: &mut HashMap<i64, M4>) -> M4 {
         .parents
         .get(&id)
         .and_then(|ps| {
-            ps.iter().find(|pid| {
-                objs.nodes
-                    .get(pid)
-                    .is_some_and(|(n, _)| n.name() == "Model")
-            })
+            ps.iter()
+                .find(|pid| objs.nodes.get(pid).is_some_and(|(n, _)| n.name() == "Model"))
         })
         .copied();
     // Guard against cycles in broken files.
@@ -540,11 +491,8 @@ fn read_material(
         })
     };
     let d = to_linear(vec3(&p, "DiffuseColor", vec3(&p, "Diffuse", [0.8, 0.8, 0.8])));
-    let alpha = scalar(&p, "Opacity").unwrap_or_else(|| {
-        1.0 - scalar(&p, "TransparencyFactor")
-            .unwrap_or(0.0)
-            .clamp(0.0, 1.0)
-    });
+    let alpha =
+        scalar(&p, "Opacity").unwrap_or_else(|| 1.0 - scalar(&p, "TransparencyFactor").unwrap_or(0.0).clamp(0.0, 1.0));
     let mut mat = Material::plain(&name, [d[0], d[1], d[2], alpha.clamp(0.0, 1.0) as f32]);
     // The emissive color is a color (sRGB unless Blender's); its factor is a linear intensity.
     let factor = scalar(&p, "EmissiveFactor").unwrap_or(1.0).max(0.0) as f32;
@@ -559,8 +507,7 @@ fn read_material(
     }
     for (tex, prop) in objs.children.get(&id).cloned().unwrap_or_default() {
         let slot = prop.to_lowercase();
-        let is_color =
-            slot.contains("diffusecolor") || slot.contains("basecolor") || slot == "diffuse";
+        let is_color = slot.contains("diffusecolor") || slot.contains("basecolor") || slot == "diffuse";
         let is_normal = slot.contains("normalmap") || slot == "bump" || slot.contains("normal");
         if !is_color && !is_normal {
             continue;
@@ -617,33 +564,29 @@ type Seen = HashMap<(usize, usize, usize, usize), u32>;
 
 /// Append one geometry's triangles, transformed by `m`, split by material.
 fn add_geometry(geom: NodeHandle<'_>, m: &M4, materials: &[usize], mesh: &mut Mesh) -> Result<()> {
-    let verts = floats(child_attr(geom, "Vertices").context("mesh has no vertices")?)
-        .context("bad vertices")?;
-    let poly_index = ints(child_attr(geom, "PolygonVertexIndex").context("mesh has no polygons")?)
-        .context("bad polygons")?;
+    let verts = floats(child_attr(geom, "Vertices").context("mesh has no vertices")?).context("bad vertices")?;
+    let poly_index =
+        ints(child_attr(geom, "PolygonVertexIndex").context("mesh has no polygons")?).context("bad polygons")?;
     let normals = Layer::read(geom, "LayerElementNormal", "Normals", "NormalsIndex", 3);
     let uvs = Layer::read(geom, "LayerElementUV", "UV", "UVIndex", 2);
     let colors = Layer::read(geom, "LayerElementColor", "Colors", "ColorIndex", 4);
     let nm = normal_matrix(m);
     let mut tris = Vec::new();
     let mut corner_pos = Vec::new();
-    let mat_layer = geom
-        .children_by_name("LayerElementMaterial")
-        .next()
-        .and_then(|el| {
-            Some(Layer {
-                values: ints(child_attr(el, "Materials")?)?
-                    .into_iter()
-                    .map(|i| i as f64)
-                    .collect(),
-                index: None,
-                mapping: child_attr(el, "MappingInformationType")
-                    .and_then(string)
-                    .unwrap_or("AllSame")
-                    .to_owned(),
-                width: 1,
-            })
-        });
+    let mat_layer = geom.children_by_name("LayerElementMaterial").next().and_then(|el| {
+        Some(Layer {
+            values: ints(child_attr(el, "Materials")?)?
+                .into_iter()
+                .map(|i| i as f64)
+                .collect(),
+            index: None,
+            mapping: child_attr(el, "MappingInformationType")
+                .and_then(string)
+                .unwrap_or("AllSame")
+                .to_owned(),
+            width: 1,
+        })
+    });
     let flip = det3(m) < 0.0;
     // Per material slot: a primitive with de-duplicated vertices keyed by (control point, normal, uv).
     let mut prims: HashMap<usize, (Prim, Seen)> = HashMap::new();
@@ -657,10 +600,7 @@ fn add_geometry(geom: NodeHandle<'_>, m: &M4, materials: &[usize], mesh: &mut Me
         let corners: Vec<(usize, usize)> = (poly_start..=k)
             .map(|pv| {
                 let v = poly_index[pv];
-                (
-                    pv,
-                    usize::try_from(if v < 0 { !v } else { v }).unwrap_or(usize::MAX),
-                )
+                (pv, usize::try_from(if v < 0 { !v } else { v }).unwrap_or(usize::MAX))
             })
             .collect();
         poly_start = k + 1;
@@ -721,8 +661,7 @@ fn add_geometry(geom: NodeHandle<'_>, m: &M4, materials: &[usize], mesh: &mut Me
         triangulate(&corner_pos, &mut tris);
         for &[a, b, c] in &tris {
             let [a, b, c] = [a, b, c].map(|i| ids[i as usize]);
-            prim.indices
-                .extend(if flip { [a, c, b] } else { [a, b, c] });
+            prim.indices.extend(if flip { [a, c, b] } else { [a, b, c] });
         }
     }
     let mut keys: Vec<usize> = prims.keys().copied().collect();
@@ -761,11 +700,7 @@ mod tests {
 
     /// A Z-up, centimeter FBX (3ds Max style): one textured quad on the ground, its model raised 100 cm.
     pub(crate) fn z_up_fbx() -> Vec<u8> {
-        let mut w = Writer::new(
-            std::io::Cursor::new(Vec::new()),
-            fbxcel::low::FbxVersion::V7_4,
-        )
-        .unwrap();
+        let mut w = Writer::new(std::io::Cursor::new(Vec::new()), fbxcel::low::FbxVersion::V7_4).unwrap();
         let p = |w: &mut Writer<std::io::Cursor<Vec<u8>>>, name: &str, vals: &[A]| {
             let mut a = w.new_node("P").unwrap();
             for s in [name, name, "", "A"] {
@@ -780,15 +715,10 @@ mod tests {
             }
             w.close_node().unwrap();
         };
-        let object = |w: &mut Writer<std::io::Cursor<Vec<u8>>>,
-                      kind: &str,
-                      id: i64,
-                      name: &str,
-                      sub: &str| {
+        let object = |w: &mut Writer<std::io::Cursor<Vec<u8>>>, kind: &str, id: i64, name: &str, sub: &str| {
             let mut a = w.new_node(kind).unwrap();
             a.append_i64(id).unwrap();
-            a.append_string_direct(&format!("{name}\0\x01{kind}"))
-                .unwrap();
+            a.append_string_direct(&format!("{name}\0\x01{kind}")).unwrap();
             a.append_string_direct(sub).unwrap();
         };
         // Global settings: Z up, -Y front, X right, centimeters.
@@ -812,11 +742,8 @@ mod tests {
         object(&mut w, "Geometry", 10, "Quad", "Mesh");
         {
             let mut a = w.new_node("Vertices").unwrap();
-            a.append_arr_f64_from_iter(
-                None,
-                [0., 0., 0., 100., 0., 0., 100., 100., 0., 0., 100., 0.],
-            )
-            .unwrap();
+            a.append_arr_f64_from_iter(None, [0., 0., 0., 100., 0., 0., 100., 100., 0., 0., 100., 0.])
+                .unwrap();
         }
         w.close_node().unwrap();
         {
@@ -850,21 +777,13 @@ mod tests {
 
         object(&mut w, "Model", 20, "Floor", "Mesh");
         w.new_node("Properties70").unwrap();
-        p(
-            &mut w,
-            "Lcl Translation",
-            &[A::F64(0.0), A::F64(0.0), A::F64(100.0)],
-        );
+        p(&mut w, "Lcl Translation", &[A::F64(0.0), A::F64(0.0), A::F64(100.0)]);
         w.close_node().unwrap();
         w.close_node().unwrap();
 
         object(&mut w, "Material", 30, "Stone", "");
         w.new_node("Properties70").unwrap();
-        p(
-            &mut w,
-            "DiffuseColor",
-            &[A::F64(0.5), A::F64(0.4), A::F64(0.3)],
-        );
+        p(&mut w, "DiffuseColor", &[A::F64(0.5), A::F64(0.4), A::F64(0.3)]);
         w.close_node().unwrap();
         w.close_node().unwrap();
 
@@ -903,9 +822,7 @@ mod tests {
             w.close_node().unwrap();
         }
         w.close_node().unwrap();
-        w.finalize_and_flush(&FbxFooter::default())
-            .unwrap()
-            .into_inner()
+        w.finalize_and_flush(&FbxFooter::default()).unwrap().into_inner()
     }
 
     #[test]
@@ -922,17 +839,12 @@ mod tests {
         let xs: Vec<f32> = prim.positions.iter().map(|v| v[0]).collect();
         let zs: Vec<f32> = prim.positions.iter().map(|v| v[2]).collect();
         assert!(
-            xs.iter().any(|&x| (x - 1.0).abs() < 1e-5)
-                && zs.iter().any(|&z| (z + 1.0).abs() < 1e-5),
+            xs.iter().any(|&x| (x - 1.0).abs() < 1e-5) && zs.iter().any(|&z| (z + 1.0).abs() < 1e-5),
             "{:?}",
             prim.positions
         );
         // Ground-facing quad in Z-up faces +Y once converted.
-        assert!(
-            prim.normals.iter().all(|n| n[1] > 0.99),
-            "{:?}",
-            prim.normals
-        );
+        assert!(prim.normals.iter().all(|n| n[1] > 0.99), "{:?}", prim.normals);
         assert_eq!(prim.uvs.len(), prim.positions.len());
         assert!(
             prim.uvs.iter().any(|t| (t[1] - 1.0).abs() < 1e-6),

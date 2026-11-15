@@ -13,9 +13,7 @@ use serde_json::{Map, Value, json};
 use super::Input;
 use super::stream::{self, Blocks};
 use crate::assets::Assets;
-use crate::mesh::{
-    FastMap, MAX_TRIANGLES, Material, Mesh, Prim, smooth_normals, srgb_to_linear, triangulate,
-};
+use crate::mesh::{FastMap, MAX_TRIANGLES, Material, Mesh, Prim, smooth_normals, srgb_to_linear, triangulate};
 use crate::{Context as _, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,19 +86,15 @@ struct Element {
 
 impl Element {
     fn slot(&self, names: &[&str]) -> Option<usize> {
-        names.iter().find_map(|n| {
-            self.props
-                .iter()
-                .position(|p| p.name == *n && p.count.is_none())
-        })
+        names
+            .iter()
+            .find_map(|n| self.props.iter().position(|p| p.name == *n && p.count.is_none()))
     }
 
     fn list(&self, names: &[&str]) -> Option<usize> {
-        names.iter().find_map(|n| {
-            self.props
-                .iter()
-                .position(|p| p.name == *n && p.count.is_some())
-        })
+        names
+            .iter()
+            .find_map(|n| self.props.iter().position(|p| p.name == *n && p.count.is_some()))
     }
 }
 
@@ -261,10 +255,7 @@ fn header(data: &[u8]) -> Result<(Format, Vec<Element>, Option<String>, usize)> 
             .get(at..)
             .filter(|r| !r.is_empty())
             .context("PLY header has no end_header")?;
-        let len = rest
-            .iter()
-            .position(|&c| c == b'\n')
-            .map_or(rest.len(), |n| n + 1);
+        let len = rest.iter().position(|&c| c == b'\n').map_or(rest.len(), |n| n + 1);
         let line = rest[..len].trim_ascii();
         at += len;
         if first {
@@ -272,10 +263,7 @@ fn header(data: &[u8]) -> Result<(Format, Vec<Element>, Option<String>, usize)> 
             first = false;
             continue;
         }
-        let w: Vec<&[u8]> = line
-            .split(u8::is_ascii_whitespace)
-            .filter(|w| !w.is_empty())
-            .collect();
+        let w: Vec<&[u8]> = line.split(u8::is_ascii_whitespace).filter(|w| !w.is_empty()).collect();
         match w.as_slice() {
             [b"end_header", ..] => break,
             [b"format", f, ..] => {
@@ -319,12 +307,7 @@ fn header(data: &[u8]) -> Result<(Format, Vec<Element>, Option<String>, usize)> 
             _ => {}
         }
     }
-    Ok((
-        format.context("PLY header names no format")?,
-        elements,
-        texture,
-        at,
-    ))
+    Ok((format.context("PLY header names no format")?, elements, texture, at))
 }
 
 /// Vertex data, by vertex. Normals are unit length and texture coordinates flipped to glTF's
@@ -364,9 +347,7 @@ fn color(el: &Element, vals: &[f64], slots: &[usize; 3], alpha: Option<usize>) -
         let c = (vals[s] / el.props[s].ty.color_scale()).clamp(0.0, 1.0) as f32;
         srgb_to_linear(c)
     };
-    let a = alpha.map_or(1.0, |s| {
-        (vals[s] / el.props[s].ty.color_scale()).clamp(0.0, 1.0) as f32
-    });
+    let a = alpha.map_or(1.0, |s| (vals[s] / el.props[s].ty.color_scale()).clamp(0.0, 1.0) as f32);
     [ch(slots[0]), ch(slots[1]), ch(slots[2]), a]
 }
 
@@ -509,13 +490,7 @@ enum Kind {
 }
 
 /// Reads one element's items, a block of the file at a time.
-fn read_element(
-    blocks: &mut Blocks<'_>,
-    format: Format,
-    el: &Element,
-    has_faces: bool,
-    body: &mut Body,
-) -> Result<()> {
+fn read_element(blocks: &mut Blocks<'_>, format: Format, el: &Element, has_faces: bool, body: &mut Body) -> Result<()> {
     let kind = match el.name.as_str() {
         "vertex" => Kind::Vertex,
         "face" => Kind::Face,
@@ -544,8 +519,7 @@ fn read_element(
     }
     // Faces become triangles as they're read when their vertices are known and their corners
     // share the vertices' data.
-    let direct =
-        kind == Kind::Face && body.have_verts && plan.rgb.is_none() && plan.uv_list.is_none();
+    let direct = kind == Kind::Face && body.have_verts && plan.rgb.is_none() && plan.uv_list.is_none();
     // Sized from the first block's triangles per face once it's read.
     let mut sized = !direct;
     body.vals.resize(el.props.len(), 0.0);
@@ -588,10 +562,7 @@ fn read_element(
             // One record is longer than what's buffered.
             blocks.need(buffered * 2 + 64)?;
         }
-        ensure!(
-            body.tris.len() / 3 <= MAX_TRIANGLES,
-            "too many triangles to convert"
-        );
+        ensure!(body.tris.len() / 3 <= MAX_TRIANGLES, "too many triangles to convert");
         if !sized && done > 0 {
             sized = true;
             let est = (body.tris.len() as f64 / done as f64 * el.count as f64 * 1.01) as usize + 48;
@@ -690,8 +661,7 @@ fn face(cur: &mut Cursor, el: &Element, plan: &Plan, direct: bool, body: &mut Bo
             return Ok(());
         }
         body.pts.clear();
-        body.pts
-            .extend(idx.iter().map(|&i| body.verts.pos[i as usize]));
+        body.pts.extend(idx.iter().map(|&i| body.verts.pos[i as usize]));
         body.local.clear();
         triangulate(&body.pts, &mut body.local);
         body.tris
@@ -724,8 +694,7 @@ fn strip(cur: &mut Cursor, el: &Element, plan: &Plan, body: &mut Body) -> Got<()
     for run in body.idx.split(|&i| i == u32::MAX) {
         for k in 2..run.len() {
             let (a, b, c) = (run[k - 2], run[k - 1], run[k]);
-            body.strip_tris
-                .push(if k % 2 == 0 { [a, b, c] } else { [b, a, c] });
+            body.strip_tris.push(if k % 2 == 0 { [a, b, c] } else { [b, a, c] });
         }
     }
     Ok(())
@@ -767,11 +736,7 @@ fn build(body: Body, texture: Option<String>, path: &Path, assets: &dyn Assets) 
     let mut local: Vec<[u32; 3]> = Vec::new();
     let mut pts: Vec<[f32; 3]> = Vec::new();
     for (f, &s) in faces.starts.iter().enumerate() {
-        let end = faces
-            .starts
-            .get(f + 1)
-            .copied()
-            .unwrap_or(faces.corners.len());
+        let end = faces.starts.get(f + 1).copied().unwrap_or(faces.corners.len());
         let face = &faces.corners[s..end];
         if face.len() < 3 || face.iter().any(|&i| i as usize >= nv) {
             continue;
@@ -785,10 +750,7 @@ fn build(body: Body, texture: Option<String>, path: &Path, assets: &dyn Assets) 
             triangulate(&pts, &mut local);
             corner_tris.extend(local.iter().map(|t| t.map(|k| s + k as usize)));
         }
-        ensure!(
-            corner_tris.len() <= MAX_TRIANGLES,
-            "too many triangles to convert"
-        );
+        ensure!(corner_tris.len() <= MAX_TRIANGLES, "too many triangles to convert");
     }
     let strips: Vec<[u32; 3]> = strip_tris
         .into_iter()
@@ -818,16 +780,12 @@ fn build(body: Body, texture: Option<String>, path: &Path, assets: &dyn Assets) 
                     p.normals.push(verts.nrm[v as usize]);
                 }
                 if has_uv {
-                    p.uvs.push(
-                        uv.or_else(|| verts.uv.get(v as usize).copied())
-                            .unwrap_or([0.0, 1.0]),
-                    );
+                    p.uvs
+                        .push(uv.or_else(|| verts.uv.get(v as usize).copied()).unwrap_or([0.0, 1.0]));
                 }
                 if has_col {
-                    p.colors.push(
-                        col.or_else(|| verts.col.get(v as usize).copied())
-                            .unwrap_or([1.0; 4]),
-                    );
+                    p.colors
+                        .push(col.or_else(|| verts.col.get(v as usize).copied()).unwrap_or([1.0; 4]));
                 }
                 (p.positions.len() - 1) as u32
             })

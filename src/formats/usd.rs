@@ -79,9 +79,15 @@ pub(crate) fn load(input: Input<'_>, assets: &dyn Assets) -> Result<Option<Mesh>
     let mut xforms = geom::XformCache::new(time);
     let prims: Vec<usd::Prim> = paths.iter().filter_map(|p| stage.prim(p.clone()).ok()).collect();
     // A point instancer's prototypes show only where it places them.
-    let instancers: Vec<&usd::Prim> = prims.iter().filter(|p| kind(p).as_deref() == Some("PointInstancer")).collect();
+    let instancers: Vec<&usd::Prim> = prims
+        .iter()
+        .filter(|p| kind(p).as_deref() == Some("PointInstancer"))
+        .collect();
     for prim in &prims {
-        if instancers.iter().any(|i| within(prim.path(), i.path()) && prim.path() != i.path()) {
+        if instancers
+            .iter()
+            .any(|i| within(prim.path(), i.path()) && prim.path() != i.path())
+        {
             continue;
         }
         if !out.shown(prim) {
@@ -111,7 +117,9 @@ pub(crate) fn load(input: Input<'_>, assets: &dyn Assets) -> Result<Option<Mesh>
 fn prim_paths(stage: &usd::Stage) -> Result<Vec<sdf::Path>> {
     let mut paths = Vec::new();
     stage
-        .traverse(usd::PrimPredicate::DEFAULT.with_instance_proxies(true), |p| paths.push(p.clone()))
+        .traverse(usd::PrimPredicate::DEFAULT.with_instance_proxies(true), |p| {
+            paths.push(p.clone())
+        })
         .map_err(|e| invalid!("{e}"))?;
     Ok(paths)
 }
@@ -203,7 +211,12 @@ impl<T: Copy> Primvar<T> {
 }
 
 impl Builder<'_> {
-    fn primvar<T>(&self, api: &PrimvarsAPI, name: &str, decode: impl Fn(sdf::Value) -> Option<Vec<T>>) -> Option<Primvar<T>> {
+    fn primvar<T>(
+        &self,
+        api: &PrimvarsAPI,
+        name: &str,
+        decode: impl Fn(sdf::Value) -> Option<Vec<T>>,
+    ) -> Option<Primvar<T>> {
         let pv = api.primvar(name).ok()?;
         let values = decode(pv.attribute().get_at::<sdf::Value>(self.time).ok()??)?;
         let indices = pv.indices(self.time).ok().flatten().filter(|i| !i.is_empty());
@@ -234,7 +247,10 @@ impl Builder<'_> {
     }
 
     fn token(&self, attr: &usd::Attribute) -> Option<String> {
-        attr.get_at::<tf::Token>(self.time).ok().flatten().map(|t| t.as_str().to_owned())
+        attr.get_at::<tf::Token>(self.time)
+            .ok()
+            .flatten()
+            .map(|t| t.as_str().to_owned())
     }
 
     /// Visible, and drawn for rendering: guides and proxies stand in for the real thing.
@@ -263,24 +279,36 @@ impl Builder<'_> {
                 let r = self.number(&c.radius_attr(), 1.0);
                 let h = self.number(&c.height_attr(), 2.0);
                 let (bottom, top) = if kind(prim)?.as_str() == "Cylinder_1" {
-                    (self.number(&prim.attribute("radiusBottom"), f64::from(r)), self.number(&prim.attribute("radiusTop"), f64::from(r)))
+                    (
+                        self.number(&prim.attribute("radiusBottom"), f64::from(r)),
+                        self.number(&prim.attribute("radiusTop"), f64::from(r)),
+                    )
                 } else {
                     (r, r)
                 };
-                Some(Tess::lathe(&Tess::frustum_rows(bottom, top, h), t(&c.axis_attr()).as_deref()))
+                Some(Tess::lathe(
+                    &Tess::frustum_rows(bottom, top, h),
+                    t(&c.axis_attr()).as_deref(),
+                ))
             }
             "Cone" => {
                 let c = geom::Cone::from_prim_unchecked(prim.clone());
                 let r = self.number(&c.radius_attr(), 1.0);
                 let h = self.number(&c.height_attr(), 2.0);
-                Some(Tess::lathe(&Tess::frustum_rows(r, 0.0, h), t(&c.axis_attr()).as_deref()))
+                Some(Tess::lathe(
+                    &Tess::frustum_rows(r, 0.0, h),
+                    t(&c.axis_attr()).as_deref(),
+                ))
             }
             "Capsule" | "Capsule_1" => {
                 let c = geom::Capsule::from_prim_unchecked(prim.clone());
                 let r = self.number(&c.radius_attr(), 0.5);
                 let h = self.number(&c.height_attr(), 1.0);
                 let (bottom, top) = if kind(prim)?.as_str() == "Capsule_1" {
-                    (self.number(&prim.attribute("radiusBottom"), f64::from(r)), self.number(&prim.attribute("radiusTop"), f64::from(r)))
+                    (
+                        self.number(&prim.attribute("radiusBottom"), f64::from(r)),
+                        self.number(&prim.attribute("radiusTop"), f64::from(r)),
+                    )
                 } else {
                     (r, r)
                 };
@@ -350,7 +378,10 @@ impl Builder<'_> {
             .or_else(|| self.value(&pi.orientations_attr()))
             .and_then(quats)
             .unwrap_or_default();
-        let scales = self.value(&prim.attribute("scales")).and_then(vec3s).unwrap_or_default();
+        let scales = self
+            .value(&prim.attribute("scales"))
+            .and_then(vec3s)
+            .unwrap_or_default();
         let ids = int64s(self.value(&prim.attribute("ids")));
         let hidden = int64s(self.value(&prim.attribute("invisibleIds")));
         let world = xforms.local_to_world_transform(prim).unwrap_or_default();
@@ -418,13 +449,19 @@ impl Builder<'_> {
             let ok = n >= 3
                 && end <= corners.len()
                 && !shape.hole.get(face).copied().unwrap_or(false)
-                && corners[start..end].iter().all(|&c| usize::try_from(c).is_ok_and(|c| c < points.len()));
+                && corners[start..end]
+                    .iter()
+                    .all(|&c| usize::try_from(c).is_ok_and(|c| c < points.len()));
             if ok {
                 faces.push((face, start, n));
             }
             start = end;
         }
-        let point_normals = if shape.smooth { smooth_normals(&points, corners, &faces, flip) } else { Vec::new() };
+        let point_normals = if shape.smooth {
+            smooth_normals(&points, corners, &faces, flip)
+        } else {
+            Vec::new()
+        };
 
         let api = PrimvarsAPI::from_prim_unchecked(prim.clone());
         let display = self.primvar(&api, "displayColor", vec3s);
@@ -437,7 +474,10 @@ impl Builder<'_> {
             Some(path) => self.material(Some(path), GRAY),
             None if vertex_colors => self.material(None, [1.0; 4]),
             None => {
-                let [r, g, b] = display.as_ref().and_then(|d| d.values.first().copied()).unwrap_or([GRAY[0], GRAY[1], GRAY[2]]);
+                let [r, g, b] = display
+                    .as_ref()
+                    .and_then(|d| d.values.first().copied())
+                    .unwrap_or([GRAY[0], GRAY[1], GRAY[2]]);
                 let a = opacity.as_ref().and_then(|o| o.values.first().copied()).unwrap_or(1.0);
                 self.material(None, [r, g, b, a.clamp(0.0, 1.0)])
             }
@@ -469,7 +509,10 @@ impl Builder<'_> {
         let mut tris = Vec::new();
         let mut poly = Vec::new();
         for &(face, start, n) in &faces {
-            ensure!(self.mesh.triangles() + n - 2 <= MAX_TRIANGLES, "too many triangles to preview");
+            ensure!(
+                self.mesh.triangles() + n - 2 <= MAX_TRIANGLES,
+                "too many triangles to preview"
+            );
             poly.clear();
             poly.extend(corners[start..start + n].iter().map(|&c| points[c as usize]));
             let flat = (shape.normals.is_none() && !shape.smooth).then(|| polygon_normal(&poly, flip));
@@ -572,7 +615,11 @@ impl Builder<'_> {
                 _ => None,
             })
             .unwrap_or(false);
-        let metallic = if specular_workflow { 0.0 } else { ps.metallic.value().copied().unwrap_or(0.0) };
+        let metallic = if specular_workflow {
+            0.0
+        } else {
+            ps.metallic.value().copied().unwrap_or(0.0)
+        };
         let emissive = ps.emissive_color.value().map_or([0.0; 3], |c| [c.x, c.y, c.z]);
         let color_image = ps.diffuse_color.texture().and_then(|t| self.image(t));
         let normal_image = ps.normal.texture().and_then(|t| self.image(t));
@@ -682,9 +729,18 @@ impl Tess {
     fn plane(width: f32, length: f32, axis: Option<&str>) -> Shape {
         let (w, l) = (width / 2.0, length / 2.0);
         let (corners, n): ([[f32; 3]; 4], [f32; 3]) = match axis {
-            Some("X") => ([[0.0, -l, -w], [0.0, l, -w], [0.0, l, w], [0.0, -l, w]], [1.0, 0.0, 0.0]),
-            Some("Y") => ([[-w, 0.0, -l], [-w, 0.0, l], [w, 0.0, l], [w, 0.0, -l]], [0.0, 1.0, 0.0]),
-            _ => ([[-w, -l, 0.0], [w, -l, 0.0], [w, l, 0.0], [-w, l, 0.0]], [0.0, 0.0, 1.0]),
+            Some("X") => (
+                [[0.0, -l, -w], [0.0, l, -w], [0.0, l, w], [0.0, -l, w]],
+                [1.0, 0.0, 0.0],
+            ),
+            Some("Y") => (
+                [[-w, 0.0, -l], [-w, 0.0, l], [w, 0.0, l], [w, 0.0, -l]],
+                [0.0, 1.0, 0.0],
+            ),
+            _ => (
+                [[-w, -l, 0.0], [w, -l, 0.0], [w, l, 0.0], [-w, l, 0.0]],
+                [0.0, 0.0, 1.0],
+            ),
         };
         let mut t = Self::default();
         t.face(&corners.map(|p| (p, n)));
@@ -764,12 +820,28 @@ fn bound(prim: &usd::Prim) -> Option<sdf::Path> {
 /// row vectors compose.
 fn instance_matrix(s: [f32; 3], q: [f32; 4], t: [f32; 3]) -> gf::Matrix4d {
     let len = q.iter().map(|c| f64::from(*c).powi(2)).sum::<f64>().sqrt();
-    let [w, x, y, z] = if len > 0.0 { q.map(|c| f64::from(c) / len) } else { [1.0, 0.0, 0.0, 0.0] };
+    let [w, x, y, z] = if len > 0.0 {
+        q.map(|c| f64::from(c) / len)
+    } else {
+        [1.0, 0.0, 0.0, 0.0]
+    };
     // The rotation for column vectors; row vectors take its transpose.
     let r = [
-        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z), 2.0 * (x * z + w * y)],
-        [2.0 * (x * y + w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - w * x)],
-        [2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y)],
+        [
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - w * z),
+            2.0 * (x * z + w * y),
+        ],
+        [
+            2.0 * (x * y + w * z),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - w * x),
+        ],
+        [
+            2.0 * (x * z - w * y),
+            2.0 * (y * z + w * x),
+            1.0 - 2.0 * (x * x + y * y),
+        ],
     ];
     let mut m = gf::Matrix4d::IDENTITY;
     for row in 0..3 {
@@ -790,8 +862,15 @@ fn smooth_normals(points: &[[f32; 3]], corners: &[i32], faces: &[(usize, usize, 
             let (p, c, nx) = (ix[(k + n - 1) % n] as usize, ix[k] as usize, ix[(k + 1) % n] as usize);
             let at = |i: usize| points[i].map(f64::from);
             let (a, b, o) = (at(nx), at(p), at(c));
-            let (u, v) = ([a[0] - o[0], a[1] - o[1], a[2] - o[2]], [b[0] - o[0], b[1] - o[1], b[2] - o[2]]);
-            let x = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+            let (u, v) = (
+                [a[0] - o[0], a[1] - o[1], a[2] - o[2]],
+                [b[0] - o[0], b[1] - o[1], b[2] - o[2]],
+            );
+            let x = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
             for (s, d) in acc[c].iter_mut().zip(x) {
                 *s += d;
             }
@@ -815,14 +894,21 @@ fn polygon_normal(poly: &[[f32; 3]], flip: bool) -> [f32; 3] {
 fn unit(n: [f64; 3], flip: bool) -> [f32; 3] {
     let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
     let s = if flip { -1.0 } else { 1.0 };
-    if len > 0.0 { n.map(|x| (s * x / len) as f32) } else { [0.0, 1.0, 0.0] }
+    if len > 0.0 {
+        n.map(|x| (s * x / len) as f32)
+    } else {
+        [0.0, 1.0, 0.0]
+    }
 }
 
 fn vec3s(v: sdf::Value) -> Option<Vec<[f32; 3]>> {
     Some(match v {
         sdf::Value::Vec3fVec(v) => v.into_iter().map(|p| [p.x, p.y, p.z]).collect(),
         sdf::Value::Vec3dVec(v) => v.into_iter().map(|p| [p.x as f32, p.y as f32, p.z as f32]).collect(),
-        sdf::Value::Vec3hVec(v) => v.into_iter().map(|p| [p.x.to_f32(), p.y.to_f32(), p.z.to_f32()]).collect(),
+        sdf::Value::Vec3hVec(v) => v
+            .into_iter()
+            .map(|p| [p.x.to_f32(), p.y.to_f32(), p.z.to_f32()])
+            .collect(),
         sdf::Value::Vec3f(p) => vec![[p.x, p.y, p.z]],
         sdf::Value::Vec3d(p) => vec![[p.x as f32, p.y as f32, p.z as f32]],
         _ => return None,
@@ -852,7 +938,10 @@ fn floats(v: sdf::Value) -> Option<Vec<f32>> {
 /// Quaternions as (w, x, y, z).
 fn quats(v: sdf::Value) -> Option<Vec<[f32; 4]>> {
     Some(match v {
-        sdf::Value::QuathVec(v) => v.into_iter().map(|q| [q.w.to_f32(), q.x.to_f32(), q.y.to_f32(), q.z.to_f32()]).collect(),
+        sdf::Value::QuathVec(v) => v
+            .into_iter()
+            .map(|q| [q.w.to_f32(), q.x.to_f32(), q.y.to_f32(), q.z.to_f32()])
+            .collect(),
         sdf::Value::QuatfVec(v) => v.into_iter().map(|q| [q.w, q.x, q.y, q.z]).collect(),
         _ => return None,
     })
@@ -909,10 +998,7 @@ struct Usdz<'a>(zip::ZipArchive<Box<dyn super::ReadSeek + 'a>>);
 
 impl<'a> Usdz<'a> {
     fn open(input: Input<'a>) -> Option<Self> {
-        let is_usdz = input
-            .path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("usdz"));
+        let is_usdz = input.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("usdz"));
         let stream = input.seekable().ok().filter(|_| is_usdz)?;
         zip::ZipArchive::new(stream).ok().map(Self)
     }
@@ -926,16 +1012,11 @@ impl<'a> Usdz<'a> {
             .filter_map(Result::ok)
             .map(std::borrow::Cow::into_owned)
             .collect();
-        let entry = names
-            .iter()
-            .find(|n| n.eq_ignore_ascii_case(reference))
-            .or_else(|| {
-                names.iter().find(|n| {
-                    n.rsplit('/')
-                        .next()
-                        .is_some_and(|f| f.to_lowercase() == name)
-                })
-            })?;
+        let entry = names.iter().find(|n| n.eq_ignore_ascii_case(reference)).or_else(|| {
+            names
+                .iter()
+                .find(|n| n.rsplit('/').next().is_some_and(|f| f.to_lowercase() == name))
+        })?;
         let mut f = self.0.by_name(entry).ok()?;
         let mut bytes = Vec::new();
         f.read_to_end(&mut bytes).ok()?;
@@ -952,13 +1033,12 @@ const FETCH_ROUNDS: usize = 32;
 fn open_in_memory(bytes: &[u8], input: Input<'_>, assets: &dyn Assets) -> Result<(usd::Stage, Vec<sdf::Path>)> {
     let mut root = memory_key(&input.path.to_string_lossy());
     let ext = input.path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if !["usd", "usda", "usdc", "usdz"].iter().any(|e| ext.eq_ignore_ascii_case(e)) {
+    if !["usd", "usda", "usdc", "usdz"]
+        .iter()
+        .any(|e| ext.eq_ignore_ascii_case(e))
+    {
         // The format is read from the name: a model named without its extension is given one.
-        root.push_str(if bytes.starts_with(b"PK") {
-            ".usdz"
-        } else {
-            ".usd"
-        });
+        root.push_str(if bytes.starts_with(b"PK") { ".usdz" } else { ".usd" });
     }
     let mut files = HashMap::new();
     files.insert(root.clone(), Arc::<[u8]>::from(bytes));
@@ -1060,9 +1140,7 @@ impl ar::Resolver for MemResolver {
             return None;
         }
         let found = match ar::split_package_relative_path_outer(asset_path) {
-            Some((package, inner)) => {
-                self.has(&package) && openusd::usdz::package_contains(self, &package, &inner)
-            }
+            Some((package, inner)) => self.has(&package) && openusd::usdz::package_contains(self, &package, &inner),
             None => self.has(asset_path),
         };
         found.then(|| ar::ResolvedPath::new(asset_path))
@@ -1078,7 +1156,12 @@ impl ar::Resolver for MemResolver {
             Some((package, inner)) => openusd::usdz::package_entry(self, &package, &inner)?,
             None => match self.files.get(path.as_ref()) {
                 Some(b) => ar::AssetBuffer::from(Arc::clone(b)),
-                None => return Err(io::Error::new(io::ErrorKind::NotFound, format!("{path} isn't among the assets"))),
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("{path} isn't among the assets"),
+                    ));
+                }
             },
         };
         Ok(Box::new(io::Cursor::new(bytes)))
@@ -1100,8 +1183,7 @@ impl ar::Resolver for MemResolver {
 /// The determinant of the matrix's rotation and scale: negative when it mirrors.
 fn det3(m: &gf::Matrix4d) -> f64 {
     let a = &m.0;
-    a[0] * (a[5] * a[10] - a[6] * a[9]) - a[1] * (a[4] * a[10] - a[6] * a[8])
-        + a[2] * (a[4] * a[9] - a[5] * a[8])
+    a[0] * (a[5] * a[10] - a[6] * a[9]) - a[1] * (a[4] * a[10] - a[6] * a[8]) + a[2] * (a[4] * a[9] - a[5] * a[8])
 }
 
 /// The cofactors of the matrix's rotation and scale, which carry normals as the inverse transpose does (up to a
@@ -1192,15 +1274,8 @@ def Xform "World"
         assert_eq!(prim.positions[1], [11.0, 0.0, 0.0]);
         assert_eq!(prim.positions[2], [11.0, 0.0, -1.0]);
         let n = prim.normals[0];
-        assert!(
-            (n[1] - 1.0).abs() < 1e-5,
-            "the +Z face normal points up: {n:?}"
-        );
-        assert_eq!(
-            prim.uvs[2],
-            [1.0, 0.0],
-            "V flipped to glTF's top-left origin"
-        );
+        assert!((n[1] - 1.0).abs() < 1e-5, "the +Z face normal points up: {n:?}");
+        assert_eq!(prim.uvs[2], [1.0, 0.0], "V flipped to glTF's top-left origin");
         let m = &mesh.materials[prim.material];
         assert_eq!(m.name, "Red");
         assert!((m.color[0] - 0.8).abs() < 1e-6 && (m.color[1] - 0.1).abs() < 1e-6);
@@ -1238,10 +1313,7 @@ def Material \"Planks\"
         let mesh = load(Input::file(&path), &crate::assets::Folder::new(dir.path()))
             .unwrap()
             .unwrap();
-        assert_eq!(
-            mesh.materials[mesh.prims[0].material].color,
-            [0.0, 0.5, 1.0, 1.0]
-        );
+        assert_eq!(mesh.materials[mesh.prims[0].material].color, [0.0, 0.5, 1.0, 1.0]);
         // Default units are centimeters.
         assert_eq!(mesh.prims[0].positions[1], [0.01, 0.0, 0.0]);
     }

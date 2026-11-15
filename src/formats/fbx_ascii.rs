@@ -21,10 +21,7 @@ pub fn is_ascii(data: &[u8]) -> bool {
 /// Rewrite an ASCII FBX file as binary FBX 7.4.
 pub fn to_binary(data: &[u8]) -> Result<Vec<u8>> {
     let text = std::str::from_utf8(data)
-        .map_or_else(
-            |_| String::from_utf8_lossy(data).into_owned(),
-            str::to_owned,
-        )
+        .map_or_else(|_| String::from_utf8_lossy(data).into_owned(), str::to_owned)
         .trim_start_matches('\u{feff}')
         .to_owned();
     if let Some(v) = text
@@ -45,11 +42,8 @@ pub fn to_binary(data: &[u8]) -> Result<Vec<u8>> {
         line: 1,
         peeked: None,
     };
-    let mut w = Writer::new(
-        std::io::Cursor::new(Vec::new()),
-        fbxcel::low::FbxVersion::V7_4,
-    )
-    .map_err(|e| invalid!("{e}"))?;
+    let mut w =
+        Writer::new(std::io::Cursor::new(Vec::new()), fbxcel::low::FbxVersion::V7_4).map_err(|e| invalid!("{e}"))?;
     while let Some(tok) = lex.next()? {
         let Tok::Name(name) = tok else {
             bail!("line {}: expected a node name", lex.line)
@@ -125,8 +119,7 @@ impl<'a> Lexer<'a> {
             b',' => Tok::Comma,
             b'*' => Tok::Star,
             b'"' => {
-                let end = memchr(b'"', &b[self.i..])
-                    .with_context(|| format!("line {}: unclosed string", self.line))?;
+                let end = memchr(b'"', &b[self.i..]).with_context(|| format!("line {}: unclosed string", self.line))?;
                 let s = &self.src[self.i..self.i + end];
                 self.line += s.matches('\n').count();
                 self.i += end + 1;
@@ -142,9 +135,7 @@ impl<'a> Lexer<'a> {
                 Tok::Num(&self.src[start..self.i])
             }
             c if c.is_ascii_alphabetic() || c == b'_' => {
-                while self.i < b.len()
-                    && (b[self.i].is_ascii_alphanumeric()
-                        || matches!(b[self.i], b'_' | b'|' | b'-'))
+                while self.i < b.len() && (b[self.i].is_ascii_alphanumeric() || matches!(b[self.i], b'_' | b'|' | b'-'))
                 {
                     self.i += 1;
                 }
@@ -202,12 +193,7 @@ fn object_name(s: &str) -> String {
 }
 
 /// One node: its values, then its children if it has a block. `parent` decides how ids are typed.
-fn node<'a>(
-    lex: &mut Lexer<'a>,
-    w: &mut Writer<std::io::Cursor<Vec<u8>>>,
-    name: &'a str,
-    parent: &str,
-) -> Result<()> {
+fn node<'a>(lex: &mut Lexer<'a>, w: &mut Writer<std::io::Cursor<Vec<u8>>>, name: &'a str, parent: &str) -> Result<()> {
     let mut vals: Vec<Val<'a>> = Vec::new();
     let mut block = false;
     loop {
@@ -304,10 +290,9 @@ fn property_type(declared: &str) -> Ty {
         | "UInteger"
         | "ULong" => Ty::I32,
         "KTime" | "ULongLong" | "LongLong" => Ty::I64,
-        "double" | "Number" | "Vector3D" | "Vector" | "Vector4D" | "ColorRGB" | "Color"
-        | "ColorAndAlpha" | "ColorRGBA" | "Lcl Translation" | "Lcl Rotation" | "Lcl Scaling"
-        | "Visibility" | "FieldOfView" | "FieldOfViewX" | "FieldOfViewY" | "Float" | "Real"
-        | "Distance" | "Opacity" => Ty::F64,
+        "double" | "Number" | "Vector3D" | "Vector" | "Vector4D" | "ColorRGB" | "Color" | "ColorAndAlpha"
+        | "ColorRGBA" | "Lcl Translation" | "Lcl Rotation" | "Lcl Scaling" | "Visibility" | "FieldOfView"
+        | "FieldOfViewX" | "FieldOfViewY" | "Float" | "Real" | "Distance" | "Opacity" => Ty::F64,
         _ => Ty::Auto,
     }
 }
@@ -315,22 +300,16 @@ fn property_type(declared: &str) -> Ty {
 /// An array node's element type, as binary FBX always stores it. Anything else is doubles.
 fn array_type(name: &str) -> Ty {
     match name {
-        "PolygonVertexIndex" | "Edges" | "UVIndex" | "NormalsIndex" | "NormalIndex"
-        | "BinormalsIndex" | "BinormalIndex" | "TangentsIndex" | "TangentIndex" | "ColorIndex"
-        | "Materials" | "Smoothing" | "Indexes" | "KeyAttrFlags" | "KeyAttrRefCount"
-        | "TextureId" | "PolygonGroup" | "VertexCreaseIndex" => Ty::I32,
+        "PolygonVertexIndex" | "Edges" | "UVIndex" | "NormalsIndex" | "NormalIndex" | "BinormalsIndex"
+        | "BinormalIndex" | "TangentsIndex" | "TangentIndex" | "ColorIndex" | "Materials" | "Smoothing" | "Indexes"
+        | "KeyAttrFlags" | "KeyAttrRefCount" | "TextureId" | "PolygonGroup" | "VertexCreaseIndex" => Ty::I32,
         "KeyTime" => Ty::I64,
         "KeyValueFloat" | "KeyAttrDataFloat" => Ty::F32,
         _ => Ty::F64,
     }
 }
 
-fn write_node(
-    w: &mut Writer<std::io::Cursor<Vec<u8>>>,
-    name: &str,
-    parent: &str,
-    vals: Vec<Val<'_>>,
-) -> Result<()> {
+fn write_node(w: &mut Writer<std::io::Cursor<Vec<u8>>>, name: &str, parent: &str, vals: Vec<Val<'_>>) -> Result<()> {
     let err = |e: fbxcel::writer::v7400::binary::Error| invalid!("{e}");
     let declared = if name == "P" {
         match vals.get(1) {
@@ -466,19 +445,13 @@ Connections:  {
             .unwrap()
             .first_child_by_name("SceneInfo")
             .unwrap();
-        assert_eq!(
-            info.attributes()[0],
-            A::String("GlobalInfo\0\x01SceneInfo".into())
-        );
+        assert_eq!(info.attributes()[0], A::String("GlobalInfo\0\x01SceneInfo".into()));
         let p70 = root
             .first_child_by_name("GlobalSettings")
             .unwrap()
             .first_child_by_name("Properties70")
             .unwrap();
-        let props: Vec<_> = p70
-            .children_by_name("P")
-            .map(|p| p.attributes()[4].clone())
-            .collect();
+        let props: Vec<_> = p70.children_by_name("P").map(|p| p.attributes()[4].clone()).collect();
         assert_eq!(props, [A::I32(1), A::F64(100.0), A::I64(479_181_389_250)]);
 
         let objects = root.first_child_by_name("Objects").unwrap();
@@ -504,10 +477,7 @@ Connections:  {
             .unwrap()
             .first_child_by_name("P")
             .unwrap();
-        assert_eq!(
-            &t.attributes()[4..],
-            [A::F64(0.0), A::F64(0.0), A::F64(150.0)]
-        );
+        assert_eq!(&t.attributes()[4..], [A::F64(0.0), A::F64(0.0), A::F64(150.0)]);
         assert_eq!(
             model.first_child_by_name("Shading").unwrap().attributes()[0],
             A::Bool(true)
@@ -524,14 +494,7 @@ Connections:  {
             .children()
             .map(|c| c.attributes().to_vec())
             .collect();
-        assert_eq!(
-            c[0],
-            [
-                A::String("OO".into()),
-                A::I64(2_295_830_373_648),
-                A::I64(20)
-            ]
-        );
+        assert_eq!(c[0], [A::String("OO".into()), A::I64(2_295_830_373_648), A::I64(20)]);
     }
 
     #[test]

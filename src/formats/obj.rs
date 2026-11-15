@@ -13,9 +13,7 @@ use super::stream;
 
 use crate::Result;
 use crate::assets::Assets;
-use crate::mesh::{
-    MAX_TRIANGLES, Material, Mesh, Prim, smooth_normals, srgb_to_linear, triangulate,
-};
+use crate::mesh::{MAX_TRIANGLES, Material, Mesh, Prim, smooth_normals, srgb_to_linear, triangulate};
 
 /// Marks a corner without a texture coordinate or normal.
 const NONE: u32 = u32::MAX;
@@ -75,10 +73,7 @@ fn for_each_line(data: &[u8], mut f: impl FnMut(&[u8])) {
 /// A line's first word and the rest, trimmed.
 fn split_key(line: &[u8]) -> (&[u8], &[u8]) {
     let line = line.trim_ascii_start();
-    let end = line
-        .iter()
-        .position(u8::is_ascii_whitespace)
-        .unwrap_or(line.len());
+    let end = line.iter().position(u8::is_ascii_whitespace).unwrap_or(line.len());
     (&line[..end], trim(&line[end..]))
 }
 
@@ -124,8 +119,9 @@ fn map_file(rest: &[u8]) -> Option<String> {
     while rest.first() == Some(&b'-') {
         let (opt, after) = split_key(rest);
         let args = match opt.to_ascii_lowercase().as_slice() {
-            b"-blendu" | b"-blendv" | b"-bm" | b"-boost" | b"-cc" | b"-clamp" | b"-imfchan"
-            | b"-texres" | b"-type" => 1,
+            b"-blendu" | b"-blendv" | b"-bm" | b"-boost" | b"-cc" | b"-clamp" | b"-imfchan" | b"-texres" | b"-type" => {
+                1
+            }
             b"-mm" => 2,
             // One to three numbers.
             b"-o" | b"-s" | b"-t" => 3,
@@ -183,10 +179,7 @@ fn read_libraries(libs: &[String], dir: &Path, assets: &dyn Assets) -> HashMap<S
     for lib in libs {
         let found = match assets.find(lib, dir) {
             Some(p) => vec![p],
-            None => lib
-                .split_whitespace()
-                .filter_map(|w| assets.find(w, dir))
-                .collect(),
+            None => lib.split_whitespace().filter_map(|w| assets.find(w, dir)).collect(),
         };
         for p in found {
             if let Some(data) = assets.read(&p) {
@@ -204,9 +197,7 @@ fn statements(d: &[u8]) -> Option<usize> {
     loop {
         let i = d[..end].iter().rposition(|&b| b == b'\n')?;
         let line = &d[..i];
-        let kept = line
-            .iter()
-            .rposition(|&b| !matches!(b, b' ' | b'\t' | b'\r' | b'\x0c'));
+        let kept = line.iter().rposition(|&b| !matches!(b, b' ' | b'\t' | b'\r' | b'\x0c'));
         if kept.is_none_or(|k| line[k] != b'\\') {
             return Some(i + 1);
         }
@@ -313,10 +304,7 @@ impl Reader {
     #[inline]
     fn line(&mut self, line: &[u8], at: usize, size: usize) {
         let line = line.trim_ascii_start();
-        let end = line
-            .iter()
-            .position(|&b| stream::space(b))
-            .unwrap_or(line.len());
+        let end = line.iter().position(|&b| stream::space(b)).unwrap_or(line.len());
         let (key, rest) = (&line[..end], &line[end..]);
         match key {
             b"v" => {
@@ -343,11 +331,8 @@ impl Reader {
                 let (f, n) = nums::<3>(rest);
                 if n == 3 {
                     let len = (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt();
-                    self.vn.push(if len > 0.0 {
-                        f.map(|c| c / len)
-                    } else {
-                        [0.0, 1.0, 0.0]
-                    });
+                    self.vn
+                        .push(if len > 0.0 { f.map(|c| c / len) } else { [0.0, 1.0, 0.0] });
                 }
             }
             b"mtllib" => self.libs.push(text(trim(rest))),
@@ -580,19 +565,13 @@ pub(crate) fn obj(input: Input<'_>, assets: &dyn Assets) -> Result<Mesh> {
             }
         }
         read += chunk.len();
-        ensure!(
-            r.triangles <= MAX_TRIANGLES,
-            "too many triangles to convert"
-        );
+        ensure!(r.triangles <= MAX_TRIANGLES, "too many triangles to convert");
     }
     if !joined.is_empty() {
         r.line(&joined, read, size);
     }
     ensure!(r.triangles > 0, "OBJ has no faces");
-    ensure!(
-        r.triangles <= MAX_TRIANGLES,
-        "too many triangles to convert"
-    );
+    ensure!(r.triangles <= MAX_TRIANGLES, "too many triangles to convert");
 
     let (colors, libs, groups) = (
         std::mem::take(&mut r.colors),
@@ -634,9 +613,9 @@ pub(crate) fn obj(input: Input<'_>, assets: &dyn Assets) -> Result<Mesh> {
             mat.emissive = e.emissive.unwrap_or([0.0; 3]);
             mat.metallic = e.metallic.unwrap_or(0.0);
             // Blender's reading of the specular exponent when there's no roughness.
-            if let Some(r) = e.roughness.or(e
-                .shininess
-                .map(|ns| 1.0 - (ns.clamp(0.0, 1000.0) / 1000.0).sqrt()))
+            if let Some(r) = e
+                .roughness
+                .or(e.shininess.map(|ns| 1.0 - (ns.clamp(0.0, 1000.0) / 1000.0).sqrt()))
             {
                 mat.roughness = r;
             }

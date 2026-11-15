@@ -57,10 +57,7 @@ pub fn pack_glb(gltf: &[u8], mut fetch: impl FnMut(&str) -> Result<Vec<u8>>) -> 
 
 /// [`pack_glb`] and [`decompress`] in one pass: a `.gltf` (or GLB) and the files it names to a
 /// plain GLB with every image embedded. Meshopt fallback buffers are never fetched.
-pub fn pack_glb_decompressed(
-    gltf: &[u8],
-    mut fetch: impl FnMut(&str) -> Result<Vec<u8>>,
-) -> Result<Vec<u8>> {
+pub fn pack_glb_decompressed(gltf: &[u8], mut fetch: impl FnMut(&str) -> Result<Vec<u8>>) -> Result<Vec<u8>> {
     Doc::parse(gltf)?.decompress(&mut fetch, true)
 }
 
@@ -175,29 +172,18 @@ impl<'a> Doc<'a> {
     }
 
     fn list(&self, key: &str) -> &[Value] {
-        self.json
-            .get(key)
-            .and_then(Value::as_array)
-            .map_or(&[], Vec::as_slice)
+        self.json.get(key).and_then(Value::as_array).map_or(&[], Vec::as_slice)
     }
 
     fn uses_meshopt(&self) -> bool {
         self.list("extensionsUsed")
             .iter()
             .any(|e| e.as_str().is_some_and(|e| MESHOPT_EXTENSIONS.contains(&e)))
-            || self
-                .list("bufferViews")
-                .iter()
-                .any(|v| meshopt_of(v).is_some())
+            || self.list("bufferViews").iter().any(|v| meshopt_of(v).is_some())
     }
 
     /// Buffer `i`'s bytes. `lenient` makes a fallback buffer that can't be had a placeholder.
-    fn buffer(
-        &self,
-        i: usize,
-        fetch: &mut dyn FnMut(&str) -> Result<Vec<u8>>,
-        lenient: bool,
-    ) -> Result<Data<'a>> {
+    fn buffer(&self, i: usize, fetch: &mut dyn FnMut(&str) -> Result<Vec<u8>>, lenient: bool) -> Result<Data<'a>> {
         let b = self
             .list("buffers")
             .get(i)
@@ -224,11 +210,7 @@ impl<'a> Doc<'a> {
     }
 
     /// Every buffer view's data, decoded, into one binary chunk.
-    fn decompress(
-        mut self,
-        fetch: &mut dyn FnMut(&str) -> Result<Vec<u8>>,
-        embed_images: bool,
-    ) -> Result<Vec<u8>> {
+    fn decompress(mut self, fetch: &mut dyn FnMut(&str) -> Result<Vec<u8>>, embed_images: bool) -> Result<Vec<u8>> {
         let views = self.list("bufferViews");
         // Only the buffers something reads from: fallbacks are skipped.
         let mut needed = vec![false; self.list("buffers").len()];
@@ -239,8 +221,7 @@ impl<'a> Doc<'a> {
             };
             let b = buffer
                 .and_then(Value::as_u64)
-                .with_context(|| format!("buffer view {i} has no buffer"))?
-                as usize;
+                .with_context(|| format!("buffer view {i} has no buffer"))? as usize;
             *needed
                 .get_mut(b)
                 .with_context(|| format!("buffer view {i} names missing buffer {b}"))? = true;
@@ -272,19 +253,12 @@ impl<'a> Doc<'a> {
                         get_usize(ext, "byteLength")?,
                     )
                     .with_context(|| format!("buffer view {i}: {name} data out of range"))?;
-                    ensure!(
-                        len / 1024 <= src.len(),
-                        "buffer view {i}: {name} data is truncated"
-                    );
+                    ensure!(len / 1024 <= src.len(), "buffer view {i}: {name} data is truncated");
                 }
                 None => {
-                    let b = get_usize(
-                        v.as_object().context("buffer view is not an object")?,
-                        "buffer",
-                    )?;
+                    let b = get_usize(v.as_object().context("buffer view is not an object")?, "buffer")?;
                     let off = v.get("byteOffset").and_then(Value::as_u64).unwrap_or(0) as usize;
-                    slice(bytes(b)?, off, len)
-                        .with_context(|| format!("buffer view {i} out of range"))?;
+                    slice(bytes(b)?, off, len).with_context(|| format!("buffer view {i} out of range"))?;
                 }
             }
             total = total.saturating_add(len.next_multiple_of(4));
@@ -304,16 +278,11 @@ impl<'a> Doc<'a> {
                     )
                     .with_context(|| format!("buffer view {i}: {name} data out of range"))?;
                     bin.resize(at + len, 0);
-                    decode_view(ext, src, &mut bin[at..])
-                        .with_context(|| format!("buffer view {i}"))?;
+                    decode_view(ext, src, &mut bin[at..]).with_context(|| format!("buffer view {i}"))?;
                 }
                 None => {
                     let src = slice(
-                        bytes(
-                            v.get("buffer")
-                                .and_then(Value::as_u64)
-                                .context("missing buffer")? as usize,
-                        )?,
+                        bytes(v.get("buffer").and_then(Value::as_u64).context("missing buffer")? as usize)?,
                         v.get("byteOffset").and_then(Value::as_u64).unwrap_or(0) as usize,
                         len,
                     )
@@ -325,10 +294,7 @@ impl<'a> Doc<'a> {
         }
         drop(data);
 
-        let views = self
-            .json
-            .get_mut("bufferViews")
-            .and_then(Value::as_array_mut);
+        let views = self.json.get_mut("bufferViews").and_then(Value::as_array_mut);
         for (v, at) in views.into_iter().flatten().zip(placed) {
             let v = v.as_object_mut().context("buffer view is not an object")?;
             v.insert("buffer".into(), json!(0));
@@ -365,10 +331,7 @@ impl<'a> Doc<'a> {
             }
         }
         let mut required = Vec::new();
-        let views = self
-            .json
-            .get_mut("bufferViews")
-            .and_then(Value::as_array_mut);
+        let views = self.json.get_mut("bufferViews").and_then(Value::as_array_mut);
         for (i, v) in views.into_iter().flatten().enumerate() {
             let v = v.as_object_mut().context("buffer view is not an object")?;
             let (vb, _) = rehome(v, &home).with_context(|| format!("buffer view {i}"))?;
@@ -379,10 +342,7 @@ impl<'a> Doc<'a> {
                 }
                 let ext = ext.as_object_mut().context("bad meshopt extension")?;
                 let (b, _) = rehome(ext, &home).with_context(|| format!("buffer view {i}"))?;
-                ensure!(
-                    b == 0,
-                    "buffer view {i}: compressed data is in a missing buffer"
-                );
+                ensure!(b == 0, "buffer view {i}: compressed data is in a missing buffer");
                 if vb != 0 {
                     required.push(name.clone());
                 }
@@ -408,10 +368,7 @@ impl<'a> Doc<'a> {
             let len = view_len(v)?;
             let off = v.get("byteOffset").and_then(Value::as_u64).unwrap_or(0) as usize;
             let src = slice(bin, off, len).with_context(|| format!("buffer view {i}"))?;
-            let mut v = v
-                .as_object()
-                .cloned()
-                .context("buffer view is not an object")?;
+            let mut v = v.as_object().cloned().context("buffer view is not an object")?;
             pad4(&mut out);
             let at = out.len();
             match plan {
@@ -472,8 +429,7 @@ impl<'a> Doc<'a> {
             }));
             require_extension(&mut self.json, MESHOPT_EXTENSIONS[0]);
         }
-        self.json
-            .insert("bufferViews".into(), Value::Array(new_views));
+        self.json.insert("bufferViews".into(), Value::Array(new_views));
         self.finish(out, placeholders)
     }
 
@@ -512,10 +468,7 @@ fn plan_compression(doc: &Doc) -> Result<Vec<Plan>> {
     let views = doc.list("bufferViews");
     let mut role = vec![Use::None; accessors.len()];
     let mut mark = |a: Option<&Value>, u: Use| {
-        if let Some(r) = a
-            .and_then(Value::as_u64)
-            .and_then(|a| role.get_mut(a as usize))
-        {
+        if let Some(r) = a.and_then(Value::as_u64).and_then(|a| role.get_mut(a as usize)) {
             *r = match (*r, u) {
                 (Use::None, u) => u,
                 (Use::Index(s, t), Use::Index(_, t2)) => Use::Index(s, t && t2),
@@ -525,17 +478,11 @@ fn plan_compression(doc: &Doc) -> Result<Vec<Plan>> {
         }
     };
     for m in doc.list("meshes") {
-        for p in m
-            .get("primitives")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
+        for p in m.get("primitives").and_then(Value::as_array).into_iter().flatten() {
             let triangles = p.get("mode").and_then(Value::as_u64).unwrap_or(4) == 4;
             mark(p.get("indices"), Use::Index(0, triangles));
             let targets = p.get("targets").and_then(Value::as_array);
-            let sets =
-                std::iter::once(p.get("attributes")).chain(targets.into_iter().flatten().map(Some));
+            let sets = std::iter::once(p.get("attributes")).chain(targets.into_iter().flatten().map(Some));
             for set in sets.flatten().filter_map(Value::as_object) {
                 for a in set.values() {
                     mark(Some(a), Use::Vertex(0));
@@ -546,11 +493,7 @@ fn plan_compression(doc: &Doc) -> Result<Vec<Plan>> {
     let mut plans: Vec<Option<Use>> = vec![None; views.len()];
     for (a, acc) in accessors.iter().enumerate() {
         let sparse = acc.get("sparse").is_some();
-        let Some(v) = acc
-            .get("bufferView")
-            .and_then(Value::as_u64)
-            .map(|v| v as usize)
-        else {
+        let Some(v) = acc.get("bufferView").and_then(Value::as_u64).map(|v| v as usize) else {
             continue;
         };
         let Some(slot) = plans.get_mut(v) else {
@@ -572,9 +515,7 @@ fn plan_compression(doc: &Doc) -> Result<Vec<Plan>> {
             (None, u) => u,
             (Some(Use::Index(s, t)), Use::Index(s2, t2)) if s == s2 => Use::Index(s, t && t2),
             (Some(Use::Vertex(s)), Use::Vertex(s2)) if s == s2 => Use::Vertex(s),
-            (Some(Use::Vertex(_)), Use::Vertex(_)) if views[v].get("byteStride").is_some() => {
-                Use::Vertex(0)
-            }
+            (Some(Use::Vertex(_)), Use::Vertex(_)) if views[v].get("byteStride").is_some() => Use::Vertex(0),
             _ => Use::Other,
         });
     }
@@ -598,10 +539,7 @@ fn plan_compression(doc: &Doc) -> Result<Vec<Plan>> {
         .zip(plans)
         .map(|(v, u)| {
             let len = view_len(v)?;
-            let stride = v
-                .get("byteStride")
-                .and_then(Value::as_u64)
-                .map(|s| s as usize);
+            let stride = v.get("byteStride").and_then(Value::as_u64).map(|s| s as usize);
             Ok(match u {
                 Some(Use::Index(s, tri)) if stride.is_none() && len.is_multiple_of(s) => {
                     let tri = tri && len.is_multiple_of(3 * s);
@@ -611,12 +549,10 @@ fn plan_compression(doc: &Doc) -> Result<Vec<Plan>> {
                     }
                 }
                 Some(Use::Vertex(s)) => match stride.unwrap_or(s) {
-                    s if s > 0 && s <= 256 && s.is_multiple_of(4) && len.is_multiple_of(s) => {
-                        Plan::Encode {
-                            mode: "ATTRIBUTES",
-                            stride: s,
-                        }
-                    }
+                    s if s > 0 && s <= 256 && s.is_multiple_of(4) && len.is_multiple_of(s) => Plan::Encode {
+                        mode: "ATTRIBUTES",
+                        stride: s,
+                    },
                     _ => Plan::Keep,
                 },
                 _ => Plan::Keep,
@@ -696,10 +632,7 @@ fn embed_images_into(
     fetch: &mut dyn FnMut(&str) -> Result<Vec<u8>>,
 ) -> Result<()> {
     let mut new_views = Vec::new();
-    let first = json
-        .get("bufferViews")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
+    let first = json.get("bufferViews").and_then(Value::as_array).map_or(0, Vec::len);
     let images = json.get_mut("images").and_then(Value::as_array_mut);
     for (i, img) in images.into_iter().flatten().enumerate() {
         let Some(img) = img.as_object_mut() else {
@@ -717,11 +650,7 @@ fn embed_images_into(
         };
         let mime = sniff_mime(&bytes)
             .map(str::to_owned)
-            .or_else(|| {
-                img.get("mimeType")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
+            .or_else(|| img.get("mimeType").and_then(Value::as_str).map(str::to_owned))
             .or(declared)
             .with_context(|| format!("image {i}: unknown image format"))?;
         pad4(bin);
@@ -856,11 +785,7 @@ pub(crate) fn data_uri(uri: &str) -> Result<(Option<String>, Vec<u8>)> {
         Some(m) => (m, true),
         None => (head, false),
     };
-    let mime = mime
-        .split(';')
-        .next()
-        .filter(|m| !m.is_empty())
-        .map(str::to_owned);
+    let mime = mime.split(';').next().filter(|m| !m.is_empty()).map(str::to_owned);
     let bytes = if base64 {
         decode_base64(payload)?
     } else {
@@ -901,10 +826,7 @@ fn percent_decode_bytes(s: &str) -> Vec<u8> {
     while i < b.len() {
         let hex = |c: u8| (c as char).to_digit(16);
         if b[i] == b'%'
-            && let (Some(h), Some(l)) = (
-                b.get(i + 1).and_then(|&c| hex(c)),
-                b.get(i + 2).and_then(|&c| hex(c)),
-            )
+            && let (Some(h), Some(l)) = (b.get(i + 1).and_then(|&c| hex(c)), b.get(i + 2).and_then(|&c| hex(c)))
         {
             out.push((h * 16 + l) as u8);
             i += 3;
@@ -928,21 +850,7 @@ fn sniff_mime(b: &[u8]) -> Option<&'static str> {
     Some(match b {
         [0x89, b'P', b'N', b'G', ..] => "image/png",
         [0xff, 0xd8, 0xff, ..] => "image/jpeg",
-        [
-            b'R',
-            b'I',
-            b'F',
-            b'F',
-            _,
-            _,
-            _,
-            _,
-            b'W',
-            b'E',
-            b'B',
-            b'P',
-            ..,
-        ] => "image/webp",
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "image/webp",
         [0xab, b'K', b'T', b'X', b' ', b'2', b'0', 0xbb, ..] => "image/ktx2",
         _ => return None,
     })
@@ -980,8 +888,7 @@ mod tests {
         for y in 0..n {
             for x in 0..n {
                 let a = y * (n + 1) + x;
-                prim.indices
-                    .extend([a, a + n + 1, a + 1, a + 1, a + n + 1, a + n + 2]);
+                prim.indices.extend([a, a + n + 1, a + 1, a + 1, a + n + 1, a + n + 2]);
             }
         }
         let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
@@ -1062,12 +969,7 @@ mod tests {
     fn compress_then_decompress_roundtrips() {
         let plain = grid_glb(40);
         let packed = compress(&plain).unwrap();
-        assert!(
-            packed.len() * 2 < plain.len(),
-            "{} vs {}",
-            packed.len(),
-            plain.len()
-        );
+        assert!(packed.len() * 2 < plain.len(), "{} vs {}", packed.len(), plain.len());
         let j = json_of(&packed);
         assert_eq!(j["extensionsRequired"], json!(["EXT_meshopt_compression"]));
         assert_eq!(j["buffers"].as_array().unwrap().len(), 2);
@@ -1079,15 +981,9 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|v| {
-                v.pointer("/extensions/EXT_meshopt_compression/mode")?
-                    .as_str()
-            })
+            .filter_map(|v| v.pointer("/extensions/EXT_meshopt_compression/mode")?.as_str())
             .collect();
-        assert_eq!(
-            modes,
-            ["ATTRIBUTES", "ATTRIBUTES", "TRIANGLES", "ATTRIBUTES"]
-        );
+        assert_eq!(modes, ["ATTRIBUTES", "ATTRIBUTES", "TRIANGLES", "ATTRIBUTES"]);
         // A plain glTF reader refuses the compressed file and takes the decompressed one.
         assert!(::gltf::Gltf::from_slice(&packed).is_err());
         let back = decompress(&packed).unwrap();
@@ -1192,10 +1088,7 @@ mod tests {
         let packed = compress(&grid_glb(5)).unwrap();
         let doc = Doc::parse(&packed).unwrap();
         let mut j = doc.json.clone();
-        let uri = format!(
-            "data:application/octet-stream;base64,{}",
-            base64(doc.bin.unwrap())
-        );
+        let uri = format!("data:application/octet-stream;base64,{}", base64(doc.bin.unwrap()));
         j["buffers"][0]["uri"] = json!(uri);
         let back = decompress(&serde_json::to_vec(&j).unwrap()).unwrap();
         same_data(&decompress(&packed).unwrap(), &back);
@@ -1206,10 +1099,9 @@ mod tests {
     #[test]
     fn khr_v1_stream_decodes() {
         let stream: &[u8] = &[
-            0xa1, 0xee, 0xaa, 0xee, 0x00, 0x4b, 0x4b, 0x4b, 0x00, 0x00, 0x4b, 0x00, 0x00, 0x7d,
-            0x7d, 0x7d, 0x00, 0x00, 0x7d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62,
-            0x00, 0x62,
+            0xa1, 0xee, 0xaa, 0xee, 0x00, 0x4b, 0x4b, 0x4b, 0x00, 0x00, 0x4b, 0x00, 0x00, 0x7d, 0x7d, 0x7d, 0x00, 0x00,
+            0x7d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0x00, 0x62,
         ];
         let j = json!({
             "asset": { "version": "2.0" },
@@ -1232,10 +1124,7 @@ mod tests {
         let d = Doc::parse(&back).unwrap();
         // Quantization stays.
         assert_eq!(d.json["extensionsUsed"], json!(["KHR_mesh_quantization"]));
-        assert_eq!(
-            d.json["extensionsRequired"],
-            json!(["KHR_mesh_quantization"])
-        );
+        assert_eq!(d.json["extensionsRequired"], json!(["KHR_mesh_quantization"]));
         assert_eq!(d.json["buffers"], json!([{ "byteLength": 48 }]));
         let mut want = Vec::new();
         for (p, t) in [

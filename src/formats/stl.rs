@@ -33,8 +33,7 @@ pub(crate) fn stl(input: Input<'_>) -> Result<Mesh> {
                 let mut again = input.blocks()?;
                 again.need(84)?;
                 again.consume(84);
-                binary(again, n, Colors::VisCam)?
-                    .ok_or_else(|| invalid!("STL changed while being read"))
+                binary(again, n, Colors::VisCam)?.ok_or_else(|| invalid!("STL changed while being read"))
             }
             None => bail!("STL changed while being read"),
         };
@@ -89,11 +88,7 @@ fn magics(header: &[u8; 80]) -> Option<Colors> {
         .windows(6)
         .position(|w| w == b"COLOR=")
         .filter(|at| at + 10 <= 80)?;
-    Some(Colors::Magics([
-        header[at + 6],
-        header[at + 7],
-        header[at + 8],
-    ]))
+    Some(Colors::Magics([header[at + 6], header[at + 7], header[at + 8]]))
 }
 
 impl Colors {
@@ -161,8 +156,7 @@ fn binary(mut blocks: Blocks<'_>, n: usize, colors: Colors) -> Result<Option<Mes
             let [r, g, b] = c.map(|v| srgb_to_linear(f32::from(v) / 255.0));
             [r, g, b, 1.0]
         });
-        mesh.materials
-            .push(Material::plain(&format!("color_{i}"), color));
+        mesh.materials.push(Material::plain(&format!("color_{i}"), color));
     }
     Ok(Some(mesh))
 }
@@ -230,10 +224,7 @@ fn ascii(mut blocks: Blocks<'_>) -> Result<Mesh> {
                         corner = 0;
                         if finite(&tri) {
                             w.push(tri);
-                            ensure!(
-                                w.triangles() <= MAX_TRIANGLES,
-                                "too many triangles to convert"
-                            );
+                            ensure!(w.triangles() <= MAX_TRIANGLES, "too many triangles to convert");
                         }
                     }
                 }

@@ -57,11 +57,7 @@ impl<'a> Blocks<'a> {
     /// The buffered bytes, consumed or not.
     #[inline]
     fn view(&self) -> &[u8] {
-        if self.source.is_some() {
-            &self.buf
-        } else {
-            self.slice
-        }
+        if self.source.is_some() { &self.buf } else { self.slice }
     }
 
     /// The unconsumed bytes, after reading as much as fits. Empty only at the end of the file.
@@ -241,8 +237,8 @@ fn decimal(s: &[u8]) -> Option<(bool, u64, i32)> {
 
 const POW10_F32: [f32; 11] = [1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10];
 const POW10_F64: [f64; 23] = [
-    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
-    1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20,
+    1e21, 1e22,
 ];
 
 /// `s` as an `f32`, rounded exactly as `str::parse` rounds it. Short decimals (up to seven
@@ -334,11 +330,7 @@ mod tests {
             );
             let want64 = s.parse::<f64>().ok();
             let got64 = f64_from(s.as_bytes());
-            assert_eq!(
-                got64.map(f64::to_bits),
-                want64.map(f64::to_bits),
-                "f64 {s:?}"
-            );
+            assert_eq!(got64.map(f64::to_bits), want64.map(f64::to_bits), "f64 {s:?}");
         }
         // Every short decimal the fast path takes, against the standard parser.
         let mut x: u32 = 1;

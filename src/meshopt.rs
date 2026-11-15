@@ -111,9 +111,7 @@ const BITS_V1: [[u8; 4]; 2] = [[0, 1, 2, 4], [1, 2, 4, 8]];
 /// Decodes mode 0 into `count` elements of `stride` bytes. Reads both attribute codec versions:
 /// 0 (`EXT_meshopt_compression`, header `0xa0`) and 1 (`KHR_meshopt_compression`, `0xa1`).
 pub fn decode_vertex_buffer(src: &[u8], count: usize, stride: usize) -> Result<Vec<u8>> {
-    let size = count
-        .checked_mul(stride)
-        .ok_or_else(|| bad("attribute count"))?;
+    let size = count.checked_mul(stride).ok_or_else(|| bad("attribute count"))?;
     // A block of at most 256 elements costs at least a quarter byte per element byte, so a
     // stream can't hold more than 1024 times its size: refuse before allocating.
     if size / 1024 > src.len() {
@@ -126,8 +124,7 @@ pub fn decode_vertex_buffer(src: &[u8], count: usize, stride: usize) -> Result<V
 
 /// Decodes mode 0 into `out`, whole elements of `stride` bytes, without allocating.
 pub fn decode_vertex_buffer_into(src: &[u8], out: &mut [u8], stride: usize) -> Result<()> {
-    if stride == 0 || stride > 256 || !stride.is_multiple_of(4) || !out.len().is_multiple_of(stride)
-    {
+    if stride == 0 || stride > 256 || !stride.is_multiple_of(4) || !out.len().is_multiple_of(stride) {
         return Err(bad("attribute stride"));
     }
     let count = out.len() / stride;
@@ -182,11 +179,7 @@ pub fn decode_vertex_buffer_into(src: &[u8], out: &mut [u8], stride: usize) -> R
                     }
                     2 => plane[..n].fill(0),
                     _ => {
-                        let bits = if v1 {
-                            &BITS_V1[ctrl as usize]
-                        } else {
-                            &BITS_V0
-                        };
+                        let bits = if v1 { &BITS_V1[ctrl as usize] } else { &BITS_V0 };
                         let header = pos;
                         pos += groups.div_ceil(4);
                         if pos > end {
@@ -235,12 +228,7 @@ pub fn decode_vertex_buffer_into(src: &[u8], out: &mut [u8], stride: usize) -> R
                     let rot = u32::from(channel >> 4);
                     let mut p = u32::from_le_bytes([prev[0], prev[1], prev[2], prev[3]]);
                     for (i, row) in rows.enumerate() {
-                        let v = u32::from_le_bytes([
-                            planes[0][i],
-                            planes[1][i],
-                            planes[2][i],
-                            planes[3][i],
-                        ]);
+                        let v = u32::from_le_bytes([planes[0][i], planes[1][i], planes[2][i], planes[3][i]]);
                         p ^= v.rotate_right(rot);
                         row[k..k + 4].copy_from_slice(&p.to_le_bytes());
                     }
@@ -279,11 +267,7 @@ fn decode_group(src: &[u8], mut pos: usize, end: usize, bits: u8, d: &mut [u8]) 
             for (i, x) in d.iter_mut().enumerate() {
                 let byte = src[pos + i / per];
                 // 1-bit groups run least significant bit first, wider ones most significant.
-                let shift = if bits == 1 {
-                    i % 8
-                } else {
-                    8 - bits * (i % per + 1)
-                };
+                let shift = if bits == 1 { i % 8 } else { 8 - bits * (i % per + 1) };
                 *x = (byte >> shift) & sentinel;
             }
             pos += packed;
@@ -627,16 +611,8 @@ pub fn encode_oct8(n: [f32; 3], w: f32) -> [u8; 4] {
     let s = if l == 0.0 { 0.0 } else { 1.0 / l };
     let (x, y, z) = (n[0] * s, n[1] * s, n[2] * s);
     let sign = |v: f32| if v >= 0.0 { 1.0 } else { -1.0 };
-    let u = if z >= 0.0 {
-        x
-    } else {
-        (1.0 - y.abs()) * sign(x)
-    };
-    let v = if z >= 0.0 {
-        y
-    } else {
-        (1.0 - x.abs()) * sign(y)
-    };
+    let u = if z >= 0.0 { x } else { (1.0 - y.abs()) * sign(x) };
+    let v = if z >= 0.0 { y } else { (1.0 - x.abs()) * sign(y) };
     [snorm(u, 8), snorm(v, 8), snorm(1.0, 8), snorm(w, 8)].map(|c| c as i8 as u8)
 }
 
@@ -646,10 +622,7 @@ pub fn apply_filter(filter: &str, data: &mut [u8], stride: usize) -> Result<()> 
         "NONE" => {}
         "OCTAHEDRAL" if stride == 4 => {
             for e in data.chunks_exact_mut(4) {
-                let [x, y, z] = octahedral(
-                    [e[0] as i8 as f32, e[1] as i8 as f32, e[2] as i8 as f32],
-                    127.0,
-                );
+                let [x, y, z] = octahedral([e[0] as i8 as f32, e[1] as i8 as f32, e[2] as i8 as f32], 127.0);
                 e[..3].copy_from_slice(&[x as i8 as u8, y as i8 as u8, z as i8 as u8]);
             }
         }
@@ -691,15 +664,7 @@ pub fn apply_filter(filter: &str, data: &mut [u8], stride: usize) -> Result<()> 
         }
         "COLOR" if stride == 4 => {
             for e in data.chunks_exact_mut(4) {
-                let rgba = ycocg(
-                    [
-                        e[0].into(),
-                        e[1] as i8 as i32,
-                        e[2] as i8 as i32,
-                        e[3].into(),
-                    ],
-                    255.0,
-                );
+                let rgba = ycocg([e[0].into(), e[1] as i8 as i32, e[2] as i8 as i32, e[3].into()], 255.0);
                 for (o, v) in e.iter_mut().zip(rgba) {
                     *o = v as u8;
                 }
@@ -709,12 +674,7 @@ pub fn apply_filter(filter: &str, data: &mut [u8], stride: usize) -> Result<()> 
             for e in data.chunks_exact_mut(8) {
                 let c = |i: usize| u16::from_le_bytes([e[2 * i], e[2 * i + 1]]);
                 let rgba = ycocg(
-                    [
-                        c(0).into(),
-                        c(1) as i16 as i32,
-                        c(2) as i16 as i32,
-                        c(3).into(),
-                    ],
+                    [c(0).into(), c(1) as i16 as i32, c(2) as i16 as i32, c(3).into()],
                     65535.0,
                 );
                 for (i, v) in rgba.into_iter().enumerate() {
@@ -766,15 +726,7 @@ mod tests {
     #[test]
     fn attributes_roundtrip() {
         let mut r = Pcg32::new(3);
-        for (count, stride) in [
-            (0, 4),
-            (1, 4),
-            (17, 8),
-            (300, 12),
-            (1000, 16),
-            (40, 256),
-            (700, 64),
-        ] {
+        for (count, stride) in [(0, 4), (1, 4), (17, 8), (300, 12), (1000, 16), (40, 256), (700, 64)] {
             // Smooth data with occasional jumps exercises every group mode.
             let mut data = vec![0u8; count * stride];
             for i in 1..count {
@@ -810,8 +762,7 @@ mod tests {
             }
         }
         let mut r = Pcg32::new(9);
-        let mut shuffled: Vec<[u32; 3]> =
-            grid.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+        let mut shuffled: Vec<[u32; 3]> = grid.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
         for i in (1..shuffled.len()).rev() {
             shuffled.swap(i, r.below(i as u32 + 1) as usize);
         }
@@ -830,10 +781,7 @@ mod tests {
                     .collect()
             };
             let enc = encode_index_buffer(idx);
-            assert_eq!(
-                canon(&decode_index_buffer(&enc, idx.len()).unwrap()),
-                canon(idx)
-            );
+            assert_eq!(canon(&decode_index_buffer(&enc, idx.len()).unwrap()), canon(idx));
         }
         // Ordered input costs about a byte per triangle.
         assert!(encode_index_buffer(&grid).len() < grid.len() / 3 * 3 / 2);
@@ -844,15 +792,9 @@ mod tests {
     fn spec_group_example() {
         let src = [0x17, 0x5f, 0xf0, 0xbc, 0x77, 0xa9, 0x21, 0x00, 0x34, 0xb5];
         let mut d = [0u8; 16];
-        assert_eq!(
-            decode_group(&src, 0, src.len(), 4, &mut d).unwrap(),
-            src.len()
-        );
+        assert_eq!(decode_group(&src, 0, src.len(), 4, &mut d).unwrap(), src.len());
         let got: Vec<i8> = d.iter().map(|&x| unzigzag8(x) as i8).collect();
-        assert_eq!(
-            got,
-            [-1, -4, -3, 26, -91, 0, -6, 6, -4, -4, 5, -5, 1, -1, 0, 0]
-        );
+        assert_eq!(got, [-1, -4, -3, 26, -91, 0, -6, 6, -4, -4, 5, -5, 1, -1, 0, 0]);
     }
 
     #[test]
@@ -889,29 +831,24 @@ mod tests {
     #[test]
     fn reference_vertex_streams() {
         let v0: &[u8] = &[
-            0xa0, 0x01, 0x3f, 0x00, 0x00, 0x00, 0x58, 0x57, 0x58, 0x01, 0x26, 0x00, 0x00, 0x00,
-            0x01, 0x0c, 0x00, 0x00, 0x00, 0x58, 0x01, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x01, 0x3f, 0x00, 0x00, 0x00, 0x17, 0x18, 0x17, 0x01, 0x26, 0x00, 0x00, 0x00,
-            0x01, 0x0c, 0x00, 0x00, 0x00, 0x17, 0x01, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00,
+            0xa0, 0x01, 0x3f, 0x00, 0x00, 0x00, 0x58, 0x57, 0x58, 0x01, 0x26, 0x00, 0x00, 0x00, 0x01, 0x0c, 0x00, 0x00,
+            0x00, 0x58, 0x01, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x3f, 0x00, 0x00, 0x00, 0x17, 0x18,
+            0x17, 0x01, 0x26, 0x00, 0x00, 0x00, 0x01, 0x0c, 0x00, 0x00, 0x00, 0x17, 0x01, 0x08, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         let v1: &[u8] = &[
-            0xa1, 0xee, 0xaa, 0xee, 0x00, 0x4b, 0x4b, 0x4b, 0x00, 0x00, 0x4b, 0x00, 0x00, 0x7d,
-            0x7d, 0x7d, 0x00, 0x00, 0x7d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62,
-            0x00, 0x62,
+            0xa1, 0xee, 0xaa, 0xee, 0x00, 0x4b, 0x4b, 0x4b, 0x00, 0x00, 0x4b, 0x00, 0x00, 0x7d, 0x7d, 0x7d, 0x00, 0x00,
+            0x7d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0x00, 0x62,
         ];
         let v1_custom: &[u8] = &[
-            0xa1, 0xd4, 0x94, 0xd4, 0x01, 0x0e, 0x00, 0x58, 0x57, 0x58, 0x02, 0x02, 0x12, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x58, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x7d, 0x7d, 0x7d,
-            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x01, 0x62,
+            0xa1, 0xd4, 0x94, 0xd4, 0x01, 0x0e, 0x00, 0x58, 0x57, 0x58, 0x02, 0x02, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x03, 0x00, 0x00, 0x58, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x02, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x7d, 0x7d, 0x7d, 0x01, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x7d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x62,
         ];
         let want = pv_bytes();
         for (name, src) in [("v0", v0), ("v1", v1), ("v1 custom", v1_custom)] {
@@ -931,23 +868,19 @@ mod tests {
     #[test]
     fn reference_vertex_deltas() {
         let want: [u16; 64] = [
-            248, 248, 240, 240, 249, 250, 243, 244, 250, 252, 246, 248, 251, 254, 249, 252, 252,
-            256, 252, 256, 253, 258, 255, 260, 254, 260, 258, 264, 255, 262, 261, 268, 256, 264,
-            264, 272, 257, 262, 267, 268, 258, 260, 270, 264, 259, 258, 273, 260, 260, 256, 276,
-            256, 261, 254, 279, 252, 262, 252, 282, 248, 263, 250, 285, 244,
+            248, 248, 240, 240, 249, 250, 243, 244, 250, 252, 246, 248, 251, 254, 249, 252, 252, 256, 252, 256, 253,
+            258, 255, 260, 254, 260, 258, 264, 255, 262, 261, 268, 256, 264, 264, 272, 257, 262, 267, 268, 258, 260,
+            270, 264, 259, 258, 273, 260, 260, 256, 276, 256, 261, 254, 279, 252, 262, 252, 282, 248, 263, 250, 285,
+            244,
         ];
         let src: &[u8] = &[
-            0xa1, 0x99, 0x99, 0x01, 0x2a, 0xaa, 0xaa, 0xaa, 0x02, 0x04, 0x44, 0x44, 0x44, 0x43,
-            0x33, 0x33, 0x33, 0x02, 0x06, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x02, 0x08,
-            0x88, 0x88, 0x88, 0x87, 0x77, 0x77, 0x77, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x00, 0xf8, 0x00, 0xf0, 0x00, 0xf0,
-            0x00, 0x01, 0x01,
+            0xa1, 0x99, 0x99, 0x01, 0x2a, 0xaa, 0xaa, 0xaa, 0x02, 0x04, 0x44, 0x44, 0x44, 0x43, 0x33, 0x33, 0x33, 0x02,
+            0x06, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x02, 0x08, 0x88, 0x88, 0x88, 0x87, 0x77, 0x77, 0x77, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x00, 0xf8, 0x00, 0xf0,
+            0x00, 0xf0, 0x00, 0x01, 0x01,
         ];
         let got = decode_vertex_buffer(src, 16, 8).unwrap();
-        let got: Vec<u16> = got
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
+        let got: Vec<u16> = got.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         assert_eq!(got, want);
     }
 
@@ -961,20 +894,16 @@ mod tests {
             [0.4, 0.4, 0.4, 0.75],
         ];
         let mut c8 = vec![
-            0x40, 0x7f, 0xc1, 0xff, 0x7f, 0x00, 0x7f, 0xc0, 0x40, 0x81, 0xc0, 0xa0, 0x66, 0x00,
-            0x00, 0xdf,
+            0x40, 0x7f, 0xc1, 0xff, 0x7f, 0x00, 0x7f, 0xc0, 0x40, 0x81, 0xc0, 0xa0, 0x66, 0x00, 0x00, 0xdf,
         ];
         apply_filter("COLOR", &mut c8, 4).unwrap();
         for (i, &v) in c8.iter().enumerate() {
-            assert!(
-                (f32::from(v) / 255.0 - want[i / 4][i % 4]).abs() < 1e-2,
-                "{i}: {v}"
-            );
+            assert!((f32::from(v) / 255.0 - want[i / 4][i % 4]).abs() < 1e-2, "{i}: {v}");
         }
         assert!(c8[12] == c8[13] && c8[13] == c8[14]);
         let c12: [u16; 16] = [
-            0x0400, 0x07ff, 0xfc01, 0x0fff, 0x07ff, 0x0000, 0x07ff, 0x0c00, 0x0400, 0xf801, 0xfc00,
-            0x0a00, 0x0666, 0x0000, 0x0000, 0x0dff,
+            0x0400, 0x07ff, 0xfc01, 0x0fff, 0x07ff, 0x0000, 0x07ff, 0x0c00, 0x0400, 0xf801, 0xfc00, 0x0a00, 0x0666,
+            0x0000, 0x0000, 0x0dff,
         ];
         let mut b: Vec<u8> = c12.iter().flat_map(|v| v.to_le_bytes()).collect();
         apply_filter("COLOR", &mut b, 8).unwrap();

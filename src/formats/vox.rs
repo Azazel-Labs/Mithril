@@ -60,7 +60,10 @@ struct Xform {
 }
 
 impl Xform {
-    const IDENTITY: Xform = Xform { r: [[1, 0, 0], [0, 1, 0], [0, 0, 1]], t: [0; 3] };
+    const IDENTITY: Xform = Xform {
+        r: [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+        t: [0; 3],
+    };
 
     fn rotate(&self, v: [i32; 3]) -> [i32; 3] {
         std::array::from_fn(|i| self.r[i][0] * v[0] + self.r[i][1] * v[1] + self.r[i][2] * v[2])
@@ -68,17 +71,17 @@ impl Xform {
 
     /// `self` applied after `local`.
     fn then(&self, local: &Xform) -> Xform {
-        let r = std::array::from_fn(|i| {
-            std::array::from_fn(|j| (0..3).map(|k| self.r[i][k] * local.r[k][j]).sum())
-        });
+        let r = std::array::from_fn(|i| std::array::from_fn(|j| (0..3).map(|k| self.r[i][k] * local.r[k][j]).sum()));
         let lt = self.rotate(local.t);
-        Xform { r, t: std::array::from_fn(|i| lt[i] + self.t[i]) }
+        Xform {
+            r,
+            t: std::array::from_fn(|i| lt[i] + self.t[i]),
+        }
     }
 
     fn mirrors(&self) -> bool {
         let r = &self.r;
-        let det = r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1])
-            - r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0])
+        let det = r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1]) - r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0])
             + r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0]);
         det < 0
     }
@@ -101,9 +104,18 @@ impl Xform {
 }
 
 enum Node {
-    Transform { child: u32, layer: i32, hidden: bool, xform: Xform },
-    Group { children: Vec<u32> },
-    Shape { models: Vec<u32> },
+    Transform {
+        child: u32,
+        layer: i32,
+        hidden: bool,
+        xform: Xform,
+    },
+    Group {
+        children: Vec<u32>,
+    },
+    Shape {
+        models: Vec<u32>,
+    },
 }
 
 #[derive(Default, Clone, Copy)]
@@ -132,7 +144,10 @@ impl Body<'_> {
 
     fn string(&mut self) -> Result<&str> {
         let n = self.u32()? as usize;
-        let s = self.b.get(self.at..self.at.saturating_add(n)).context("VOX chunk ends early")?;
+        let s = self
+            .b
+            .get(self.at..self.at.saturating_add(n))
+            .context("VOX chunk ends early")?;
         self.at += n;
         Ok(std::str::from_utf8(s).unwrap_or(""))
     }
@@ -154,7 +169,9 @@ impl Body<'_> {
 pub(crate) fn vox(data: &[u8]) -> Result<(Option<Mesh>, Map<String, Value>)> {
     ensure!(data.len() >= 20 && &data[..4] == b"VOX ", "not a MagicaVoxel file");
     let le = |at: usize| -> Result<u32> {
-        Ok(u32::from_le_bytes(data.get(at..at + 4).context("VOX ends early")?.try_into()?))
+        Ok(u32::from_le_bytes(
+            data.get(at..at + 4).context("VOX ends early")?.try_into()?,
+        ))
     };
     ensure!(&data[8..12] == b"MAIN", "VOX file has no MAIN chunk");
     let mut models: Vec<Model> = Vec::new();
@@ -182,7 +199,10 @@ pub(crate) fn vox(data: &[u8]) -> Result<(Option<Mesh>, Map<String, Value>)> {
                 ensure!(total <= MAX_VOXELS, "too many voxels to convert ({total})");
                 let raw = body.get(4..4 + n * 4).context("VOX voxels end early")?;
                 let size = size.take().context("VOX voxels without a SIZE")?;
-                models.push(Model { size, voxels: raw.as_chunks::<4>().0.to_vec() });
+                models.push(Model {
+                    size,
+                    voxels: raw.as_chunks::<4>().0.to_vec(),
+                });
             }
             b"RGBA" => {
                 // Entry i is color index i + 1.
@@ -214,13 +234,24 @@ pub(crate) fn vox(data: &[u8]) -> Result<(Option<Mesh>, Map<String, Value>)> {
                     }
                 }
                 let hidden = attrs.get("_hidden").is_some_and(|h| h == "1");
-                nodes.insert(id, Node::Transform { child, layer, hidden, xform });
+                nodes.insert(
+                    id,
+                    Node::Transform {
+                        child,
+                        layer,
+                        hidden,
+                        xform,
+                    },
+                );
             }
             b"nGRP" => {
                 let id = b.u32()?;
                 b.dict()?;
                 let n = b.u32()?;
-                ensure!(n as usize <= body.len() / 4, "VOX group lists more children than it holds");
+                ensure!(
+                    n as usize <= body.len() / 4,
+                    "VOX group lists more children than it holds"
+                );
                 let children = (0..n).map(|_| b.u32()).collect::<Result<_>>()?;
                 nodes.insert(id, Node::Group { children });
             }
@@ -228,7 +259,10 @@ pub(crate) fn vox(data: &[u8]) -> Result<(Option<Mesh>, Map<String, Value>)> {
                 let id = b.u32()?;
                 b.dict()?;
                 let n = b.u32()?;
-                ensure!(n as usize <= body.len() / 4, "VOX shape lists more models than it holds");
+                ensure!(
+                    n as usize <= body.len() / 4,
+                    "VOX shape lists more models than it holds"
+                );
                 let mut ms = Vec::new();
                 for _ in 0..n {
                     ms.push(b.u32()?);
@@ -248,11 +282,22 @@ pub(crate) fn vox(data: &[u8]) -> Result<(Option<Mesh>, Map<String, Value>)> {
                 let f = |k: &str| d.get(k).and_then(|v| v.parse::<f32>().ok());
                 let ty = d.get("_type").map_or("_diffuse", String::as_str);
                 if let Ok(index) = u8::try_from(id) {
-                    matl.insert(index, Matl {
-                        metal: if ty == "_metal" { f("_metal").unwrap_or(0.0) } else { 0.0 },
-                        rough: (ty == "_metal").then(|| f("_rough")).flatten(),
-                        emit: if ty == "_emit" { f("_emit").unwrap_or(0.0) * (1.0 + f("_flux").unwrap_or(0.0)) } else { 0.0 },
-                    });
+                    matl.insert(
+                        index,
+                        Matl {
+                            metal: if ty == "_metal" {
+                                f("_metal").unwrap_or(0.0)
+                            } else {
+                                0.0
+                            },
+                            rough: (ty == "_metal").then(|| f("_rough")).flatten(),
+                            emit: if ty == "_emit" {
+                                f("_emit").unwrap_or(0.0) * (1.0 + f("_flux").unwrap_or(0.0))
+                            } else {
+                                0.0
+                            },
+                        },
+                    );
                 }
             }
             _ => {}
@@ -268,7 +313,12 @@ pub(crate) fn vox(data: &[u8]) -> Result<(Option<Mesh>, Map<String, Value>)> {
         while let Some((id, parent, depth)) = stack.pop() {
             ensure!(depth < 64, "VOX scene graph too deep");
             match nodes.get(&id) {
-                Some(Node::Transform { child, layer, hidden, xform }) => {
+                Some(Node::Transform {
+                    child,
+                    layer,
+                    hidden,
+                    xform,
+                }) => {
                     if !*hidden && !hidden_layers.contains(layer) {
                         stack.push((*child, parent.then(xform), depth + 1));
                     }
@@ -299,7 +349,10 @@ pub(crate) fn vox(data: &[u8]) -> Result<(Option<Mesh>, Map<String, Value>)> {
     prims.sort_by_key(|(c, _)| *c);
 
     let mut facts = Map::new();
-    facts.insert("voxels".into(), json!(placed.iter().map(|&(m, ..)| models[m].voxels.len()).sum::<usize>()));
+    facts.insert(
+        "voxels".into(),
+        json!(placed.iter().map(|&(m, ..)| models[m].voxels.len()).sum::<usize>()),
+    );
     let s = models[0].size;
     facts.insert("voxel_size".into(), json!(format!("{}x{}x{}", s[0], s[1], s[2])));
     if models.len() > 1 {
@@ -360,7 +413,11 @@ fn mesh_model(model: &Model, xform: &Xform, centred: bool, prims: &mut HashMap<u
         let c = cell(x as usize, y as usize, z as usize);
         occupied[c / 64] >> (c % 64) & 1 == 1
     };
-    let pivot = if centred { [sx / 2, sy / 2, sz / 2].map(|p| p as i32) } else { [0; 3] };
+    let pivot = if centred {
+        [sx / 2, sy / 2, sz / 2].map(|p| p as i32)
+    } else {
+        [0; 3]
+    };
     let mirrored = xform.mirrors();
     // MagicaVoxel is Z-up, glTF Y-up: (x, y, z) -> (x, z, -y).
     let to_gltf = |p: [i32; 3]| [p[0] as f32, p[2] as f32, -p[1] as f32];
@@ -385,7 +442,8 @@ fn mesh_model(model: &Model, xform: &Xform, centred: bool, prims: &mut HashMap<u
                 let c = corners[if mirrored { 3 - k } else { k }];
                 let local = [x + c[0] - pivot[0], y + c[1] - pivot[1], z + c[2] - pivot[2]];
                 let w = xform.rotate(local);
-                p.positions.push(to_gltf([w[0] + xform.t[0], w[1] + xform.t[1], w[2] + xform.t[2]]));
+                p.positions
+                    .push(to_gltf([w[0] + xform.t[0], w[1] + xform.t[1], w[2] + xform.t[2]]));
                 p.normals.push(normal);
             }
             p.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);

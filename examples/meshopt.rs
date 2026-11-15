@@ -29,8 +29,7 @@ fn sample() -> mithril::Result<Vec<u8>> {
     for y in 0..n {
         for x in 0..n {
             let a = y * (n + 1) + x;
-            prim.indices
-                .extend([a, a + n + 1, a + 1, a + 1, a + n + 1, a + n + 2]);
+            prim.indices.extend([a, a + n + 1, a + 1, a + 1, a + n + 1, a + n + 2]);
         }
     }
     let mesh = Mesh {

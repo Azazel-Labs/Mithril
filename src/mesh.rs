@@ -306,10 +306,7 @@ pub fn to_glb(mesh: &Mesh) -> Result<Vec<u8>> {
             .then(|| push_view(&mut bin, &f32s(p.normals.as_flattened()), Some(34962)));
         let iv = push_view(
             &mut bin,
-            &p.indices
-                .iter()
-                .flat_map(|i| i.to_le_bytes())
-                .collect::<Vec<u8>>(),
+            &p.indices.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>(),
             Some(34963),
         );
         let (mut min, mut max) = ([f32::MAX; 3], [f32::MIN; 3]);
@@ -323,7 +320,8 @@ pub fn to_glb(mesh: &Mesh) -> Result<Vec<u8>> {
         accessors.push(json!({ "bufferView": pv, "componentType": 5126, "count": p.positions.len(), "type": "VEC3", "min": min, "max": max }));
         let mut attributes = json!({ "POSITION": a });
         if let Some(nv) = nv {
-            accessors.push(json!({ "bufferView": nv, "componentType": 5126, "count": p.normals.len(), "type": "VEC3" }));
+            accessors
+                .push(json!({ "bufferView": nv, "componentType": 5126, "count": p.normals.len(), "type": "VEC3" }));
             attributes["NORMAL"] = json!(accessors.len() - 1);
         }
         let ia = accessors.len();
@@ -334,12 +332,7 @@ pub fn to_glb(mesh: &Mesh) -> Result<Vec<u8>> {
             attributes["TEXCOORD_0"] = json!(accessors.len() - 1);
         }
         if p.colors.len() == p.positions.len() {
-            let clamped: Vec<f32> = p
-                .colors
-                .as_flattened()
-                .iter()
-                .map(|c| c.clamp(0.0, 1.0))
-                .collect();
+            let clamped: Vec<f32> = p.colors.as_flattened().iter().map(|c| c.clamp(0.0, 1.0)).collect();
             let cv = push_view(&mut bin, &f32s(&clamped), Some(34962));
             accessors.push(json!({ "bufferView": cv, "componentType": 5126, "count": p.colors.len(), "type": "VEC4" }));
             attributes["COLOR_0"] = json!(accessors.len() - 1);
@@ -394,8 +387,7 @@ pub fn to_glb(mesh: &Mesh) -> Result<Vec<u8>> {
     });
     if !images.is_empty() {
         // One texture per image, all sharing a repeating, mipmapped sampler.
-        doc["samplers"] =
-            json!([{ "magFilter": 9729, "minFilter": 9987, "wrapS": 10497, "wrapT": 10497 }]);
+        doc["samplers"] = json!([{ "magFilter": 9729, "minFilter": 9987, "wrapS": 10497, "wrapT": 10497 }]);
         doc["textures"] = json!(
             (0..images.len())
                 .map(|i| json!({ "sampler": 0, "source": i }))
@@ -466,18 +458,11 @@ pub(crate) fn triangulate(corners: &[[f32; 3]], out: &mut Vec<[u32; 3]>) {
         let (x, y) = (f64::from(c[u]), f64::from(c[v]));
         if flip { [y, x] } else { [x, y] }
     };
-    let cross = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
-        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
-    };
+    let cross = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
     if n == 4 {
         // Quads, most faces that aren't triangles: no allocation. A convex one is fanned; one
         // with a single reflex corner is cut along the diagonal from that corner.
-        let q = [
-            to2(&corners[0]),
-            to2(&corners[1]),
-            to2(&corners[2]),
-            to2(&corners[3]),
-        ];
+        let q = [to2(&corners[0]), to2(&corners[1]), to2(&corners[2]), to2(&corners[3])];
         let turn = |k: usize| cross(q[(k + 3) % 4], q[k], q[(k + 1) % 4]);
         let mut r = None;
         let mut count = 0;
@@ -612,5 +597,4 @@ impl std::hash::Hasher for FxHasher {
 
 /// A `HashMap` with [`FxHasher`].
 #[cfg(any(feature = "ply", feature = "3ds"))]
-pub(crate) type FastMap<K, V> =
-    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<FxHasher>>;
+pub(crate) type FastMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<FxHasher>>;

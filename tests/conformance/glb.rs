@@ -84,8 +84,7 @@ pub fn validate(bytes: &[u8]) -> Result<Glb, String> {
         return Err("JSON chunk is not 4-byte aligned".into());
     }
     let json_bytes = bytes.get(20..20 + json_len).ok_or("JSON chunk runs past the end")?;
-    let json: Value =
-        serde_json::from_slice(json_bytes).map_err(|e| format!("JSON chunk doesn't parse: {e}"))?;
+    let json: Value = serde_json::from_slice(json_bytes).map_err(|e| format!("JSON chunk doesn't parse: {e}"))?;
     let mut bin: &[u8] = &[];
     let mut at = 20 + json_len;
     if at < bytes.len() {
@@ -329,8 +328,7 @@ pub fn validate(bytes: &[u8]) -> Result<Glb, String> {
             if w != 3 || acc["componentType"] != 5126 {
                 return Err("POSITION is not float VEC3".into());
             }
-            let positions: Vec<[f32; 3]> =
-                pos.as_chunks::<3>().0.to_vec();
+            let positions: Vec<[f32; 3]> = pos.as_chunks::<3>().0.to_vec();
             // POSITION must carry min and max, and they must be the real bounds.
             let (Some(min), Some(max)) = (acc["min"].as_array(), acc["max"].as_array()) else {
                 return Err("POSITION has no min/max".into());
@@ -338,9 +336,14 @@ pub fn validate(bytes: &[u8]) -> Result<Glb, String> {
             for k in 0..3 {
                 let lo = positions.iter().map(|p| p[k]).fold(f32::MAX, f32::min);
                 let hi = positions.iter().map(|p| p[k]).fold(f32::MIN, f32::max);
-                let (m0, m1) = (min[k].as_f64().unwrap_or(f64::NAN) as f32, max[k].as_f64().unwrap_or(f64::NAN) as f32);
+                let (m0, m1) = (
+                    min[k].as_f64().unwrap_or(f64::NAN) as f32,
+                    max[k].as_f64().unwrap_or(f64::NAN) as f32,
+                );
                 if m0 != lo || m1 != hi {
-                    return Err(format!("POSITION min/max [{m0}, {m1}] != actual [{lo}, {hi}] on axis {k}"));
+                    return Err(format!(
+                        "POSITION min/max [{m0}, {m1}] != actual [{lo}, {hi}] on axis {k}"
+                    ));
                 }
             }
             let n = positions.len();

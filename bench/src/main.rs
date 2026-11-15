@@ -84,7 +84,11 @@ impl Torus {
         let (a, b) = (u * std::f32::consts::TAU, v * std::f32::consts::TAU);
         let (big, small) = (1.0f32, 0.35f32);
         let n = [a.cos() * b.cos(), a.sin() * b.cos(), b.sin()];
-        let p = [(big + small * b.cos()) * a.cos(), (big + small * b.cos()) * a.sin(), small * b.sin()];
+        let p = [
+            (big + small * b.cos()) * a.cos(),
+            (big + small * b.cos()) * a.sin(),
+            small * b.sin(),
+        ];
         (p, n, [u, v])
     }
     fn index(&self, i: usize, j: usize) -> usize {
@@ -97,7 +101,12 @@ impl Torus {
     fn quads(&self) -> impl Iterator<Item = [usize; 4]> + '_ {
         (0..self.rows).flat_map(move |i| {
             (0..self.cols).map(move |j| {
-                [self.index(i, j), self.index(i + 1, j), self.index(i + 1, j + 1), self.index(i, j + 1)]
+                [
+                    self.index(i, j),
+                    self.index(i + 1, j),
+                    self.index(i + 1, j + 1),
+                    self.index(i, j + 1),
+                ]
             })
         })
     }
@@ -112,7 +121,11 @@ impl Torus {
                 let [p, q, r] = t.map(|k| pos[k]);
                 let u = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
                 let v = [r[0] - p[0], r[1] - p[1], r[2] - p[2]];
-                let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+                let n = [
+                    u[1] * v[2] - u[2] * v[1],
+                    u[2] * v[0] - u[0] * v[2],
+                    u[0] * v[1] - u[1] * v[0],
+                ];
                 let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(f32::MIN_POSITIVE);
                 (n.map(|x| x / len), [p, q, r])
             })
@@ -159,7 +172,11 @@ fn write_stl_ascii(t: &Torus, path: &Path) -> std::io::Result<()> {
     let mut f = BufWriter::new(File::create(path)?);
     writeln!(f, "solid torus")?;
     for (n, tri) in t.facets() {
-        writeln!(f, "  facet normal {:.6e} {:.6e} {:.6e}\n    outer loop", n[0], n[1], n[2])?;
+        writeln!(
+            f,
+            "  facet normal {:.6e} {:.6e} {:.6e}\n    outer loop",
+            n[0], n[1], n[2]
+        )?;
         for p in tri {
             writeln!(f, "      vertex {:.6e} {:.6e} {:.6e}", p[0], p[1], p[2])?;
         }
@@ -254,7 +271,13 @@ fn inputs(dir: &Path, sizes: &[String]) -> Vec<Input> {
             let path = dir.join(format!("{size}_{}.{ext}", kind.replace(' ', "_")));
             write(&t, &path).unwrap();
             let bytes = std::fs::metadata(&path).unwrap().len();
-            out.push(Input { name: format!("{kind}, {size}"), path, ext, triangles: t.triangles(), bytes });
+            out.push(Input {
+                name: format!("{kind}, {size}"),
+                path,
+                ext,
+                triangles: t.triangles(),
+                bytes,
+            });
         }
     }
     out
@@ -462,7 +485,14 @@ fn run(input: &Input, budget: Duration) -> Vec<Row> {
         .zip(times)
         .map(|((&(loader, _), s), mut t)| {
             t.sort();
-            Row { loader, median: t[t.len() / 2], best: t[0], rounds: t.len(), peak: s.peak, kept: s.kept }
+            Row {
+                loader,
+                median: t[t.len() / 2],
+                best: t[0],
+                rounds: t.len(),
+                peak: s.peak,
+                kept: s.kept,
+            }
         })
         .collect()
 }
@@ -479,9 +509,17 @@ fn mb(b: usize) -> f64 {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
-    let sizes: Vec<String> =
-        arg("--sizes").unwrap_or("small,medium,large".into()).split(',').map(|s| s.trim().to_owned()).collect();
+    let arg = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let sizes: Vec<String> = arg("--sizes")
+        .unwrap_or("small,medium,large".into())
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .collect();
     let budget = Duration::from_secs_f64(arg("--budget").map_or(3.0, |b| b.parse().expect("--budget seconds")));
     let dir = std::env::temp_dir().join("mithril-bench");
 
@@ -497,7 +535,12 @@ fn main() {
     )
     .unwrap();
     for input in &inputs {
-        eprintln!("{} ({:.1} MB, {} triangles)", input.name, mb(input.bytes as usize), input.triangles);
+        eprintln!(
+            "{} ({:.1} MB, {} triangles)",
+            input.name,
+            mb(input.bytes as usize),
+            input.triangles
+        );
         let rows = run(input, budget);
         let me = &rows[0];
         if rows[1..].iter().all(|r| me.median <= r.median) {

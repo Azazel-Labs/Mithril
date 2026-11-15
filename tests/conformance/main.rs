@@ -37,7 +37,9 @@ fn enabled(ext: &str) -> bool {
 }
 
 /// Every model extension a full build reads, so cases are found in builds without some readers.
-const ALL_EXTENSIONS: &[&str] = &["stl", "ply", "vox", "obj", "3ds", "fbx", "3mf", "usd", "usda", "usdc", "usdz", "gltf", "glb"];
+const ALL_EXTENSIONS: &[&str] = &[
+    "stl", "ply", "vox", "obj", "3ds", "fbx", "3mf", "usd", "usda", "usdc", "usdz", "gltf", "glb",
+];
 
 fn ext_of(p: &Path) -> String {
     p.extension()
@@ -67,10 +69,13 @@ fn cases(format: &str) -> Vec<Case> {
             let name = format!("{format}/{}", dir.file_name().unwrap().to_string_lossy());
             let text = std::fs::read_to_string(dir.join("expect.json"))
                 .unwrap_or_else(|e| panic!("{name}: no expect.json: {e}"));
-            let expect: Map<String, Value> = serde_json::from_str(&text)
-                .unwrap_or_else(|e| panic!("{name}: expect.json doesn't parse: {e}"));
+            let expect: Map<String, Value> =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name}: expect.json doesn't parse: {e}"));
             for key in ["spec", "source"] {
-                assert!(expect.get(key).is_some_and(Value::is_string), "{name}: expect.json needs \"{key}\"");
+                assert!(
+                    expect.get(key).is_some_and(Value::is_string),
+                    "{name}: expect.json needs \"{key}\""
+                );
             }
             let file = match expect.get("file").and_then(Value::as_str) {
                 Some(f) => dir.join(f),
@@ -172,7 +177,11 @@ fn run(case: &Case) -> Result<(), String> {
     let bytes = mithril::mesh::to_glb(&mesh).map_err(|err| format!("to_glb failed: {err}"))?;
     let g = glb::validate(&bytes).map_err(|err| format!("invalid GLB: {err}"))?;
     if g.triangles() != mesh.triangles() {
-        return Err(format!("GLB has {} triangles, the mesh {}", g.triangles(), mesh.triangles()));
+        return Err(format!(
+            "GLB has {} triangles, the mesh {}",
+            g.triangles(),
+            mesh.triangles()
+        ));
     }
     if let Some(t) = loaded.facts.get("triangles")
         && t.as_u64() != Some(g.triangles() as u64)
@@ -201,11 +210,21 @@ fn run(case: &Case) -> Result<(), String> {
         let area: f64 = g
             .prims
             .iter()
-            .flat_map(|p| p.indices.as_chunks::<3>().0.iter().map(|t| t.map(|i| p.positions[i as usize])))
+            .flat_map(|p| {
+                p.indices
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .map(|t| t.map(|i| p.positions[i as usize]))
+            })
             .map(|[a, b, c]| {
                 let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]].map(f64::from);
                 let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]].map(f64::from);
-                let x = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+                let x = [
+                    u[1] * v[2] - u[2] * v[1],
+                    u[2] * v[0] - u[0] * v[2],
+                    u[0] * v[1] - u[1] * v[0],
+                ];
                 0.5 * (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt()
             })
             .sum();
@@ -224,7 +243,9 @@ fn run(case: &Case) -> Result<(), String> {
             }
         }
         if !close(&min, &want_min, tol) || !close(&max, &want_max, tol) {
-            return Err(format!("bounds are {min:?}..{max:?}, expected {want_min:?}..{want_max:?}"));
+            return Err(format!(
+                "bounds are {min:?}..{max:?}, expected {want_min:?}..{want_max:?}"
+            ));
         }
     }
     let flag = |key: &str, has: bool| -> Result<(), String> {
@@ -247,9 +268,15 @@ fn run(case: &Case) -> Result<(), String> {
         Ok(())
     };
     let all = |f: &dyn Fn(&glb::Prim) -> Vec<Vec<f32>>| -> Vec<Vec<f32>> { g.prims.iter().flat_map(f).collect() };
-    contains("positions_include", &all(&|p| p.positions.iter().map(|v| v.to_vec()).collect()))?;
+    contains(
+        "positions_include",
+        &all(&|p| p.positions.iter().map(|v| v.to_vec()).collect()),
+    )?;
     contains("uvs_include", &all(&|p| p.uvs.iter().map(|v| v.to_vec()).collect()))?;
-    contains("colors_include", &all(&|p| p.colors.iter().map(|v| v.to_vec()).collect()))?;
+    contains(
+        "colors_include",
+        &all(&|p| p.colors.iter().map(|v| v.to_vec()).collect()),
+    )?;
     // Every normal is one of these (a faceted model's face directions).
     if let Some(dirs) = e.get("normals_in").and_then(Value::as_array) {
         let dirs: Vec<Vec<f32>> = dirs.iter().map(floats).collect();
@@ -263,15 +290,28 @@ fn run(case: &Case) -> Result<(), String> {
                     let [a, b, c] = t.map(|i| p.positions[i as usize]);
                     let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
                     let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-                    let f = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+                    let f = [
+                        u[1] * v[2] - u[2] * v[1],
+                        u[2] * v[0] - u[0] * v[2],
+                        u[0] * v[1] - u[1] * v[0],
+                    ];
                     let len = (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt();
                     f.map(|x| x / len)
                 })
                 .filter(|n| n.iter().all(|x| x.is_finite()))
                 .collect()
         };
-        let normals: Vec<[f32; 3]> =
-            g.prims.iter().flat_map(|p| if p.normals.is_empty() { flat(p) } else { p.normals.clone() }).collect();
+        let normals: Vec<[f32; 3]> = g
+            .prims
+            .iter()
+            .flat_map(|p| {
+                if p.normals.is_empty() {
+                    flat(p)
+                } else {
+                    p.normals.clone()
+                }
+            })
+            .collect();
         for n in &normals {
             if !dirs.iter().any(|d| close(n, d, 1e-3)) {
                 return Err(format!("normal {n:?} is none of {dirs:?}"));
@@ -287,7 +327,11 @@ fn run(case: &Case) -> Result<(), String> {
                 let [a, b, c] = t.map(|i| p.positions[i as usize]);
                 let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
                 let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-                let face = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+                let face = [
+                    u[1] * v[2] - u[2] * v[1],
+                    u[2] * v[0] - u[0] * v[2],
+                    u[0] * v[1] - u[1] * v[0],
+                ];
                 let n = p.normals[t[0] as usize];
                 let n2 = p.normals[t[1] as usize];
                 let n3 = p.normals[t[2] as usize];
@@ -317,7 +361,11 @@ fn run(case: &Case) -> Result<(), String> {
                 let [a, b, c] = t.map(|i| p.positions[i as usize]);
                 let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
                 let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-                let face = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+                let face = [
+                    u[1] * v[2] - u[2] * v[1],
+                    u[2] * v[0] - u[0] * v[2],
+                    u[0] * v[1] - u[1] * v[0],
+                ];
                 let out = [0, 1, 2].map(|k| (a[k] + b[k] + c[k]) / 3.0 - mid[k]);
                 if face[0] * out[0] + face[1] * out[1] + face[2] * out[2] <= 0.0 {
                     return Err(format!("triangle {t:?} faces inward"));
@@ -326,16 +374,27 @@ fn run(case: &Case) -> Result<(), String> {
         }
     }
 
-    for (i, want) in e.get("materials").and_then(Value::as_array).into_iter().flatten().enumerate() {
+    for (i, want) in e
+        .get("materials")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
         let m = match want.get("name").and_then(Value::as_str) {
-            Some(name) => g
-                .materials
-                .iter()
-                .find(|m| m.name == name)
-                .ok_or_else(|| format!("no material named {name:?} in {:?}", g.materials.iter().map(|m| &m.name).collect::<Vec<_>>()))?,
+            Some(name) => g.materials.iter().find(|m| m.name == name).ok_or_else(|| {
+                format!(
+                    "no material named {name:?} in {:?}",
+                    g.materials.iter().map(|m| &m.name).collect::<Vec<_>>()
+                )
+            })?,
             None => g.materials.get(i).ok_or(format!("no material {i}"))?,
         };
-        let label = if m.name.is_empty() { format!("material {i}") } else { format!("material {:?}", m.name) };
+        let label = if m.name.is_empty() {
+            format!("material {i}")
+        } else {
+            format!("material {:?}", m.name)
+        };
         if let Some(c) = want.get("color") {
             let c = floats(c);
             let tol = want.get("tolerance").and_then(Value::as_f64).map_or(2e-3, |t| t as f32);
@@ -356,7 +415,11 @@ fn run(case: &Case) -> Result<(), String> {
                 return Err(format!("{label} {key} is {got}, expected {v}"));
             }
         }
-        for (key, got) in [("textured", m.color_image.is_some()), ("normal_map", m.normal_image.is_some()), ("double_sided", m.double_sided)] {
+        for (key, got) in [
+            ("textured", m.color_image.is_some()),
+            ("normal_map", m.normal_image.is_some()),
+            ("double_sided", m.double_sided),
+        ] {
             if let Some(v) = want.get(key).and_then(Value::as_bool)
                 && v != got
             {
@@ -397,7 +460,12 @@ fn check(format: &str) {
         }
     }
     println!("{format}: {ran} of {} cases ran", cases.len());
-    assert!(failures.is_empty(), "{} of {ran} {format} cases failed:\n  {}", failures.len(), failures.join("\n  "));
+    assert!(
+        failures.is_empty(),
+        "{} of {ran} {format} cases failed:\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
 }
 
 #[test]

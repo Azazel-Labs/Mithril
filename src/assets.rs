@@ -179,10 +179,7 @@ pub(crate) fn memory_key(path: &str) -> String {
 }
 
 /// A model's color texture by its name, from the images `walk` visits (until told to stop).
-fn color_texture_by_name(
-    model: &Path,
-    walk: impl FnOnce(&mut dyn FnMut(&Path, &str) -> bool),
-) -> Option<PathBuf> {
+fn color_texture_by_name(model: &Path, walk: impl FnOnce(&mut dyn FnMut(&Path, &str) -> bool)) -> Option<PathBuf> {
     let stem = model.file_stem()?.to_string_lossy().to_lowercase();
     if stem.len() < 3 || stem.contains('@') {
         return None;
@@ -209,10 +206,7 @@ fn color_texture_by_name(
 
 /// An image with the same name as `name` (lowercase) in another format (`rock.png` for
 /// `rock.tga`, as packs often ship), preferring PNG and JPEG, from the images `walk` visits.
-fn same_name_other_format(
-    name: &str,
-    walk: impl FnOnce(&mut dyn FnMut(&Path, &str) -> bool),
-) -> Option<PathBuf> {
+fn same_name_other_format(name: &str, walk: impl FnOnce(&mut dyn FnMut(&Path, &str) -> bool)) -> Option<PathBuf> {
     let (stem, ext) = name.rsplit_once('.')?;
     if !IMAGE_EXTS.contains(&ext) {
         return None;
@@ -270,8 +264,7 @@ fn texture_role(stem: &str) -> Option<Role> {
         "bump",
     ]) || has(&["mask", "opacity", "alpha", "spec", "gloss", "smooth"])
         || ends(&[
-            "n", "nor", "norm", "e", "r", "m", "mt", "ao", "occ", "h", "orm", "arm", "mra", "rma",
-            "s", "g",
+            "n", "nor", "norm", "e", "r", "m", "mt", "ao", "occ", "h", "orm", "arm", "mra", "rma", "s", "g",
         ])
     {
         return Some(Role::Other);
@@ -333,11 +326,7 @@ fn find_texture(reference: &str, model_dir: &Path, root: &Path) -> Option<PathBu
         return None;
     }
     let rel = model_dir.join(&cleaned);
-    if !cleaned.starts_with('/')
-        && !cleaned.contains(':')
-        && !cleaned.split('/').any(|c| c == "..")
-        && rel.is_file()
-    {
+    if !cleaned.starts_with('/') && !cleaned.contains(':') && !cleaned.split('/').any(|c| c == "..") && rel.is_file() {
         return Some(rel);
     }
     let name = cleaned.rsplit('/').next()?.to_lowercase();
@@ -386,10 +375,7 @@ mod tests {
             .with("textures/rock.jpg", "jpg")
             .with("Barrel_Albedo.png", "a")
             .with("Barrel_Normal.png", "n");
-        let found = |r: &str| {
-            m.find(r, Path::new("Models"))
-                .map(|p| p.to_string_lossy().into_owned())
-        };
+        let found = |r: &str| m.find(r, Path::new("Models")).map(|p| p.to_string_lossy().into_owned());
         let krate = Some("Models/textures/Crate.PNG");
         assert_eq!(found("textures/Crate.PNG").as_deref(), krate);
         assert_eq!(found("./textures\\Crate.PNG").as_deref(), krate);
