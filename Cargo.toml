@@ -1,7 +1,7 @@
 [package]
 name = "mithril"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT-0"
 rust-version = "1.88"
 description = "Pure-Rust 3D asset interchange: glTF/GLB reading and writing, meshopt compression, and readers for common mesh formats"
