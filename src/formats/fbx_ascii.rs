@@ -1,5 +1,5 @@
 //! ASCII FBX (7.x), the text form some tools write (Asset Forge, which made many of Kenney's older kits, and others
-//! on request), rewritten as binary FBX so it's read like any other: by `fbx` for thumbnails and GLB copies, and
+//! on request), rewritten as binary FBX so it's read like any other: by this crate's FBX reader, and
 //! by Blender, whose importer takes only binary. Values get the types binary FBX gives them, since Blender checks:
 //! object ids and connections are 64-bit, a property's values follow the type it declares, and an array takes the
 //! type its node always has.
@@ -11,7 +11,7 @@ use fbxcel::writer::v7400::binary::{FbxFooter, Writer};
 const BINARY_MAGIC: &[u8] = b"Kaydara FBX Binary";
 
 /// Whether `data` is an ASCII FBX file.
-pub(crate) fn is_ascii(data: &[u8]) -> bool {
+pub fn is_ascii(data: &[u8]) -> bool {
     !data.starts_with(BINARY_MAGIC) && {
         let head = &data[..data.len().min(64 << 10)];
         head.windows(19).any(|w| w == b"FBXHeaderExtension:")
@@ -19,7 +19,7 @@ pub(crate) fn is_ascii(data: &[u8]) -> bool {
 }
 
 /// Rewrite an ASCII FBX file as binary FBX 7.4.
-pub(crate) fn to_binary(data: &[u8]) -> Result<Vec<u8>> {
+pub fn to_binary(data: &[u8]) -> Result<Vec<u8>> {
     let text = std::str::from_utf8(data)
         .map_or_else(
             |_| String::from_utf8_lossy(data).into_owned(),
