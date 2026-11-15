@@ -246,9 +246,13 @@ fn ascii(mut blocks: Blocks<'_>) -> Result<Vec<(Option<String>, Prim)>> {
         let mut i = 0;
         let n = text.len();
         loop {
+            let gap = i;
             while i < n && stream::space(text[i]) {
-                naming &= text[i] != b'\n' && text[i] != b'\r';
                 i += 1;
+            }
+            // A name ends with its line.
+            if naming && text[gap..i].iter().any(|&c| c == b'\n' || c == b'\r') {
+                naming = false;
             }
             if i == n {
                 break;
@@ -286,7 +290,7 @@ fn ascii(mut blocks: Blocks<'_>) -> Result<Vec<(Option<String>, Prim)>> {
                 }
             } else if word.len() == 6 && word.eq_ignore_ascii_case(b"vertex") {
                 want = 3;
-            } else if word.len() == 5 && word.eq_ignore_ascii_case(b"solid") {
+            } else if word.len() == 5 && word[0] | 0x20 == b's' && word.eq_ignore_ascii_case(b"solid") {
                 if seen {
                     finish_solid(&mut solids, &name, std::mem::replace(&mut w, Welder::with_capacity(0)));
                 }
