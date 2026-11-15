@@ -1712,12 +1712,12 @@ mod tests {
         // The compressed data and the fallback are gone: only the decoded buffer is left.
         assert_eq!(doc.json["buffers"].as_array().unwrap().len(), 1);
         let after = doc.flatten(Pose::Rest).unwrap().unwrap();
-        assert!(to_glb(&before).unwrap() == to_glb(&after).unwrap());
+        assert_eq!(to_glb(&before).unwrap(), to_glb(&after).unwrap());
         same(&mesh, &load(dir.path(), "decoded.glb", &doc.to_glb().unwrap()));
         // Decoding plain glTF changes nothing.
         let glb = doc.to_glb().unwrap();
         doc.decode().unwrap();
-        assert!(glb == doc.to_glb().unwrap());
+        assert_eq!(glb, doc.to_glb().unwrap());
     }
 
     #[test]
