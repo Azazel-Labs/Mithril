@@ -207,9 +207,9 @@ impl<'a> Input<'a> {
 }
 
 fn read<'a>(input: Input<'a>, ext: &str, assets: &'a dyn Assets, keep: Keep) -> Result<Document<'a>> {
-    let mut doc = convert(input, ext, assets)?;
+    let mut doc = convert(input, ext, assets, keep)?;
     doc.prune(keep);
-    if matches!(ext, "gltf" | "glb") {
+    if matches!(ext, "gltf" | "glb" | "fbx") {
         let c = doc.counts();
         for (key, n) in [("triangles", c.triangles), ("points", c.points), ("lines", c.lines)] {
             if n > 0 || key == "triangles" {
@@ -237,8 +237,8 @@ fn counted(mesh: Mesh) -> Document<'static> {
     Document::from_mesh(mesh, facts)
 }
 
-fn convert<'a>(input: Input<'a>, ext: &str, assets: &'a dyn Assets) -> Result<Document<'a>> {
-    let _ = (input, assets);
+fn convert<'a>(input: Input<'a>, ext: &str, assets: &'a dyn Assets, keep: Keep) -> Result<Document<'a>> {
+    let _ = (input, assets, keep);
     match ext {
         #[cfg(feature = "stl")]
         "stl" => stl::stl(input).map(counted),
@@ -266,11 +266,7 @@ fn convert<'a>(input: Input<'a>, ext: &str, assets: &'a dyn Assets) -> Result<Do
             assets,
         ))),
         #[cfg(feature = "fbx")]
-        "fbx" => {
-            let mut mesh = fbx::load(input, assets)?;
-            guess_color_texture(&mut mesh, input.path, assets);
-            Ok(counted(mesh))
-        }
+        "fbx" => fbx::load(input, assets, keep),
         #[cfg(feature = "gltf")]
         "gltf" | "glb" => gltf::load(input, assets),
         e if EXTENSIONS.contains(&e) => bail!("built without the `{}` feature", feature_for(e)),
@@ -316,7 +312,7 @@ fn linear_colors(input: Input<'_>, ext: &str) -> bool {
     }
 }
 
-#[cfg(any(feature = "obj", feature = "fbx", feature = "3ds"))]
+#[cfg(any(feature = "obj", feature = "3ds"))]
 /// A model that names no color texture takes one by name: `Barrel.png` or
 /// `Barrel_Albedo.png` for `Barrel.obj`, from anywhere in the pack. Its color then shows as painted.
 fn guess_color_texture(mesh: &mut Mesh, path: &Path, assets: &dyn Assets) {

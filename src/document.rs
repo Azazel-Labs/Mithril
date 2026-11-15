@@ -25,7 +25,7 @@ use std::sync::Mutex;
 use serde_json::{Map, Value, json};
 
 use crate::gltf as container;
-use crate::mesh::{Image, Mesh};
+use crate::mesh::{Image, Material, Mesh, Prim};
 use crate::num::usize_of;
 use crate::{Context as _, Result};
 
@@ -539,56 +539,127 @@ impl<'a> Document<'a> {
             images,
         } = mesh;
         let last_material = materials.len().saturating_sub(1);
-        let mut primitives = Vec::new();
-        for p in prims {
-            if p.indices.is_empty() {
-                continue;
-            }
-            let n = p.positions.len();
-            let (mut min, mut max) = ([f32::MAX; 3], [f32::MIN; 3]);
-            for v in &p.positions {
-                for k in 0..3 {
-                    min[k] = min[k].min(v[k]);
-                    max[k] = max[k].max(v[k]);
-                }
-            }
-            let pos = b.accessor(Part::f32(p.positions.into_flattened()), 5126, n, "VEC3", Some(34962));
-            b.accessors[pos]["min"] = json!(min);
-            b.accessors[pos]["max"] = json!(max);
-            let mut attributes = json!({ "POSITION": pos });
-            // Without normals, glTF clients shade flat.
-            if p.normals.len() == n {
-                let a = b.accessor(Part::f32(p.normals.into_flattened()), 5126, n, "VEC3", Some(34962));
-                attributes["NORMAL"] = json!(a);
-            }
-            let count = p.indices.len();
-            let indices = b.accessor(Part::u32(p.indices), 5125, count, "SCALAR", Some(34963));
-            if p.uvs.len() == n {
-                let a = b.accessor(Part::f32(p.uvs.into_flattened()), 5126, n, "VEC2", Some(34962));
-                attributes["TEXCOORD_0"] = json!(a);
-            }
-            if p.colors.len() == n {
-                let mut colors = p.colors.into_flattened();
-                for c in &mut colors {
-                    *c = c.clamp(0.0, 1.0);
-                }
-                let a = b.accessor(Part::f32(colors), 5126, n, "VEC4", Some(34962));
-                attributes["COLOR_0"] = json!(a);
-            }
-            primitives.push(json!({
-                "attributes": attributes,
-                "indices": indices,
-                "material": p.material.min(last_material),
-            }));
-        }
+        let primitives: Vec<Value> = prims
+            .into_iter()
+            .filter_map(|p| {
+                let material = p.material.min(last_material);
+                let mut prim = b.primitive(p)?;
+                prim["material"] = json!(material);
+                Some(prim)
+            })
+            .collect();
         if primitives.is_empty() {
             return Document::empty(facts);
         }
+        let mut json = Map::new();
+        json.insert("scene".into(), json!(0));
+        json.insert("scenes".into(), json!([{ "nodes": [0] }]));
+        json.insert("nodes".into(), json!([{ "mesh": 0 }]));
+        json.insert("meshes".into(), json!([{ "primitives": primitives }]));
+        b.materials(&materials, images, &mut json);
+        b.finish(json, facts)
+    }
+}
+
+/// Builds a document's one buffer from typed arrays, with a view and an accessor for each.
+#[derive(Default)]
+pub(crate) struct Builder {
+    pub parts: Parts,
+    pub views: Vec<Value>,
+    pub accessors: Vec<Value>,
+}
+
+impl Builder {
+    /// A primitive's JSON (attributes and indices, no material), its arrays moved into the
+    /// buffer; `None` when it has no triangles.
+    pub(crate) fn primitive(&mut self, p: Prim) -> Option<Value> {
+        if p.indices.is_empty() {
+            return None;
+        }
+        let n = p.positions.len();
+        let pos = self.positions(p.positions);
+        let mut attributes = json!({ "POSITION": pos });
+        // Without normals, glTF clients shade flat.
+        if p.normals.len() == n {
+            let a = self.accessor(Part::f32(p.normals.into_flattened()), 5126, n, "VEC3", Some(34962));
+            attributes["NORMAL"] = json!(a);
+        }
+        let count = p.indices.len();
+        let indices = self.accessor(Part::u32(p.indices), 5125, count, "SCALAR", Some(34963));
+        if p.uvs.len() == n {
+            let a = self.accessor(Part::f32(p.uvs.into_flattened()), 5126, n, "VEC2", Some(34962));
+            attributes["TEXCOORD_0"] = json!(a);
+        }
+        if p.colors.len() == n {
+            let mut colors = p.colors.into_flattened();
+            for c in &mut colors {
+                *c = c.clamp(0.0, 1.0);
+            }
+            let a = self.accessor(Part::f32(colors), 5126, n, "VEC4", Some(34962));
+            attributes["COLOR_0"] = json!(a);
+        }
+        Some(json!({ "attributes": attributes, "indices": indices }))
+    }
+
+    /// A `VEC3` float accessor with the `min` and `max` glTF requires of positions (and of
+    /// morph targets' position deltas).
+    pub(crate) fn positions(&mut self, v: Vec<[f32; 3]>) -> usize {
+        let (mut min, mut max) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for p in &v {
+            for k in 0..3 {
+                min[k] = min[k].min(p[k]);
+                max[k] = max[k].max(p[k]);
+            }
+        }
+        if v.is_empty() {
+            (min, max) = ([0.0; 3], [0.0; 3]);
+        }
+        let n = v.len();
+        let a = self.accessor(Part::f32(v.into_flattened()), 5126, n, "VEC3", Some(34962));
+        self.accessors[a]["min"] = json!(min);
+        self.accessors[a]["max"] = json!(max);
+        a
+    }
+
+    /// A float accessor of `kind` (`SCALAR`, `VEC3`, `VEC4`, `MAT4`) with no target, for skins
+    /// and animations; `bounds` adds the `min` and `max` an animation's times need.
+    #[cfg(feature = "fbx")]
+    pub(crate) fn floats(&mut self, v: Vec<f32>, kind: &str, bounds: bool) -> usize {
+        let width = match kind {
+            "VEC2" => 2,
+            "VEC3" => 3,
+            "VEC4" => 4,
+            "MAT4" => 16,
+            _ => 1,
+        };
+        let count = v.len() / width;
+        let range = bounds.then(|| {
+            let mut min = vec![f32::MAX; width];
+            let mut max = vec![f32::MIN; width];
+            for e in v.chunks_exact(width) {
+                for k in 0..width {
+                    min[k] = min[k].min(e[k]);
+                    max[k] = max[k].max(e[k]);
+                }
+            }
+            (min, max)
+        });
+        let a = self.accessor(Part::f32(v), 5126, count, kind, None);
+        if let Some((min, max)) = range {
+            self.accessors[a]["min"] = json!(min);
+            self.accessors[a]["max"] = json!(max);
+        }
+        a
+    }
+
+    /// Adds `materials` and `images` to `json`: one texture per image, all sharing a repeating,
+    /// mipmapped sampler. Nothing is added for an empty list.
+    pub(crate) fn materials(&mut self, materials: &[Material], images: Vec<Image>, json: &mut Map<String, Value>) {
         let image_count = images.len();
         let images: Vec<Value> = images
             .into_iter()
             .map(|Image { bytes, mime }| {
-                let v = b.view(Part::bytes(bytes), None);
+                let v = self.view(Part::bytes(bytes), None);
                 json!({ "bufferView": v, "mimeType": mime })
             })
             .collect();
@@ -620,47 +691,40 @@ impl<'a> Document<'a> {
                 mat
             })
             .collect();
-        let mut doc = json!({
-            "asset": { "version": "2.0", "generator": "mithril" },
-            "scene": 0,
-            "scenes": [{ "nodes": [0] }],
-            "nodes": [{ "mesh": 0 }],
-            "meshes": [{ "primitives": primitives }],
-            "accessors": b.accessors,
-            "bufferViews": b.views,
-            "buffers": [{ "byteLength": b.parts.len }],
-        });
         if !materials.is_empty() {
-            doc["materials"] = json!(materials);
+            json.insert("materials".into(), json!(materials));
         }
         if !images.is_empty() {
-            // One texture per image, all sharing a repeating, mipmapped sampler.
-            doc["samplers"] = json!([{ "magFilter": 9729, "minFilter": 9987, "wrapS": 10497, "wrapT": 10497 }]);
-            doc["textures"] = json!(
-                (0..images.len())
-                    .map(|i| json!({ "sampler": 0, "source": i }))
-                    .collect::<Vec<_>>()
+            json.insert(
+                "samplers".into(),
+                json!([{ "magFilter": 9729, "minFilter": 9987, "wrapS": 10497, "wrapT": 10497 }]),
             );
-            doc["images"] = json!(images);
-        }
-        let Value::Object(json) = doc else { unreachable!() };
-        Document {
-            json,
-            buffers: vec![Blob::Parts(b.parts)],
-            facts,
+            let textures: Vec<Value> = (0..images.len())
+                .map(|i| json!({ "sampler": 0, "source": i }))
+                .collect();
+            json.insert("textures".into(), json!(textures));
+            json.insert("images".into(), json!(images));
         }
     }
-}
 
-/// Builds a document's one buffer from typed arrays, with a view and an accessor for each.
-#[derive(Default)]
-pub(crate) struct Builder {
-    pub parts: Parts,
-    pub views: Vec<Value>,
-    pub accessors: Vec<Value>,
-}
+    /// The document: `json` (scenes, nodes, meshes and the rest) with the asset, the accessors,
+    /// the views and the one buffer they're on.
+    pub(crate) fn finish(self, mut json: Map<String, Value>, facts: Map<String, Value>) -> Document<'static> {
+        let asset = json.entry("asset").or_insert_with(|| json!({}));
+        asset["version"] = json!("2.0");
+        if asset.get("generator").is_none() {
+            asset["generator"] = json!("mithril");
+        }
+        let mut buffers = Vec::new();
+        if !self.views.is_empty() {
+            json.insert("accessors".into(), Value::Array(self.accessors));
+            json.insert("bufferViews".into(), Value::Array(self.views));
+            json.insert("buffers".into(), json!([{ "byteLength": self.parts.len }]));
+            buffers.push(Blob::Parts(self.parts));
+        }
+        Document { json, buffers, facts }
+    }
 
-impl Builder {
     /// A buffer view of `part`; returns its index.
     pub(crate) fn view(&mut self, part: Part, target: Option<u32>) -> usize {
         let (at, len) = self.parts.push(part);

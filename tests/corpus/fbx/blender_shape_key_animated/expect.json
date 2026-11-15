@@ -1,0 +1,89 @@
+{
+  "spec": "binary FBX 7.4 as Blender's exporter writes it: a shape key whose value is animated",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.export_scene.fbx), tools/corpus/blender_export.py",
+  "triangles": 12,
+  "bounds": {
+    "min": [
+      -1.0,
+      -1.0,
+      -1.0
+    ],
+    "max": [
+      1.0,
+      1.0,
+      1.0
+    ]
+  },
+  "area": 24.0,
+  "tolerance": 0.001,
+  "document": {
+    "morph_targets": 1,
+    "animations": 1
+  },
+  "poses": [
+    {
+      "animation": 0,
+      "time": 0.0,
+      "bounds": {
+        "min": [
+          -1.0,
+          -1.0,
+          -1.0
+        ],
+        "max": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "animation": 0,
+      "time": 0.333333,
+      "bounds": {
+        "min": [
+          -1.0,
+          -1.0,
+          -1.0
+        ],
+        "max": [
+          1.0,
+          1.5185,
+          1.0
+        ]
+      }
+    },
+    {
+      "animation": 0,
+      "time": 0.666667,
+      "bounds": {
+        "min": [
+          -1.0,
+          -1.0,
+          -1.0
+        ],
+        "max": [
+          1.0,
+          2.4815,
+          1.0
+        ]
+      }
+    },
+    {
+      "animation": 0,
+      "time": 1.0,
+      "bounds": {
+        "min": [
+          -1.0,
+          -1.0,
+          -1.0
+        ],
+        "max": [
+          1.0,
+          3.0,
+          1.0
+        ]
+      }
+    }
+  ]
+}

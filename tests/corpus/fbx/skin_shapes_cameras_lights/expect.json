@@ -16,5 +16,18 @@
     ]
   },
   "faces_outward": true,
-  "vertices": 24
+  "vertices": 24,
+  "document": {
+    "skins": 1,
+    "cameras": 1,
+    "lights": 1,
+    "animations": 0,
+    "node_names": [
+      "Body",
+      "Hips",
+      "Spine",
+      "Camera",
+      "Sun"
+    ]
+  }
 }

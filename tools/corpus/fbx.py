@@ -800,11 +800,169 @@ s.obj(Node("NodeAttribute", L(51), ON("NodeAttribute", "Sun"), S("Light")), ("OO
 s.obj(Node("AnimationStack", L(60), ON("AnimStack", "Take 001"), S("")))
 write("skin_shapes_cameras_lights", s,
       "a skinned mesh with a blend shape, a skeleton, a camera, a light, a curve and an animation stack: the bind pose",
-      {"faces_outward": True, "vertices": 24})
+      {"faces_outward": True, "vertices": 24,
+       "document": {"skins": 1, "cameras": 1, "lights": 1, "animations": 0,
+                    "node_names": ["Body", "Hips", "Spine", "Camera", "Sun"]}})
 
 s = Scene()
 s.model(13, "Camera", kind="Camera")
-write("no_geometry", s, "only a camera", {"error": "no mesh"}, extra_stats=False)
+write("no_geometry", s, "only a camera: a document with nothing to draw", {"no_mesh": True, "facts": {"triangles": 0}}, extra_stats=False)
+
+# --- the document: hierarchy, skins, morph targets, animation, cameras, lights -------------
+
+KTIME = 46186158000
+
+
+def anim_stack(s, stack=60, layer=61, name="Take 001"):
+    s.obj(Node("AnimationStack", L(stack), ON("AnimStack", name), S("")))
+    s.obj(Node("AnimationLayer", L(layer), ON("AnimLayer", "BaseLayer"), S("")), ("OO", layer, stack))
+
+
+def anim_curves(s, target, prop, cn, curves, layer=61, defaults=None):
+    """An AnimationCurveNode on `target`'s `prop`, with a curve per component: {"d|X": (times, values, constant)}."""
+    defaults = defaults or {}
+    comps = ["d|X", "d|Y", "d|Z"] if prop.startswith("Lcl") else list(curves)
+    s.obj(Node("AnimationCurveNode", L(cn), ON("AnimCurveNode", prop.split()[-1][0]), S(""), children=[
+        props70(*[P(c, "Number", "", "A", defaults.get(c, 0.0)) for c in comps])]),
+        ("OO", cn, layer), ("OP", cn, target, prop))
+    for k, (comp, (times, values, constant)) in enumerate(curves.items()):
+        cid = cn * 10 + k + 1
+        s.obj(Node("AnimationCurve", L(cid), ON("AnimCurve", ""), S(""), children=[
+            Node("Default", D(0)), Node("KeyVer", I(4008)),
+            Node("KeyTime", AL([round(t * KTIME) for t in times])),
+            Node("KeyValueFloat", AF(values)),
+            Node("KeyAttrFlags", AI([0x2 if constant else 0x4])),
+            Node("KeyAttrDataFloat", AI([0, 0, 0, 0])),
+            Node("KeyAttrRefCount", AI([len(times)]))]), ("OP", cid, cn, comp))
+
+
+def box(lo, hi):
+    return {"min": [r(c) for c in lo], "max": [r(c) for c in hi]}
+
+
+# A cube sliding 1 m along X over a second.
+s = Scene()
+s.model(10, "Cube")
+s.geometry(cube_geometry(), 10)
+anim_stack(s)
+anim_curves(s, 10, "Lcl Translation", 70, {"d|X": ([0, 1], [0, 100], False)})
+write("anim_translate", s, "Lcl Translation animated on X: a translation channel, sampled linearly",
+      {"document": {"animations": 1, "channels": 1},
+       "poses": [{"animation": 0, "time": 0, "bounds": box((0, 0, 0), (1, 1, 1))},
+                 {"animation": 0, "time": 0.5, "bounds": box((0.5, 0, 0), (1.5, 1, 1))},
+                 {"animation": 0, "time": 1, "bounds": box((1, 0, 0), (2, 1, 1))},
+                 {"animation": 0, "time": 5, "bounds": box((1, 0, 0), (2, 1, 1))}]})
+
+# Constant keys hold until the next.
+s = Scene()
+s.model(10, "Cube")
+s.geometry(cube_geometry(), 10)
+anim_stack(s)
+anim_curves(s, 10, "Lcl Translation", 70, {"d|Y": ([0, 1, 2], [0, 100, 200], True)})
+write("anim_constant_keys", s, "constant (stepped) keys: the value holds until the next key",
+      {"document": {"animations": 1},
+       "poses": [{"animation": 0, "time": 0.5, "bounds": box((0, 0, 0), (1, 1, 1))},
+                 {"animation": 0, "time": 1.5, "bounds": box((0, 1, 0), (1, 2, 1))},
+                 {"animation": 0, "time": 2, "bounds": box((0, 2, 0), (1, 3, 1))}]})
+
+# Half a turn about Z: the Euler angle turns evenly, which a quaternion only follows in short steps.
+s = Scene()
+s.model(10, "Cube")
+s.geometry(cube_geometry(), 10)
+anim_stack(s)
+anim_curves(s, 10, "Lcl Rotation", 70, {"d|Z": ([0, 1], [0, 180], False)})
+h = math.sqrt(0.5)
+write("anim_rotate_half_turn", s, "Lcl Rotation turning 180 degrees about Z in one pair of keys",
+      {"document": {"animations": 1, "channels": 1},
+       "poses": [{"animation": 0, "time": 0.25, "bounds": box((-h, 0, 0), (h, 2 * h, 1))},
+                 {"animation": 0, "time": 0.5, "bounds": box((-1, 0, 0), (0, 1, 1))},
+                 {"animation": 0, "time": 1, "bounds": box((-1, -1, 0), (0, 0, 1))}]})
+
+# An animated child under a scaled, Z-up, meter file: the root carries the axes and unit.
+s = Scene(up=(2, 1), front=(1, -1), coord=(0, 1), unit=100.0)
+s.model(9, "Base", S=(2, 2, 2))
+s.model(10, "Cube", parent=9)
+s.geometry(cube_geometry(size=0.5), 10)
+anim_stack(s)
+anim_curves(s, 10, "Lcl Translation", 70, {"d|Z": ([0, 1], [0, 1], False)})
+write("anim_under_axes", s, "a Z-up meter file, a scaled parent and a child animated along Z (up)",
+      {"document": {"animations": 1, "node_names": ["Base", "Cube", "RootNode"]},
+       "poses": [{"animation": 0, "time": 1, "bounds": box((0, 2, -1), (1, 3, 0))}]})
+
+# Two bones; the top of the cube follows the second, which slides 1 m along X.
+s = Scene()
+s.model(10, "Body")
+s.model(11, "Root", kind="LimbNode")
+s.model(12, "Tip", kind="LimbNode", parent=11, T=(0, 50, 0))
+s.geometry(cube_geometry(), 10)
+IDENT = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+s.obj(Node("Deformer", L(40), ON("Deformer", "Skin"), S("Skin"), children=[Node("Version", I(101))]), ("OO", 40, 1))
+# `Transform` is the mesh's space in the bone's at bind time: the inverse of `TransformLink` for a mesh at the origin.
+for cid, bone, verts, link, transform in [(41, 11, [0, 1, 4, 5], IDENT, IDENT),
+                                          (42, 12, [2, 3, 6, 7], IDENT[:13] + [50, 0, 1], IDENT[:13] + [-50, 0, 1])]:
+    s.obj(Node("Deformer", L(cid), ON("SubDeformer", f"Cluster {cid}"), S("Cluster"), children=[
+        Node("Version", I(100)), Node("Indexes", AI(verts)), Node("Weights", AD([1] * len(verts))),
+        Node("Transform", AD(transform)), Node("TransformLink", AD(link))]), ("OO", cid, 40), ("OO", bone, cid))
+anim_stack(s)
+anim_curves(s, 12, "Lcl Translation", 70, {"d|X": ([0, 1], [0, 100], False)}, defaults={"d|Y": 50})
+write("skin_two_bones", s, "a cube skinned to two bones; the top bone's translation is animated",
+      {"vertices": 24, "document": {"skins": 1, "joints": 3, "animations": 1, "node_names": ["Root", "Tip"]},
+       "poses": [{"animation": 0, "time": 1, "bounds": box((0, 0, 0), (2, 1, 1))}]})
+
+# The same skin bound away from where the file leaves its bones: the bind pose comes from the clusters.
+s = Scene()
+s.model(10, "Body")
+s.model(11, "Root", kind="LimbNode", R=(0, 0, 90))
+s.geometry(cube_geometry(), 10)
+s.obj(Node("Deformer", L(40), ON("Deformer", "Skin"), S("Skin"), children=[Node("Version", I(101))]), ("OO", 40, 1))
+s.obj(Node("Deformer", L(41), ON("SubDeformer", "Cluster"), S("Cluster"), children=[
+    Node("Version", I(100)), Node("Indexes", AI(range(8))), Node("Weights", AD([1] * 8)),
+    Node("Transform", AD(IDENT)), Node("TransformLink", AD(IDENT))]), ("OO", 41, 40), ("OO", 11, 41))
+write("skin_posed_bone", s, "a skin bound with its bone unrotated, the bone left turned 90 degrees about Z",
+      {"vertices": 24, "document": {"skins": 1}, "bounds": box((-1, 0, 0), (0, 1, 1))}, extra_stats=False)
+
+# A blend shape raising the cube's top, its weight animated.
+s = Scene()
+s.model(10, "Cube")
+s.geometry(cube_geometry(), 10)
+s.obj(Node("Geometry", L(2), ON("Geometry", "Raise"), S("Shape"), children=[
+    Node("Version", I(100)), Node("Indexes", AI([2, 3, 6, 7])), Node("Vertices", AD([0, 100, 0] * 4)),
+    Node("Normals", AD([0, 0, 0] * 4))]))
+s.obj(Node("Deformer", L(42), ON("Deformer", "Morph"), S("BlendShape"), children=[Node("Version", I(100))]),
+      ("OO", 42, 1))
+s.obj(Node("Deformer", L(43), ON("SubDeformer", "Raise"), S("BlendShapeChannel"), children=[
+    Node("Version", I(100)), Node("DeformPercent", D(0)), Node("FullWeights", AD([100])),
+    props70(P("DeformPercent", "Number", "", "A", 25))]), ("OO", 43, 42), ("OO", 2, 43))
+anim_stack(s)
+anim_curves(s, 43, "DeformPercent", 70, {"d|DeformPercent": ([0, 1], [0, 100], False)})
+write("blend_shape_animated", s, "a blend shape at 25%, its DeformPercent animated from 0 to 100",
+      {"document": {"animations": 1, "morph_targets": 1}, "bounds": box((0, 0, 0), (1, 1.25, 1)),
+       "poses": [{"animation": 0, "time": 0, "bounds": box((0, 0, 0), (1, 1, 1))},
+                 {"animation": 0, "time": 0.5, "bounds": box((0, 0, 0), (1, 1.5, 1))},
+                 {"animation": 0, "time": 1, "bounds": box((0, 0, 0), (1, 2, 1))}]}, extra_stats=False)
+
+# Cameras and lights of each kind.
+s = Scene()
+s.model(10, "Cube")
+s.geometry(cube_geometry(), 10)
+s.model(13, "Persp", kind="Camera", T=(0, 0, 500))
+s.model(14, "Ortho", kind="Camera", T=(0, 500, 0))
+s.model(15, "Bulb", kind="Light", T=(0, 200, 0))
+s.model(16, "Sun", kind="Light", R=(-45, 0, 0))
+s.model(17, "Spot", kind="Light", T=(0, 300, 0))
+s.model(18, "Area", kind="Light")
+s.obj(Node("NodeAttribute", L(50), ON("NodeAttribute", "Persp"), S("Camera"), children=[props70(
+    P("FieldOfView", "FieldOfView", "", "A", 60), P("AspectWidth", "double", "Number", "", 1920),
+    P("AspectHeight", "double", "Number", "", 1080), P("NearPlane", "double", "Number", "", 10),
+    P("FarPlane", "double", "Number", "", 10000))]), ("OO", 50, 13))
+s.obj(Node("NodeAttribute", L(51), ON("NodeAttribute", "Ortho"), S("Camera"), children=[props70(
+    P("CameraProjectionType", "enum", "", "", 1))]), ("OO", 51, 14))
+for aid, mid, kind in [(52, 15, 0), (53, 16, 1), (54, 17, 2), (55, 18, 3)]:
+    s.obj(Node("NodeAttribute", L(aid), ON("NodeAttribute", "L"), S("Light"), children=[props70(
+        P("LightType", "enum", "", "", kind), P("Color", "Color", "", "A", 1, 0.5, 0.25),
+        P("Intensity", "Number", "", "A", 200), P("OuterAngle", "Number", "", "A", 60))]), ("OO", aid, mid))
+write("cameras_and_lights", s, "a perspective and an orthographic camera; point, directional, spot and area lights",
+      {"document": {"cameras": 2, "lights": 3, "node_names": ["Persp", "Ortho", "Bulb", "Sun", "Spot", "Area"]}})
 
 # --- files that aren't readable ------------------------------------------------------------
 

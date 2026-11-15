@@ -166,6 +166,70 @@ fn flattened(doc: Document<'_>) -> mithril::Result<Loaded<'_>> {
     Ok((doc, mesh))
 }
 
+/// `document`: how many of each thing the glTF JSON holds (`nodes`, `skins`, `animations`, `cameras`, `lights`,
+/// `joints` across skins, `morph_targets` across meshes' first primitives, `channels` across animations), and
+/// `node_names` that must be there.
+fn document(e: &Map<String, Value>, doc: &Document<'_>) -> Result<(), String> {
+    let Some(want) = e.get("document") else { return Ok(()) };
+    let j = &doc.json;
+    let list = |k: &str| j.get(k).and_then(Value::as_array).cloned().unwrap_or_default();
+    let sum = |k: &str, f: &dyn Fn(&Value) -> usize| list(k).iter().map(f).sum::<usize>();
+    let len = |v: Option<&Value>| v.and_then(Value::as_array).map_or(0, Vec::len);
+    let have = |key: &str| -> usize {
+        match key {
+            "lights" => len(j
+                .get("extensions")
+                .and_then(|x| x.pointer("/KHR_lights_punctual/lights"))),
+            "joints" => sum("skins", &|s| len(s.get("joints"))),
+            "morph_targets" => sum("meshes", &|m| len(m.pointer("/primitives/0/targets"))),
+            "channels" => sum("animations", &|a| len(a.get("channels"))),
+            k => list(k).len(),
+        }
+    };
+    for (key, v) in want.as_object().into_iter().flatten() {
+        if key == "node_names" {
+            for name in v.as_array().into_iter().flatten() {
+                if !list("nodes").iter().any(|n| n.get("name") == Some(name)) {
+                    return Err(format!("no node is named {name}"));
+                }
+            }
+            continue;
+        }
+        let n = have(key);
+        if Some(n as u64) != v.as_u64() {
+            return Err(format!("document has {n} {key}, expected {v}"));
+        }
+    }
+    Ok(())
+}
+
+/// `poses`: the bounds of what's drawn in animation `animation` at `time` seconds.
+fn poses(e: &Map<String, Value>, doc: &Document<'_>, tol: f32) -> Result<(), String> {
+    for p in e.get("poses").and_then(Value::as_array).into_iter().flatten() {
+        let index = p["animation"].as_u64().unwrap_or(0) as usize;
+        let time = p["time"].as_f64().unwrap_or(0.0) as f32;
+        let mesh = doc
+            .flatten(Pose::Animation { index, time })
+            .map_err(|err| format!("animation {index} at {time}: {err}"))?
+            .ok_or_else(|| format!("animation {index} at {time} draws nothing"))?;
+        let (want_min, want_max) = (floats(&p["bounds"]["min"]), floats(&p["bounds"]["max"]));
+        let mut min = [f32::MAX; 3];
+        let mut max = [f32::MIN; 3];
+        for v in mesh.prims.iter().flat_map(|p| &p.positions) {
+            for k in 0..3 {
+                min[k] = min[k].min(v[k]);
+                max[k] = max[k].max(v[k]);
+            }
+        }
+        if !close(&min, &want_min, tol) || !close(&max, &want_max, tol) {
+            return Err(format!(
+                "animation {index} at {time}: bounds are {min:?}..{max:?}, expected {want_min:?}..{want_max:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Writes the case's document as a GLB under `target/conformance/`, for the Khronos validator.
 fn keep_glb(case: &Case, doc: &Document<'_>) -> Result<(), String> {
     let rel = relative(&case.dir, &corpus());
@@ -203,6 +267,8 @@ fn run(case: &Case) -> Result<(), String> {
             }
         }
     }
+    document(e, &doc)?;
+    poses(e, &doc, tol)?;
     if e.get("no_mesh").and_then(Value::as_bool) == Some(true) {
         return match mesh {
             None => Ok(()),

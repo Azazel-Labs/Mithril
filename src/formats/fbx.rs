@@ -1,7 +1,9 @@
-//! Binary FBX (7.x) to a `meshes::Mesh`: geometry with normals, UVs and vertex colors, materials with their diffuse,
-//! emissive and shininess and their textures (embedded or found in the pack), node transforms through the hierarchy
-//! (pivots, offsets, pre- and post-rotation, rotation order, geometric transforms), and the file's axis system and
-//! unit converted to glTF's Y-up meters. Skinning and animation aren't carried over: the result is the bind pose.
+//! FBX (binary 7.x, and ASCII) as a glTF document: the model hierarchy with each model's transform (pivots, offsets,
+//! pre- and post-rotation, rotation order; geometric transforms on a child node), meshes in their own space and shared
+//! between instances, materials and their textures (embedded or found in the pack), skins from skin clusters, morph
+//! targets from blend shapes, animation stacks sampled into translation, rotation, scale and weights channels,
+//! cameras, lights, and user properties as node extras. The file's axis system and unit become a root node that
+//! carries them to glTF's Y-up meters, and are recorded in `asset.extras.source`.
 //!
 //! Colors are sRGB, as the FBX SDK's tools write them, except that Blender writes material colors linear; vertex
 //! colors are sRGB from every tool, Blender included (its exporter's default).
@@ -12,9 +14,11 @@ use std::path::Path;
 use crate::{Context as _, Result};
 use fbxcel::low::v7400::AttributeValue as A;
 use fbxcel::tree::v7400::NodeHandle;
+use serde_json::{Map, Value, json};
 
 use crate::assets::Assets;
-use crate::mesh::{GRAY, Image, Material, Mesh, Prim, smooth_normals, srgb_to_linear, triangulate};
+use crate::document::{Builder, Document, Keep, Part};
+use crate::mesh::{GRAY, Image, Material, Prim, smooth_normals, srgb_to_linear, triangulate};
 use crate::num::f32_of;
 
 const MAX_TRIANGLES: usize = 4_000_000;
@@ -78,33 +82,6 @@ fn rotate(deg: [f64; 3], order: i32) -> M4 {
         5 => mul(&rx, &mul(&ry, &rz)), // ZYX
         _ => mul(&rz, &mul(&ry, &rx)), // XYZ
     }
-}
-
-fn apply(m: &M4, p: [f64; 3]) -> [f64; 3] {
-    [0, 1, 2].map(|i| m[i][0] * p[0] + m[i][1] * p[1] + m[i][2] * p[2] + m[i][3])
-}
-
-/// The matrix that carries normals through `m`: the inverse transpose of its 3x3 part (cofactors over the
-/// determinant, whose sign keeps a mirrored normal pointing out).
-fn normal_matrix(m: &M4) -> M4 {
-    let d = det3(m);
-    let mut n = IDENTITY;
-    if d.abs() < 1e-300 {
-        return n;
-    }
-    for (i, row) in n.iter_mut().enumerate().take(3) {
-        for (j, v) in row.iter_mut().enumerate().take(3) {
-            let (i1, i2, j1, j2) = ((i + 1) % 3, (i + 2) % 3, (j + 1) % 3, (j + 2) % 3);
-            *v = (m[i1][j1] * m[i2][j2] - m[i1][j2] * m[i2][j1]) / d;
-        }
-    }
-    n
-}
-
-fn apply_dir(m: &M4, d: [f64; 3]) -> [f64; 3] {
-    let v = [0, 1, 2].map(|i| m[i][0] * d[0] + m[i][1] * d[1] + m[i][2] * d[2]);
-    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    if len > 0.0 { v.map(|c| c / len) } else { [0.0, 1.0, 0.0] }
 }
 
 fn det3(m: &M4) -> f64 {
@@ -231,16 +208,15 @@ impl Layer {
     }
 }
 
-/// Object id → (node, class).
-struct Objects<'a> {
-    nodes: HashMap<i64, (NodeHandle<'a>, String)>,
-    /// child → parents (object-object connections), in file order.
-    parents: HashMap<i64, Vec<i64>>,
-    /// parent → children with the property they plug into ("" for object-object).
-    children: HashMap<i64, Vec<(i64, String)>>,
-}
+/// FBX time units per second.
+const KTIME: f64 = 46_186_158_000.0;
 
-pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets) -> Result<Mesh> {
+/// The most degrees a rotation curve may turn between two samples: FBX interpolates Euler
+/// angles, glTF quaternions, so long turns are cut into steps short enough to agree.
+const MAX_STEP_DEGREES: f64 = 10.0;
+
+/// Reads an FBX file (binary 7.x, or ASCII) as a glTF document.
+pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets, keep: Keep) -> Result<Document<'static>> {
     let mut data = input.read()?;
     if super::fbx_ascii::is_ascii(&data) {
         data = super::fbx_ascii::to_binary(&data)
@@ -257,7 +233,7 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets) -> Result<Mesh>
             v % 1000 / 100
         );
     }
-    let fbxcel::tree::any::AnyTree::V7400(_, tree, _) =
+    let fbxcel::tree::any::AnyTree::V7400(version, tree, _) =
         fbxcel::tree::any::AnyTree::from_seekable_reader(std::io::Cursor::new(data))
             .map_err(|e| invalid!("not a readable FBX file: {e}"))?
     else {
@@ -269,17 +245,25 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets) -> Result<Mesh>
             .and_then(|c| c.attributes().first().and_then(string).map(str::to_owned))
             .unwrap_or_default()
     };
-    let linear = creator(Some(rootnode)).contains("Blender")
-        || creator(rootnode.first_child_by_name("FBXHeaderExtension")).contains("Blender");
+    let creator = [
+        creator(Some(rootnode)),
+        creator(rootnode.first_child_by_name("FBXHeaderExtension")),
+    ]
+    .into_iter()
+    .find(|c| !c.is_empty())
+    .unwrap_or_default();
     let objects_node = rootnode.first_child_by_name("Objects").context("FBX has no Objects")?;
     let mut objs = Objects {
         nodes: HashMap::new(),
+        order: Vec::new(),
         parents: HashMap::new(),
         children: HashMap::new(),
     };
     for o in objects_node.children() {
-        if let Some(id) = o.attributes().first().and_then(id) {
-            objs.nodes.insert(id, (o, o.name().to_owned()));
+        if let Some(id) = o.attributes().first().and_then(id)
+            && objs.nodes.insert(id, (o, o.name().to_owned())).is_none()
+        {
+            objs.order.push(id);
         }
     }
     if let Some(conns) = rootnode.first_child_by_name("Connections") {
@@ -302,7 +286,8 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets) -> Result<Mesh>
         }
     }
 
-    // The file's axis system and unit, mapped to glTF (X right, Y up, Z toward the viewer, meters).
+    // The file's axis system and unit, mapped to glTF (X right, Y up, Z toward the viewer,
+    // meters) by a root node.
     let settings = rootnode
         .first_child_by_name("GlobalSettings")
         .map(props)
@@ -319,7 +304,8 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets) -> Result<Mesh>
     let (up, up_s) = axis("UpAxis", "UpAxisSign", 1);
     let (front, front_s) = axis("FrontAxis", "FrontAxisSign", 2);
     let (coord, coord_s) = axis("CoordAxis", "CoordAxisSign", 0);
-    let unit = scalar(&settings, "UnitScaleFactor").unwrap_or(1.0) / 100.0;
+    let unit_cm = scalar(&settings, "UnitScaleFactor").unwrap_or(1.0);
+    let unit = unit_cm / 100.0;
     let mut basis = [[0.0; 4]; 4];
     basis[0][coord] = coord_s * unit;
     basis[1][up] = up_s * unit;
@@ -329,157 +315,1257 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets) -> Result<Mesh>
     if det3(&basis).abs() < 1e-12 {
         basis = scale([unit; 3]);
     }
+    let named = |a: usize, s: f64| format!("{}{}", if s < 0.0 { '-' } else { '+' }, ["X", "Y", "Z"][a]);
+    let source = json!({
+        "format": "FBX",
+        "version": format!("{}.{}", version.major(), version.minor()),
+        "creator": creator,
+        "unitMeters": unit,
+        "upAxis": named(up, up_s),
+        "frontAxis": named(front, front_s),
+        "coordAxis": named(coord, coord_s),
+    });
 
-    let mut world_cache: HashMap<i64, M4> = HashMap::new();
-    let dir = input.dir();
-    let mut mesh = Mesh::default();
-    let mut material_index: HashMap<i64, usize> = HashMap::new();
-    let mut image_index: HashMap<i64, Option<usize>> = HashMap::new();
+    let mut r = Reader {
+        objs: &objs,
+        linear: creator.contains("Blender"),
+        dir: input.dir(),
+        assets,
+        keep,
+        b: Builder::default(),
+        nodes: Vec::new(),
+        node_of: HashMap::new(),
+        meshes: Vec::new(),
+        mesh_of: HashMap::new(),
+        materials: Vec::new(),
+        images: Vec::new(),
+        material_index: HashMap::new(),
+        image_index: HashMap::new(),
+        default_material: None,
+        textured: Vec::new(),
+        skins: Vec::new(),
+        skin_of: HashMap::new(),
+        cameras: Vec::new(),
+        lights: Vec::new(),
+        channel_users: HashMap::new(),
+        morphs: HashMap::new(),
+        unit,
+        skinned_roots: Vec::new(),
+    };
+    let models: Vec<i64> = objs.order.iter().copied().filter(|id| objs.is("Model", *id)).collect();
+    for &m in &models {
+        let node = r.model_node(m);
+        r.nodes.push(node);
+        r.node_of.insert(m, r.nodes.len() - 1);
+    }
+    // Parents, once every model has its node.
+    let mut roots = Vec::new();
+    for &m in &models {
+        let n = r.node_of[&m];
+        match objs.model_parent(m).and_then(|p| r.node_of.get(&p)) {
+            Some(&p) if p != n && !r.is_ancestor(n, p) => r.add_child(p, n),
+            _ => roots.push(n),
+        }
+    }
+    for &m in &models {
+        r.attach(m)?;
+    }
+    // A geometry no model holds is drawn where it is.
+    for &g in &objs.order {
+        if objs.is_kind("Geometry", g, "Mesh") && !objs.parents_of(g).any(|p| objs.is("Model", p)) {
+            let mesh = r.mesh_for(g, 0)?;
+            r.nodes.push(json!({ "mesh": mesh }));
+            roots.push(r.nodes.len() - 1);
+        }
+    }
+    let animations = if keep.animations { r.animations() } else { Vec::new() };
+    let mut scene_nodes = roots;
+    if basis != IDENTITY {
+        let mut root = json!({ "name": "RootNode", "children": scene_nodes });
+        set_transform(&mut root, &basis);
+        r.nodes.push(root);
+        scene_nodes = vec![r.nodes.len() - 1];
+    }
+    scene_nodes.append(&mut r.skinned_roots);
+    ensure!(!r.nodes.is_empty(), "FBX has no mesh geometry");
 
-    let geometries: Vec<i64> = objs
-        .nodes
-        .iter()
-        .filter(|(_, (n, _))| n.name() == "Geometry" && kind_of(*n) == "Mesh")
-        .map(|(id, _)| *id)
-        .collect();
-    let mut geometries = geometries;
-    geometries.sort_unstable();
-    for gid in geometries {
-        let (geom, _) = objs.nodes[&gid];
-        // A geometry can be instanced by several models.
-        let models: Vec<i64> = objs
-            .parents
-            .get(&gid)
-            .map(|p| {
-                p.iter()
-                    .copied()
-                    .filter(|m| objs.nodes.get(m).is_some_and(|(n, _)| n.name() == "Model"))
-                    .collect()
+    if !r.textured.is_empty()
+        && !r.materials.iter().any(|m| m.color_image.is_some())
+        && let Some(img) = assets.color_texture_for(input.path).and_then(|p| assets.load_image(&p))
+    {
+        // A model that names no color texture takes one by name (see `guess_color_texture`).
+        r.images.push(img);
+        let i = r.images.len() - 1;
+        for &m in &r.textured {
+            r.materials[m].color_image = Some(i);
+            r.materials[m].color[..3].copy_from_slice(&[1.0, 1.0, 1.0]);
+        }
+    }
+
+    let mut json = Map::new();
+    json.insert("asset".into(), json!({ "extras": { "source": source } }));
+    json.insert("scene".into(), json!(0));
+    json.insert("scenes".into(), json!([{ "nodes": scene_nodes }]));
+    json.insert("nodes".into(), Value::Array(std::mem::take(&mut r.nodes)));
+    if !r.meshes.is_empty() {
+        json.insert("meshes".into(), Value::Array(std::mem::take(&mut r.meshes)));
+    }
+    if !r.skins.is_empty() {
+        json.insert("skins".into(), Value::Array(std::mem::take(&mut r.skins)));
+    }
+    if !animations.is_empty() {
+        json.insert("animations".into(), Value::Array(animations));
+    }
+    if !r.cameras.is_empty() {
+        json.insert("cameras".into(), Value::Array(std::mem::take(&mut r.cameras)));
+    }
+    if !r.lights.is_empty() {
+        json.insert("extensionsUsed".into(), json!(["KHR_lights_punctual"]));
+        json.insert(
+            "extensions".into(),
+            json!({ "KHR_lights_punctual": { "lights": std::mem::take(&mut r.lights) } }),
+        );
+    }
+    let (materials, images) = (std::mem::take(&mut r.materials), std::mem::take(&mut r.images));
+    let mut b = r.b;
+    b.materials(&materials, images, &mut json);
+    Ok(b.finish(json, Map::new()))
+}
+
+/// Object id → (node, class), and how objects connect.
+struct Objects<'a> {
+    nodes: HashMap<i64, (NodeHandle<'a>, String)>,
+    /// Object ids in file order.
+    order: Vec<i64>,
+    /// child → parents (object-object connections), in file order.
+    parents: HashMap<i64, Vec<i64>>,
+    /// parent → children with the property they plug into ("" for object-object).
+    children: HashMap<i64, Vec<(i64, String)>>,
+}
+
+impl<'a> Objects<'a> {
+    fn node(&self, id: i64) -> Option<NodeHandle<'a>> {
+        self.nodes.get(&id).map(|(n, _)| *n)
+    }
+
+    /// Whether object `id` is a `class` node (`Model`, `Geometry`, `Deformer`, ...).
+    fn is(&self, class: &str, id: i64) -> bool {
+        self.node(id).is_some_and(|n| n.name() == class)
+    }
+
+    /// Whether object `id` is a `class` node of `kind` (`Geometry: id, "Name", "Mesh"`).
+    fn is_kind(&self, class: &str, id: i64, kind: &str) -> bool {
+        self.node(id).is_some_and(|n| n.name() == class && kind_of(n) == kind)
+    }
+
+    fn parents_of(&self, id: i64) -> impl Iterator<Item = i64> + '_ {
+        self.parents.get(&id).into_iter().flatten().copied()
+    }
+
+    /// Object-object children of `id`.
+    fn children_of(&self, id: i64) -> impl Iterator<Item = i64> + '_ {
+        self.children
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .filter(|(_, p)| p.is_empty())
+            .map(|(c, _)| *c)
+    }
+
+    /// The child plugged into `id`'s property `prop`.
+    fn child_at<'s>(&'s self, id: i64, prop: &'s str) -> impl Iterator<Item = i64> + 's {
+        self.children
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .filter(move |(_, p)| p == prop)
+            .map(|(c, _)| *c)
+    }
+
+    fn model_parent(&self, id: i64) -> Option<i64> {
+        self.parents_of(id).find(|p| self.is("Model", *p))
+    }
+}
+
+/// An object's name, without its `\0\x01Class` suffix.
+fn name_of(node: NodeHandle<'_>) -> Option<&str> {
+    let name = node.attributes().get(1).and_then(string)?.split('\0').next()?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// A model's local transform: `T * Roff * Rp * Rpre * R * Rpost^-1 * Rp^-1 * Soff * Sp * S * Sp^-1`, the FBX SDK's
+/// order, with `t`, `r` and `s` standing in for its `Lcl` properties when given.
+fn local_of(p: &Props, t: Option<[f64; 3]>, r: Option<[f64; 3]>, s: Option<[f64; 3]>) -> M4 {
+    #[allow(clippy::cast_possible_truncation, reason = "an enum value; `as` saturates bad ones")]
+    let order = scalar(p, "RotationOrder").map_or(0, |v| v as i32);
+    let r_pre = rotate(vec3(p, "PreRotation", [0.0; 3]), 0);
+    let r_post_inv = transpose3(&rotate(vec3(p, "PostRotation", [0.0; 3]), 0));
+    let rp = vec3(p, "RotationPivot", [0.0; 3]);
+    let sp = vec3(p, "ScalingPivot", [0.0; 3]);
+    [
+        translate(t.unwrap_or_else(|| vec3(p, "Lcl Translation", [0.0; 3]))),
+        translate(vec3(p, "RotationOffset", [0.0; 3])),
+        translate(rp),
+        r_pre,
+        rotate(r.unwrap_or_else(|| vec3(p, "Lcl Rotation", [0.0; 3])), order),
+        r_post_inv,
+        translate(rp.map(|c| -c)),
+        translate(vec3(p, "ScalingOffset", [0.0; 3])),
+        translate(sp),
+        scale(s.unwrap_or_else(|| vec3(p, "Lcl Scaling", [1.0; 3]))),
+        translate(sp.map(|c| -c)),
+    ]
+    .iter()
+    .fold(IDENTITY, |acc, m| mul(&acc, m))
+}
+
+/// The transpose of a rotation (its inverse).
+fn transpose3(r: &M4) -> M4 {
+    let mut t = IDENTITY;
+    for i in 0..3 {
+        for j in 0..3 {
+            t[i][j] = r[j][i];
+        }
+    }
+    t
+}
+
+/// A model's geometric transform: applied to what it holds, not passed to its children.
+fn geometric_of(p: &Props) -> M4 {
+    mul(
+        &translate(vec3(p, "GeometricTranslation", [0.0; 3])),
+        &mul(
+            &rotate(vec3(p, "GeometricRotation", [0.0; 3]), 0),
+            &scale(vec3(p, "GeometricScaling", [1.0; 3])),
+        ),
+    )
+}
+
+/// The inverse of an affine transform.
+fn inverse(m: &M4) -> M4 {
+    let d = det3(m);
+    if d.abs() < 1e-300 {
+        return IDENTITY;
+    }
+    let mut r = IDENTITY;
+    for (i, row) in r.iter_mut().enumerate().take(3) {
+        for (j, v) in row.iter_mut().enumerate().take(3) {
+            let (i1, i2, j1, j2) = ((j + 1) % 3, (j + 2) % 3, (i + 1) % 3, (i + 2) % 3);
+            *v = (m[i1][j1] * m[i2][j2] - m[i1][j2] * m[i2][j1]) / d;
+        }
+    }
+    let t = [0, 1, 2].map(|i| -(0..3).map(|k| r[i][k] * m[k][3]).sum::<f64>());
+    for (row, t) in r.iter_mut().zip(t) {
+        row[3] = t;
+    }
+    r
+}
+
+/// A 4x4 matrix as glTF lists it: column by column.
+fn column_major(m: &M4) -> [f64; 16] {
+    std::array::from_fn(|k| m[k % 4][k / 4])
+}
+
+/// An affine transform as translation, rotation (a unit quaternion, x y z w) and scale; `exact` is false when it
+/// shears, which TRS can't hold.
+struct Trs {
+    t: [f64; 3],
+    r: [f64; 4],
+    s: [f64; 3],
+    exact: bool,
+}
+
+fn decompose(m: &M4) -> Trs {
+    let t = [m[0][3], m[1][3], m[2][3]];
+    let col = |j: usize| [m[0][j], m[1][j], m[2][j]];
+    let len = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    let mut s = [len(col(0)), len(col(1)), len(col(2))];
+    if det3(m) < 0.0 {
+        s[0] = -s[0];
+    }
+    if s.iter().any(|v| v.abs() < 1e-300) {
+        return Trs {
+            t,
+            r: [0.0, 0.0, 0.0, 1.0],
+            s,
+            exact: false,
+        };
+    }
+    let rot: [[f64; 3]; 3] = std::array::from_fn(|i| std::array::from_fn(|j| m[i][j] / s[j]));
+    let mut exact = true;
+    for a in 0..3 {
+        for b in 0..3 {
+            let dot: f64 = (0..3).map(|k| rot[k][a] * rot[k][b]).sum();
+            let want = if a == b { 1.0 } else { 0.0 };
+            if (dot - want).abs() > 1e-6 {
+                exact = false;
+            }
+        }
+    }
+    Trs {
+        t,
+        r: quaternion(&rot),
+        s,
+        exact,
+    }
+}
+
+/// A rotation matrix's unit quaternion (x, y, z, w).
+fn quaternion(m: &[[f64; 3]; 3]) -> [f64; 4] {
+    let trace = m[0][0] + m[1][1] + m[2][2];
+    let q = if trace > 0.0 {
+        let s = (trace + 1.0).sqrt() * 2.0;
+        [
+            (m[2][1] - m[1][2]) / s,
+            (m[0][2] - m[2][0]) / s,
+            (m[1][0] - m[0][1]) / s,
+            s / 4.0,
+        ]
+    } else if m[0][0] > m[1][1] && m[0][0] > m[2][2] {
+        let s = (1.0 + m[0][0] - m[1][1] - m[2][2]).sqrt() * 2.0;
+        [
+            s / 4.0,
+            (m[0][1] + m[1][0]) / s,
+            (m[0][2] + m[2][0]) / s,
+            (m[2][1] - m[1][2]) / s,
+        ]
+    } else if m[1][1] > m[2][2] {
+        let s = (1.0 + m[1][1] - m[0][0] - m[2][2]).sqrt() * 2.0;
+        [
+            (m[0][1] + m[1][0]) / s,
+            s / 4.0,
+            (m[1][2] + m[2][1]) / s,
+            (m[0][2] - m[2][0]) / s,
+        ]
+    } else {
+        let s = (1.0 + m[2][2] - m[0][0] - m[1][1]).sqrt() * 2.0;
+        [
+            (m[0][2] + m[2][0]) / s,
+            (m[1][2] + m[2][1]) / s,
+            s / 4.0,
+            (m[1][0] - m[0][1]) / s,
+        ]
+    };
+    let n = q.iter().map(|c| c * c).sum::<f64>().sqrt();
+    q.map(|c| c / n)
+}
+
+/// Sets a node's transform: TRS where it holds one, else the matrix.
+fn set_transform(node: &mut Value, m: &M4) {
+    let d = decompose(m);
+    if !d.exact {
+        node["matrix"] = json!(column_major(m));
+        return;
+    }
+    if d.t.iter().any(|&c| c != 0.0) {
+        node["translation"] = json!(d.t);
+    }
+    if (d.r[3] - 1.0).abs() > 1e-12 {
+        node["rotation"] = json!(d.r);
+    }
+    if d.s.iter().any(|&c| (c - 1.0).abs() > 1e-12) {
+        node["scale"] = json!(d.s);
+    }
+}
+
+/// A property's values as JSON: a number, a string, or a list of them.
+fn prop_json(vals: &[A]) -> Option<Value> {
+    let one = |v: &A| match v {
+        A::String(s) => Some(json!(s.split('\0').next().unwrap_or(""))),
+        A::Bool(b) => Some(json!(b)),
+        A::I16(i) => Some(json!(i)),
+        A::I32(i) => Some(json!(i)),
+        A::I64(i) => Some(json!(i)),
+        A::F32(f) if f.is_finite() => Some(json!(f)),
+        A::F64(f) if f.is_finite() => Some(json!(f)),
+        _ => None,
+    };
+    match vals {
+        [] => None,
+        [v] => one(v),
+        vs => vs.iter().map(one).collect::<Option<Vec<_>>>().map(Value::Array),
+    }
+}
+
+/// A model's user-defined properties (flagged `U`), for its node's extras.
+fn user_props(node: NodeHandle<'_>) -> Map<String, Value> {
+    let mut out = Map::new();
+    if let Some(p70) = node.first_child_by_name("Properties70") {
+        for p in p70.children_by_name("P") {
+            let a = p.attributes();
+            if let (Some(name), Some(flags)) = (a.first().and_then(string), a.get(3).and_then(string))
+                && flags.contains('U')
+                && let Some(v) = prop_json(a.get(4..).unwrap_or_default())
+            {
+                out.insert(name.to_owned(), v);
+            }
+        }
+    }
+    out
+}
+
+/// An animation curve: keys in seconds, and whether each holds its value until the next.
+struct Curve {
+    times: Vec<f64>,
+    values: Vec<f64>,
+    constant: Vec<bool>,
+}
+
+impl Curve {
+    fn read(node: NodeHandle<'_>) -> Option<Self> {
+        let times: Vec<f64> = child_attr(node, "KeyTime")
+            .and_then(ints)?
+            .into_iter()
+            .map(|t| {
+                #[allow(clippy::cast_precision_loss, reason = "FBX time to seconds, as the SDK does")]
+                let t = t as f64;
+                t / KTIME
             })
-            .unwrap_or_default();
-        for model in if models.is_empty() { vec![0] } else { models } {
-            let world = if model == 0 {
-                IDENTITY
+            .collect();
+        let values = floats(child_attr(node, "KeyValueFloat")?)?;
+        if times.is_empty() || times.len() != values.len() || times.windows(2).any(|w| w[1] < w[0]) {
+            return None;
+        }
+        // Flags are shared by runs of keys: flag i covers the next `KeyAttrRefCount[i]` keys.
+        let flags = child_attr(node, "KeyAttrFlags").and_then(ints).unwrap_or_default();
+        let counts = child_attr(node, "KeyAttrRefCount").and_then(ints).unwrap_or_default();
+        let mut constant = Vec::with_capacity(times.len());
+        for (f, n) in flags.iter().zip(&counts) {
+            for _ in 0..usize::try_from(*n).unwrap_or(0) {
+                if constant.len() < times.len() {
+                    constant.push(f & 0x2 != 0);
+                }
+            }
+        }
+        constant.resize(times.len(), false);
+        Some(Self {
+            times,
+            values,
+            constant,
+        })
+    }
+
+    /// The value at `t`: the first or last key's outside them, linear between keys (as
+    /// Blender's and Assimp's importers read FBX) unless the earlier key is constant.
+    fn at(&self, t: f64) -> f64 {
+        let i = self.times.partition_point(|&k| k <= t);
+        if i == 0 {
+            return self.values[0];
+        }
+        if i == self.times.len() {
+            return self.values[i - 1];
+        }
+        let (t0, t1) = (self.times[i - 1], self.times[i]);
+        if self.constant[i - 1] || t1 <= t0 {
+            return self.values[i - 1];
+        }
+        let f = (t - t0) / (t1 - t0);
+        self.values[i - 1] + (self.values[i] - self.values[i - 1]) * f
+    }
+
+    /// Times just before each key that follows a constant one, so a linear sampler steps.
+    fn steps(&self, out: &mut Vec<f64>) {
+        for i in 1..self.times.len() {
+            if self.constant[i - 1] {
+                let dt = self.times[i] - self.times[i - 1];
+                out.push(self.times[i] - (dt / 2.0).min(1e-3));
+            }
+        }
+    }
+}
+
+/// An animated vector property (`Lcl Translation`, ...): a curve or a fixed value per component.
+struct Animated {
+    curves: [Option<Curve>; 3],
+    fixed: [f64; 3],
+}
+
+impl Animated {
+    fn at(&self, t: f64) -> [f64; 3] {
+        std::array::from_fn(|k| self.curves[k].as_ref().map_or(self.fixed[k], |c| c.at(t)))
+    }
+
+    fn times(&self, out: &mut Vec<f64>) {
+        for c in self.curves.iter().flatten() {
+            out.extend_from_slice(&c.times);
+            c.steps(out);
+        }
+    }
+}
+
+/// Sorted, de-duplicated times, shifted so none is negative.
+fn timeline(mut times: Vec<f64>) -> Vec<f64> {
+    times.retain(|t| t.is_finite());
+    times.sort_by(f64::total_cmp);
+    times.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+    times
+}
+
+/// A mesh built for one geometry and the materials of the model holding it.
+struct Built {
+    mesh: usize,
+    /// Whether it carries joints and weights (and so needs a skin).
+    skinned: bool,
+}
+
+type Props = HashMap<String, Vec<A>>;
+
+/// A blend shape channel's name, weight (0 to 1), and offsets at full weight by control point.
+type Shape = (String, f64, HashMap<usize, [f32; 3]>);
+
+/// Builds the document as the file's objects are visited.
+struct Reader<'o, 'a, 'x> {
+    objs: &'o Objects<'a>,
+    /// Blender writes material colors linear; everyone else sRGB.
+    linear: bool,
+    dir: &'x Path,
+    assets: &'x dyn Assets,
+    keep: Keep,
+    b: Builder,
+    nodes: Vec<Value>,
+    /// Model id → node.
+    node_of: HashMap<i64, usize>,
+    meshes: Vec<Value>,
+    /// (geometry, its materials) → mesh.
+    mesh_of: HashMap<(i64, Vec<usize>), Built>,
+    materials: Vec<Material>,
+    images: Vec<Image>,
+    material_index: HashMap<i64, usize>,
+    image_index: HashMap<i64, Option<usize>>,
+    /// The gray material primitives without one take.
+    default_material: Option<usize>,
+    /// Materials a primitive with UVs uses.
+    textured: Vec<usize>,
+    skins: Vec<Value>,
+    /// (skin deformer, model) → skin.
+    skin_of: HashMap<(i64, i64), usize>,
+    cameras: Vec<Value>,
+    lights: Vec<Value>,
+    /// Blend shape channel → (node, target) pairs it drives.
+    channel_users: HashMap<i64, Vec<(usize, usize)>>,
+    /// Mesh → the blend shape channels its targets come from, in order.
+    morphs: HashMap<usize, Vec<i64>>,
+    /// Meters per file unit.
+    unit: f64,
+    /// Nodes holding skinned meshes, which go at the scene's root, outside the axis and unit conversion.
+    skinned_roots: Vec<usize>,
+}
+
+impl Reader<'_, '_, '_> {
+    /// A model's node: its name, local transform and user properties.
+    fn model_node(&self, m: i64) -> Value {
+        let Some(node) = self.objs.node(m) else {
+            return json!({});
+        };
+        let p = props(node);
+        let mut out = json!({});
+        if let Some(name) = name_of(node) {
+            out["name"] = json!(name);
+        }
+        set_transform(&mut out, &local_of(&p, None, None, None));
+        let extras = user_props(node);
+        if !extras.is_empty() {
+            out["extras"] = Value::Object(extras);
+        }
+        out
+    }
+
+    fn add_child(&mut self, parent: usize, child: usize) {
+        let kids = self.nodes[parent]
+            .as_object_mut()
+            .expect("a node is an object")
+            .entry("children")
+            .or_insert_with(|| json!([]));
+        kids.as_array_mut().expect("children is a list").push(json!(child));
+    }
+
+    /// Whether `a` is `b` or one of its ancestors, through the children set so far.
+    fn is_ancestor(&self, a: usize, b: usize) -> bool {
+        let mut seen = vec![false; self.nodes.len()];
+        let mut stack = vec![a];
+        while let Some(n) = stack.pop() {
+            if n == b {
+                return true;
+            }
+            if std::mem::replace(&mut seen[n], true) {
+                continue;
+            }
+            stack.extend(
+                self.nodes[n]["children"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_u64)
+                    .filter_map(|c| usize::try_from(c).ok()),
+            );
+        }
+        false
+    }
+
+    /// What model `m` holds: its geometry (with skin and morph targets), camera and light.
+    fn attach(&mut self, m: i64) -> Result<()> {
+        let node = self.node_of[&m];
+        let p = self.objs.node(m).map(props).unwrap_or_default();
+        let geometric = geometric_of(&p);
+        let geometries: Vec<i64> = self
+            .objs
+            .children_of(m)
+            .filter(|g| self.objs.is_kind("Geometry", *g, "Mesh"))
+            .collect();
+        for g in geometries {
+            let built = self.mesh_for(g, m)?;
+            let skin = self
+                .objs
+                .children_of(g)
+                .find(|d| self.objs.is_kind("Deformer", *d, "Skin"));
+            let skinned = self.mesh_of.values().any(|b| b.mesh == built && b.skinned);
+            let target = if skinned && let Some(skin) = skin {
+                // A skinned mesh's node transform is ignored, its joints place it (the geometric transform
+                // goes into the inverse bind matrices), so it gets a root node of its own, as glTF asks; the
+                // model's node stays where it is, a joint for vertices no bone weights.
+                let s = self.skin(skin, m, &geometric);
+                let mut host = json!({ "skin": s });
+                if let Some(name) = self.nodes[node].get("name") {
+                    host["name"] = name.clone();
+                }
+                self.nodes.push(host);
+                self.skinned_roots.push(self.nodes.len() - 1);
+                self.nodes.len() - 1
+            } else if geometric == IDENTITY && self.nodes[node].get("mesh").is_none() {
+                node
             } else {
-                world_of(model, &objs, &mut world_cache)
+                self.child(node, Some(&geometric))
             };
-            let geometric = if model == 0 {
-                IDENTITY
-            } else {
-                let p = props(objs.nodes[&model].0);
-                mul(
-                    &translate(vec3(&p, "GeometricTranslation", [0.0; 3])),
-                    &mul(
-                        &rotate(vec3(&p, "GeometricRotation", [0.0; 3]), 0),
-                        &scale(vec3(&p, "GeometricScaling", [1.0; 3])),
-                    ),
-                )
+            self.nodes[target]["mesh"] = json!(built);
+            for (k, ch) in self
+                .morphs
+                .get(&built)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+            {
+                self.channel_users.entry(ch).or_default().push((target, k));
+            }
+        }
+        let attributes: Vec<i64> = self
+            .objs
+            .children_of(m)
+            .filter(|a| self.objs.is("NodeAttribute", *a))
+            .collect();
+        for a in attributes {
+            let Some(attr) = self.objs.node(a) else { continue };
+            match kind_of(attr) {
+                "Camera" if self.keep.cameras => {
+                    let cam = camera(&props(attr), self.unit);
+                    self.cameras.push(cam);
+                    // FBX cameras look down +X, glTF's down -Z.
+                    let c = self.child(node, None);
+                    self.nodes[c]["rotation"] = json!([
+                        0.0,
+                        -std::f64::consts::FRAC_1_SQRT_2,
+                        0.0,
+                        std::f64::consts::FRAC_1_SQRT_2
+                    ]);
+                    self.nodes[c]["camera"] = json!(self.cameras.len() - 1);
+                }
+                "Light" if self.keep.lights => {
+                    let Some(light) = light(&props(attr)) else { continue };
+                    self.lights.push(light);
+                    // FBX lights shine down -Y, glTF's down -Z.
+                    let c = self.child(node, None);
+                    self.nodes[c]["rotation"] = json!([
+                        -std::f64::consts::FRAC_1_SQRT_2,
+                        0.0,
+                        0.0,
+                        std::f64::consts::FRAC_1_SQRT_2
+                    ]);
+                    self.nodes[c]["extensions"] = json!({ "KHR_lights_punctual": { "light": self.lights.len() - 1 } });
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// A new child of `parent`, with transform `m`; returns it.
+    fn child(&mut self, parent: usize, m: Option<&M4>) -> usize {
+        let mut n = json!({});
+        if let Some(m) = m {
+            set_transform(&mut n, m);
+        }
+        self.nodes.push(n);
+        let c = self.nodes.len() - 1;
+        self.add_child(parent, c);
+        c
+    }
+
+    /// Model `m`'s materials, in connection order: a geometry's material layer indexes into this list.
+    fn model_materials(&mut self, m: i64) -> Vec<usize> {
+        let ids: Vec<i64> = self
+            .objs
+            .children_of(m)
+            .filter(|c| self.objs.is("Material", *c))
+            .collect();
+        if !self.keep.materials {
+            return Vec::new();
+        }
+        ids.into_iter()
+            .map(|mid| {
+                if let Some(&i) = self.material_index.get(&mid) {
+                    return i;
+                }
+                let mat = read_material(
+                    mid,
+                    self.objs,
+                    self.linear,
+                    self.dir,
+                    self.assets,
+                    &mut self.images,
+                    &mut self.image_index,
+                );
+                self.materials.push(mat);
+                self.material_index.insert(mid, self.materials.len() - 1);
+                self.materials.len() - 1
+            })
+            .collect()
+    }
+
+    fn default_material(&mut self) -> usize {
+        *self.default_material.get_or_insert_with(|| {
+            self.materials.push(Material::plain("default", GRAY));
+            self.materials.len() - 1
+        })
+    }
+
+    /// The blend shape channels deforming geometry `g`, in target order.
+    fn morph_channels(&self, g: i64) -> Vec<i64> {
+        self.objs
+            .children_of(g)
+            .filter(|d| self.objs.is_kind("Deformer", *d, "BlendShape"))
+            .flat_map(|d| self.objs.children_of(d).collect::<Vec<_>>())
+            .filter(|c| self.objs.is_kind("Deformer", *c, "BlendShapeChannel"))
+            .collect()
+    }
+
+    /// The mesh for geometry `g` as model `m` (0 for none) uses it.
+    fn mesh_for(&mut self, g: i64, m: i64) -> Result<usize> {
+        let mats = if m == 0 { Vec::new() } else { self.model_materials(m) };
+        if let Some(b) = self.mesh_of.get(&(g, mats.clone())) {
+            return Ok(b.mesh);
+        }
+        let geom = self.objs.node(g).context("missing geometry")?;
+        let prims = geometry(geom)?;
+        // Skin weights per control point: (joint, weight), heaviest first.
+        let influences = if self.keep.skins {
+            self.influences(g)
+        } else {
+            HashMap::new()
+        };
+        let channels = if self.keep.morph_targets {
+            self.morph_channels(g)
+        } else {
+            Vec::new()
+        };
+        let (morph_ids, shapes): (Vec<i64>, Vec<Shape>) =
+            channels.iter().filter_map(|&c| Some((c, self.shape(c)?))).unzip();
+        let joint_sets = influences
+            .values()
+            .map(|v| v.len().div_ceil(4))
+            .max()
+            .unwrap_or(0)
+            .min(4);
+        let mut primitives = Vec::new();
+        for (slot, prim, cps) in prims {
+            let material = match mats.get(slot) {
+                Some(&i) => i,
+                None => self.default_material(),
             };
-            let m = mul(&basis, &mul(&world, &geometric));
-            // The model's materials, in connection order: the geometry's material layer indexes into this list.
-            let mats: Vec<i64> = objs
-                .children
-                .get(&model)
-                .map(|c| {
-                    c.iter()
-                        .filter(|(id, p)| {
-                            p.is_empty() && objs.nodes.get(id).is_some_and(|(n, _)| n.name() == "Material")
-                        })
-                        .map(|(id, _)| *id)
-                        .collect()
-                })
-                .unwrap_or_default();
-            let mut local_materials = Vec::new();
-            for mid in &mats {
-                let idx = if let Some(&i) = material_index.get(mid) {
-                    i
-                } else {
-                    let mat = read_material(*mid, &objs, linear, dir, assets, &mut mesh.images, &mut image_index);
-                    mesh.materials.push(mat);
-                    material_index.insert(*mid, mesh.materials.len() - 1);
-                    mesh.materials.len() - 1
+            if !prim.uvs.is_empty() && !self.textured.contains(&material) {
+                self.textured.push(material);
+            }
+            let Some(mut json) = self.b.primitive(prim) else {
+                continue;
+            };
+            json["material"] = json!(material);
+            if joint_sets > 0 {
+                let unweighted = influences.len() + 1; // stands for the model itself; see `skin`
+                for set in 0..joint_sets {
+                    let mut joints = Vec::with_capacity(cps.len() * 4);
+                    let mut weights = Vec::with_capacity(cps.len() * 4);
+                    for cp in &cps {
+                        let inf = influences.get(cp).map_or(&[][..], Vec::as_slice);
+                        for k in set * 4..set * 4 + 4 {
+                            match inf.get(k) {
+                                Some(&(j, w)) => {
+                                    joints.push(u16::try_from(j).unwrap_or(0));
+                                    weights.push(w);
+                                }
+                                None if k == 0 => {
+                                    joints.push(u16::try_from(unweighted).unwrap_or(0));
+                                    weights.push(1.0);
+                                }
+                                None => {
+                                    joints.push(0);
+                                    weights.push(0.0);
+                                }
+                            }
+                        }
+                    }
+                    let n = cps.len();
+                    let j = self.b.accessor(Part::u16(joints), 5123, n, "VEC4", Some(34962));
+                    let w = self.b.accessor(Part::f32(weights), 5126, n, "VEC4", Some(34962));
+                    json["attributes"][format!("JOINTS_{set}")] = json!(j);
+                    json["attributes"][format!("WEIGHTS_{set}")] = json!(w);
+                }
+            }
+            if !shapes.is_empty() {
+                let targets: Vec<Value> = shapes
+                    .iter()
+                    .map(|(_, _, deltas)| {
+                        let d: Vec<[f32; 3]> = cps
+                            .iter()
+                            .map(|cp| deltas.get(cp).copied().unwrap_or([0.0; 3]))
+                            .collect();
+                        json!({ "POSITION": self.b.positions(d) })
+                    })
+                    .collect();
+                json["targets"] = json!(targets);
+            }
+            primitives.push(json);
+        }
+        let mut mesh = json!({ "primitives": primitives });
+        if let Some(name) = name_of(geom) {
+            mesh["name"] = json!(name);
+        }
+        if !shapes.is_empty() {
+            mesh["weights"] = json!(shapes.iter().map(|s| s.1).collect::<Vec<_>>());
+            mesh["extras"] = json!({ "targetNames": shapes.iter().map(|s| s.0.clone()).collect::<Vec<_>>() });
+        }
+        self.meshes.push(mesh);
+        let built = Built {
+            mesh: self.meshes.len() - 1,
+            skinned: joint_sets > 0,
+        };
+        let i = built.mesh;
+        self.mesh_of.insert((g, mats), built);
+        if !morph_ids.is_empty() {
+            self.morphs.insert(i, morph_ids);
+        }
+        Ok(i)
+    }
+
+    /// The skin deformer's clusters on geometry `g`, as control point → (cluster number, weight), heaviest first and
+    /// summing to one. Clusters whose bone isn't a model are left out.
+    fn influences(&self, g: i64) -> HashMap<usize, Vec<(usize, f32)>> {
+        let mut out: HashMap<usize, Vec<(usize, f32)>> = HashMap::new();
+        let Some(skin) = self
+            .objs
+            .children_of(g)
+            .find(|d| self.objs.is_kind("Deformer", *d, "Skin"))
+        else {
+            return out;
+        };
+        for (j, cluster) in self.clusters(skin).into_iter().enumerate() {
+            let Some(node) = self.objs.node(cluster) else { continue };
+            let idx = child_attr(node, "Indexes").and_then(ints).unwrap_or_default();
+            let w = child_attr(node, "Weights").and_then(floats).unwrap_or_default();
+            for (&cp, &w) in idx.iter().zip(&w) {
+                if let Ok(cp) = usize::try_from(cp)
+                    && w > 0.0
+                {
+                    out.entry(cp).or_default().push((j, f32_of(w)));
+                }
+            }
+        }
+        for inf in out.values_mut() {
+            inf.sort_by(|a, b| b.1.total_cmp(&a.1));
+            inf.truncate(16);
+            let sum: f32 = inf.iter().map(|x| x.1).sum();
+            for x in inf.iter_mut() {
+                x.1 /= sum;
+            }
+        }
+        out
+    }
+
+    /// A skin deformer's clusters that name a bone.
+    fn clusters(&self, skin: i64) -> Vec<i64> {
+        self.objs
+            .children_of(skin)
+            .filter(|c| self.objs.is_kind("Deformer", *c, "Cluster"))
+            .filter(|c| self.objs.children_of(*c).any(|b| self.node_of.contains_key(&b)))
+            .collect()
+    }
+
+    /// The skin for deformer `skin` on model `m`: a joint per cluster, and the model's own node last, for
+    /// vertices no cluster weights.
+    fn skin(&mut self, skin: i64, m: i64, geometric: &M4) -> usize {
+        if let Some(&s) = self.skin_of.get(&(skin, m)) {
+            return s;
+        }
+        let mut joints = Vec::new();
+        let mut ibms = Vec::new();
+        for cluster in self.clusters(skin) {
+            let Some(node) = self.objs.node(cluster) else { continue };
+            let bone = self
+                .objs
+                .children_of(cluster)
+                .find(|b| self.node_of.contains_key(b))
+                .unwrap_or(0);
+            let matrix = |name: &str| {
+                child_attr(node, name)
+                    .and_then(floats)
+                    .filter(|v| v.len() == 16)
+                    .map(|v| {
+                        let mut m = IDENTITY;
+                        for (k, x) in v.iter().enumerate() {
+                            m[k % 4][k / 4] = *x;
+                        }
+                        m
+                    })
+            };
+            // `Transform` takes the model's space to the bone's at bind time: the file stores it relative to
+            // `TransformLink` (the bone's bind-time world), though the FBX SDK hands back `TransformLink ·
+            // Transform`, the model's world. Without it, the bind pose is the pose the file is in.
+            let transform = matrix("Transform").unwrap_or_else(|| {
+                let link = matrix("TransformLink").unwrap_or_else(|| self.world_of(bone));
+                mul(&inverse(&link), &self.world_of(m))
+            });
+            // The vertex goes geometry → model → bone space.
+            ibms.extend(column_major(&mul(&transform, geometric)).map(f32_of));
+            joints.push(self.node_of[&bone]);
+        }
+        // The model's own node: at bind time it's where `Transform` says, so its inverse bind matrix is the
+        // geometric transform.
+        joints.push(self.node_of[&m]);
+        ibms.extend(column_major(geometric).map(f32_of));
+        let acc = self.b.floats(ibms, "MAT4", false);
+        self.skins.push(json!({ "joints": joints, "inverseBindMatrices": acc }));
+        let s = self.skins.len() - 1;
+        self.skin_of.insert((skin, m), s);
+        s
+    }
+
+    /// Model `m`'s world transform in the file's space: its parents' times its own.
+    fn world_of(&self, m: i64) -> M4 {
+        let mut world = IDENTITY;
+        let mut at = Some(m);
+        // At most one step per model, so a cycle in a broken file ends.
+        for _ in 0..=self.node_of.len() {
+            let Some(id) = at else { break };
+            let p = self.objs.node(id).map(props).unwrap_or_default();
+            world = mul(&local_of(&p, None, None, None), &world);
+            at = self.objs.model_parent(id).filter(|&p| p != id);
+        }
+        world
+    }
+
+    /// A blend shape channel's name, weight (0 to 1) and full-weight shape, as control point → offset.
+    fn shape(&self, channel: i64) -> Option<Shape> {
+        let node = self.objs.node(channel)?;
+        let shape = self
+            .objs
+            .children_of(channel)
+            .filter(|s| self.objs.is_kind("Geometry", *s, "Shape"))
+            .last()?;
+        let shape = self.objs.node(shape)?;
+        let idx = child_attr(shape, "Indexes").and_then(ints)?;
+        let v = child_attr(shape, "Vertices").and_then(floats)?;
+        let mut deltas = HashMap::new();
+        for (k, &cp) in idx.iter().enumerate() {
+            if let (Ok(cp), Some(d)) = (usize::try_from(cp), v.get(k * 3..k * 3 + 3)) {
+                deltas.insert(cp, [d[0], d[1], d[2]].map(f32_of));
+            }
+        }
+        let weight = scalar(&props(node), "DeformPercent").unwrap_or(0.0) / 100.0;
+        Some((name_of(node).unwrap_or("").to_owned(), weight.clamp(0.0, 1.0), deltas))
+    }
+
+    /// Every animation stack as a glTF animation, its curves sampled at their keys.
+    fn animations(&mut self) -> Vec<Value> {
+        let stacks: Vec<i64> = self
+            .objs
+            .order
+            .iter()
+            .copied()
+            .filter(|s| self.objs.is("AnimationStack", *s))
+            .collect();
+        let mut out = Vec::new();
+        for stack in stacks {
+            let layers: Vec<i64> = self
+                .objs
+                .children_of(stack)
+                .filter(|l| self.objs.is("AnimationLayer", *l))
+                .collect();
+            let curve_nodes: Vec<i64> = layers
+                .iter()
+                .flat_map(|&l| self.objs.children_of(l).collect::<Vec<_>>())
+                .filter(|c| self.objs.is("AnimationCurveNode", *c))
+                .collect();
+            let in_stack = |c: &i64| curve_nodes.contains(c);
+            let mut channels = Vec::new();
+            let mut samplers = Vec::new();
+            let mut per_node: Vec<(usize, [Option<Animated>; 3])> = Vec::new();
+            let models: Vec<(i64, usize)> = self.node_of.iter().map(|(&m, &n)| (m, n)).collect();
+            for (m, node) in models {
+                let tracks = ["Lcl Translation", "Lcl Rotation", "Lcl Scaling"].map(|prop| {
+                    let cn = self.objs.child_at(m, prop).find(in_stack)?;
+                    self.animated(cn, ["d|X", "d|Y", "d|Z"])
+                });
+                if tracks.iter().any(Option::is_some) {
+                    per_node.push((node, tracks));
+                }
+            }
+            per_node.sort_by_key(|(n, _)| *n);
+            let model_of: HashMap<usize, i64> = self.node_of.iter().map(|(&m, &n)| (n, m)).collect();
+            for (node, tracks) in per_node {
+                let p = self.objs.node(model_of[&node]).map(props).unwrap_or_default();
+                self.transform_channels(node, &p, &tracks, &mut channels, &mut samplers);
+            }
+            // Morph weights: every channel of a mesh at once, per node drawing it.
+            let mut weight_nodes: HashMap<usize, Vec<(usize, Animated)>> = HashMap::new();
+            let users: Vec<(i64, Vec<(usize, usize)>)> =
+                self.channel_users.iter().map(|(c, u)| (*c, u.clone())).collect();
+            for (ch, users) in users {
+                let Some(cn) = self.objs.child_at(ch, "DeformPercent").find(in_stack) else {
+                    continue;
                 };
-                local_materials.push(idx);
+                for (node, target) in users {
+                    if let Some(a) = self.animated(cn, ["d|DeformPercent", "", ""]) {
+                        weight_nodes.entry(node).or_default().push((target, a));
+                    }
+                }
             }
-            add_geometry(geom, &m, &local_materials, &mut mesh)?;
-            ensure!(mesh.triangles() <= MAX_TRIANGLES, "too many triangles to convert");
+            let mut weight_nodes: Vec<_> = weight_nodes.into_iter().collect();
+            weight_nodes.sort_by_key(|(n, _)| *n);
+            for (node, tracks) in weight_nodes {
+                self.weight_channel(node, &tracks, &mut channels, &mut samplers);
+            }
+            if channels.is_empty() {
+                continue;
+            }
+            let mut anim = json!({ "channels": channels, "samplers": samplers });
+            if let Some(name) = self.objs.node(stack).and_then(name_of) {
+                anim["name"] = json!(name);
+            }
+            out.push(anim);
+        }
+        out
+    }
+
+    /// A curve node's curves for its components (`d|X`, ...; "" for none), with its own values where a component
+    /// has no curve.
+    fn animated(&self, cn: i64, components: [&str; 3]) -> Option<Animated> {
+        let node = self.objs.node(cn)?;
+        let p = props(node);
+        let curves = components.map(|c| {
+            if c.is_empty() {
+                return None;
+            }
+            let curve = self.objs.child_at(cn, c).find(|k| self.objs.is("AnimationCurve", *k))?;
+            Curve::read(self.objs.node(curve)?)
+        });
+        if curves.iter().all(Option::is_none) {
+            return None;
+        }
+        let fixed = components.map(|c| scalar(&p, c).unwrap_or(0.0));
+        Some(Animated { curves, fixed })
+    }
+
+    /// Translation, rotation and scale channels for a node whose `Lcl` properties are animated: its whole local
+    /// transform is evaluated at each time (pivots and pre-rotations included) and taken apart again.
+    fn transform_channels(
+        &mut self,
+        node: usize,
+        p: &Props,
+        tracks: &[Option<Animated>; 3],
+        channels: &mut Vec<Value>,
+        samplers: &mut Vec<Value>,
+    ) {
+        let mut times = Vec::new();
+        for t in tracks.iter().flatten() {
+            t.times(&mut times);
+        }
+        let mut times = timeline(times);
+        // Cut long turns into short steps.
+        if let Some(r) = &tracks[1] {
+            let mut fine = Vec::with_capacity(times.len());
+            for w in times.windows(2) {
+                fine.push(w[0]);
+                let (a, b) = (r.at(w[0]), r.at(w[1] - 1e-9));
+                let turn = (0..3).map(|k| (b[k] - a[k]).abs()).fold(0.0, f64::max);
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "a small step count"
+                )]
+                let n = ((turn / MAX_STEP_DEGREES).ceil() as usize).min(360);
+                for k in 1..n {
+                    #[allow(clippy::cast_precision_loss, reason = "a small step count")]
+                    fine.push(w[0] + (w[1] - w[0]) * k as f64 / n as f64);
+                }
+            }
+            fine.extend(times.last());
+            times = fine;
+        }
+        if times.is_empty() {
+            return;
+        }
+        let shift = times[0].min(0.0);
+        let at = |k: usize, t: f64| tracks[k].as_ref().map(|a| a.at(t));
+        let mut trs: Vec<Trs> = times
+            .iter()
+            .map(|&t| decompose(&local_of(p, at(0, t), at(1, t), at(2, t))))
+            .collect();
+        // Keep each quaternion on the same side as the last, so slerp takes the short way.
+        for i in 1..trs.len() {
+            let prev = trs[i - 1].r;
+            let q = &mut trs[i].r;
+            if (0..4).map(|k| prev[k] * q[k]).sum::<f64>() < 0.0 {
+                *q = q.map(|c| -c);
+            }
+        }
+        let input = self
+            .b
+            .floats(times.iter().map(|&t| f32_of(t - shift)).collect(), "SCALAR", true);
+        let rest = decompose(&local_of(p, None, None, None));
+        let paths: [(&str, Vec<f64>, Vec<f64>); 3] = [
+            ("translation", trs.iter().flat_map(|x| x.t).collect(), rest.t.to_vec()),
+            ("rotation", trs.iter().flat_map(|x| x.r).collect(), rest.r.to_vec()),
+            ("scale", trs.iter().flat_map(|x| x.s).collect(), rest.s.to_vec()),
+        ];
+        for (path, values, rest) in paths {
+            let width = rest.len();
+            let still = values
+                .chunks_exact(width)
+                .all(|v| v.iter().zip(&rest).all(|(a, b)| (a - b).abs() < 1e-7));
+            if still {
+                continue;
+            }
+            let output = self.b.floats(
+                values.into_iter().map(f32_of).collect(),
+                if width == 4 { "VEC4" } else { "VEC3" },
+                false,
+            );
+            samplers.push(json!({ "input": input, "output": output, "interpolation": "LINEAR" }));
+            channels.push(json!({ "sampler": samplers.len() - 1, "target": { "node": node, "path": path } }));
+        }
+        // An animated node holds TRS, never a matrix.
+        if self.nodes[node]
+            .as_object_mut()
+            .and_then(|n| n.remove("matrix"))
+            .is_some()
+        {
+            let n = &mut self.nodes[node];
+            n["translation"] = json!(rest.t);
+            n["rotation"] = json!(rest.r);
+            n["scale"] = json!(rest.s);
         }
     }
-    ensure!(!mesh.prims.is_empty(), "FBX has no mesh geometry");
-    if mesh.materials.is_empty() || mesh.prims.iter().any(|p| p.material >= mesh.materials.len()) {
-        let gray = mesh.materials.len();
-        mesh.materials.push(Material::plain("default", GRAY));
-        for p in &mut mesh.prims {
-            if p.material > gray {
-                p.material = gray;
-            }
+
+    /// A weights channel for a node whose mesh's blend shape channels are animated.
+    fn weight_channel(
+        &mut self,
+        node: usize,
+        tracks: &[(usize, Animated)],
+        channels: &mut Vec<Value>,
+        samplers: &mut Vec<Value>,
+    ) {
+        let Some(mesh) = self.nodes[node]["mesh"].as_u64().and_then(|m| usize::try_from(m).ok()) else {
+            return;
+        };
+        let rest: Vec<f64> = self.meshes[mesh]["weights"]
+            .as_array()
+            .map(|w| w.iter().filter_map(Value::as_f64).collect())
+            .unwrap_or_default();
+        let mut times = Vec::new();
+        for (_, a) in tracks {
+            a.times(&mut times);
         }
+        let times = timeline(times);
+        if times.is_empty() || rest.is_empty() {
+            return;
+        }
+        let shift = times[0].min(0.0);
+        let mut values = Vec::with_capacity(times.len() * rest.len());
+        for &t in &times {
+            let mut w = rest.clone();
+            for (k, a) in tracks {
+                if let Some(x) = w.get_mut(*k) {
+                    *x = (a.at(t)[0] / 100.0).clamp(0.0, 1.0);
+                }
+            }
+            values.extend(w.into_iter().map(f32_of));
+        }
+        let input = self
+            .b
+            .floats(times.iter().map(|&t| f32_of(t - shift)).collect(), "SCALAR", true);
+        let output = self.b.floats(values, "SCALAR", false);
+        samplers.push(json!({ "input": input, "output": output, "interpolation": "LINEAR" }));
+        channels.push(json!({ "sampler": samplers.len() - 1, "target": { "node": node, "path": "weights" } }));
     }
-    Ok(mesh)
+}
+
+/// A camera's glTF form. FBX gives the field of view horizontally unless its aperture mode says otherwise.
+fn camera(p: &Props, unit: f64) -> Value {
+    let aspect = match (scalar(p, "AspectWidth"), scalar(p, "AspectHeight")) {
+        (Some(w), Some(h)) if w > 0.0 && h > 0.0 => w / h,
+        _ => 16.0 / 9.0,
+    };
+    // Planes are in the file's units, but a node's scale doesn't reach a camera's planes: they're converted here.
+    let near = scalar(p, "NearPlane").filter(|n| *n > 0.0).unwrap_or(10.0);
+    let far = scalar(p, "FarPlane").filter(|f| *f > near).unwrap_or(near * 10_000.0);
+    let (near, far) = (near * unit, far * unit);
+    if scalar(p, "CameraProjectionType") == Some(1.0) {
+        let zoom = scalar(p, "OrthoZoom").filter(|z| *z > 0.0).unwrap_or(1.0);
+        return json!({ "type": "orthographic", "orthographic": { "xmag": zoom * aspect, "ymag": zoom, "znear": near, "zfar": far } });
+    }
+    #[allow(clippy::cast_possible_truncation, reason = "an enum value; `as` saturates bad ones")]
+    let mode = scalar(p, "ApertureMode").map_or(1, |m| m as i32);
+    let deg = scalar(p, "FieldOfView")
+        .filter(|f| *f > 0.0 && *f < 180.0)
+        .unwrap_or(40.0);
+    let yfov = match mode {
+        2 => deg.to_radians(),
+        0 => scalar(p, "FieldOfViewY")
+            .filter(|f| *f > 0.0 && *f < 180.0)
+            .unwrap_or(deg)
+            .to_radians(),
+        3 => match (scalar(p, "FocalLength"), scalar(p, "FilmHeight")) {
+            (Some(f), Some(h)) if f > 0.0 && h > 0.0 => 2.0 * (h * 25.4 / 2.0 / f).atan(),
+            _ => 2.0 * ((deg.to_radians() / 2.0).tan() / aspect).atan(),
+        },
+        _ => 2.0 * ((deg.to_radians() / 2.0).tan() / aspect).atan(),
+    };
+    json!({ "type": "perspective", "perspective": { "yfov": yfov, "aspectRatio": aspect, "znear": near, "zfar": far } })
+}
+
+/// A light's `KHR_lights_punctual` form: point, directional or spot (area and volume lights have none).
+fn light(p: &Props) -> Option<Value> {
+    #[allow(clippy::cast_possible_truncation, reason = "an enum value; `as` saturates bad ones")]
+    let kind = scalar(p, "LightType").map_or(0, |t| t as i32);
+    let color = vec3(p, "Color", [1.0; 3]).map(|c| srgb_to_linear(f32_of(c.clamp(0.0, 1.0))));
+    let intensity = scalar(p, "Intensity").unwrap_or(100.0).max(0.0) / 100.0;
+    let mut out = json!({ "color": color, "intensity": intensity });
+    match kind {
+        0 => out["type"] = json!("point"),
+        1 => out["type"] = json!("directional"),
+        2 => {
+            let half = std::f64::consts::FRAC_PI_2;
+            let outer = (scalar(p, "OuterAngle").unwrap_or(45.0).to_radians() / 2.0).clamp(1e-4, half);
+            let inner = (scalar(p, "InnerAngle").unwrap_or(0.0).to_radians() / 2.0).clamp(0.0, outer * 0.999);
+            out["type"] = json!("spot");
+            out["spot"] = json!({ "innerConeAngle": inner, "outerConeAngle": outer });
+        }
+        _ => return None,
+    }
+    Some(out)
 }
 
 /// "Mesh" in `Geometry: 123, "Geometry::Name", "Mesh"`.
 fn kind_of(node: NodeHandle<'_>) -> &str {
     node.attributes().get(2).and_then(string).unwrap_or("")
-}
-
-/// A model's world transform: its parents' times its own local transform.
-fn world_of(id: i64, objs: &Objects<'_>, cache: &mut HashMap<i64, M4>) -> M4 {
-    if let Some(m) = cache.get(&id) {
-        return *m;
-    }
-    let Some((node, _)) = objs.nodes.get(&id) else {
-        return IDENTITY;
-    };
-    let p = props(*node);
-    #[allow(clippy::cast_possible_truncation, reason = "an enum value; `as` saturates bad ones")]
-    let order = scalar(&p, "RotationOrder").map_or(0, |v| v as i32);
-    let r_pre = rotate(vec3(&p, "PreRotation", [0.0; 3]), 0);
-    let r_post_inv = {
-        // The inverse of a rotation is its transpose.
-        let r = rotate(vec3(&p, "PostRotation", [0.0; 3]), 0);
-        let mut t = IDENTITY;
-        for i in 0..3 {
-            for j in 0..3 {
-                t[i][j] = r[j][i];
-            }
-        }
-        t
-    };
-    // T * Roff * Rp * Rpre * R * Rpost^-1 * Rp^-1 * Soff * Sp * S * Sp^-1, the FBX SDK's order.
-    let rp = vec3(&p, "RotationPivot", [0.0; 3]);
-    let sp = vec3(&p, "ScalingPivot", [0.0; 3]);
-    let local = [
-        translate(vec3(&p, "Lcl Translation", [0.0; 3])),
-        translate(vec3(&p, "RotationOffset", [0.0; 3])),
-        translate(rp),
-        r_pre,
-        rotate(vec3(&p, "Lcl Rotation", [0.0; 3]), order),
-        r_post_inv,
-        translate(rp.map(|c| -c)),
-        translate(vec3(&p, "ScalingOffset", [0.0; 3])),
-        translate(sp),
-        scale(vec3(&p, "Lcl Scaling", [1.0; 3])),
-        translate(sp.map(|c| -c)),
-    ]
-    .iter()
-    .fold(IDENTITY, |acc, m| mul(&acc, m));
-    let parent = objs
-        .parents
-        .get(&id)
-        .and_then(|ps| {
-            ps.iter()
-                .find(|pid| objs.nodes.get(pid).is_some_and(|(n, _)| n.name() == "Model"))
-        })
-        .copied();
-    // Guard against cycles in broken files.
-    cache.insert(id, local);
-    let world = match parent {
-        Some(pid) if pid != id => mul(&world_of(pid, objs, cache), &local),
-        _ => local,
-    };
-    cache.insert(id, world);
-    world
 }
 
 fn read_material(
@@ -580,15 +1666,15 @@ fn texture_image(id: i64, objs: &Objects<'_>, dir: &Path, assets: &dyn Assets) -
 /// Vertices already emitted for a primitive, by (control point, normal index, uv index, color index).
 type Seen = HashMap<(usize, usize, usize, usize), u32>;
 
-/// Append one geometry's triangles, transformed by `m`, split by material.
-fn add_geometry(geom: NodeHandle<'_>, m: &M4, materials: &[usize], mesh: &mut Mesh) -> Result<()> {
+/// A geometry's triangles in its own space, a primitive per material slot (sorted), each vertex's control point
+/// alongside so skins and blend shapes can find it.
+fn geometry(geom: NodeHandle<'_>) -> Result<Vec<(usize, Prim, Vec<usize>)>> {
     let verts = floats(child_attr(geom, "Vertices").context("mesh has no vertices")?).context("bad vertices")?;
     let poly_index =
         ints(child_attr(geom, "PolygonVertexIndex").context("mesh has no polygons")?).context("bad polygons")?;
     let normals = Layer::read(geom, "LayerElementNormal", "Normals", "NormalsIndex", 3);
     let uvs = Layer::read(geom, "LayerElementUV", "UV", "UVIndex", 2);
     let colors = Layer::read(geom, "LayerElementColor", "Colors", "ColorIndex", 4);
-    let nm = normal_matrix(m);
     let mut tris = Vec::new();
     let mut corner_pos = Vec::new();
     let mat_layer = geom.children_by_name("LayerElementMaterial").next().and_then(|el| {
@@ -609,9 +1695,8 @@ fn add_geometry(geom: NodeHandle<'_>, m: &M4, materials: &[usize], mesh: &mut Me
             width: 1,
         })
     });
-    let flip = det3(m) < 0.0;
-    // Per material slot: a primitive with de-duplicated vertices keyed by (control point, normal, uv).
-    let mut prims: HashMap<usize, (Prim, Seen)> = HashMap::new();
+    // Per material slot: a primitive with de-duplicated vertices, and each vertex's control point.
+    let mut prims: HashMap<usize, (Prim, Seen, Vec<usize>)> = HashMap::new();
     let mut poly_start = 0;
     let mut poly = 0;
     for (k, &raw) in poly_index.iter().enumerate() {
@@ -643,21 +1728,22 @@ fn add_geometry(geom: NodeHandle<'_>, m: &M4, materials: &[usize], mesh: &mut Me
                 let slot = v[0] as usize;
                 slot
             });
-        let material = materials.get(slot).copied().unwrap_or(usize::MAX);
-        let (prim, seen) = prims.entry(material).or_insert_with(|| {
+        let (prim, seen, cps) = prims.entry(slot).or_insert_with(|| {
             (
                 Prim {
-                    material,
+                    material: slot,
                     ..Prim::default()
                 },
                 HashMap::new(),
+                Vec::new(),
             )
         });
         let mut ids = Vec::with_capacity(corners.len());
         corner_pos.clear();
         for &(pv, cp) in &corners {
             let pos = &verts[cp * 3..cp * 3 + 3];
-            corner_pos.push([pos[0], pos[1], pos[2]].map(f32_of));
+            let p = [pos[0], pos[1], pos[2]].map(f32_of);
+            corner_pos.push(p);
             let n = normals.as_ref().and_then(|l| l.get(pv, cp, poly - 1));
             let t = uvs.as_ref().and_then(|l| l.get(pv, cp, poly - 1));
             let c = colors.as_ref().and_then(|l| l.get(pv, cp, poly - 1));
@@ -668,10 +1754,10 @@ fn add_geometry(geom: NodeHandle<'_>, m: &M4, materials: &[usize], mesh: &mut Me
                 c.map_or(usize::MAX, |x| x.0),
             );
             let id = *seen.entry(key).or_insert_with(|| {
-                let p = apply(m, [pos[0], pos[1], pos[2]]);
-                prim.positions.push(p.map(f32_of));
+                prim.positions.push(p);
+                cps.push(cp);
                 if let Some((_, nv)) = n {
-                    prim.normals.push(apply_dir(&nm, [nv[0], nv[1], nv[2]]).map(f32_of));
+                    prim.normals.push(unit([nv[0], nv[1], nv[2]]).map(f32_of));
                 }
                 if let Some((_, tv)) = t {
                     // FBX's texture origin is bottom-left, glTF's top-left.
@@ -689,35 +1775,54 @@ fn add_geometry(geom: NodeHandle<'_>, m: &M4, materials: &[usize], mesh: &mut Me
         tris.clear();
         triangulate(&corner_pos, &mut tris);
         for &[a, b, c] in &tris {
-            let [a, b, c] = [a, b, c].map(|i| ids[i as usize]);
-            prim.indices.extend(if flip { [a, c, b] } else { [a, b, c] });
+            prim.indices.extend([a, b, c].map(|i| ids[i as usize]));
         }
     }
-    let mut keys: Vec<usize> = prims.keys().copied().collect();
-    keys.sort_unstable();
-    for key in keys {
-        let (mut prim, _) = prims.remove(&key).unwrap_or_default();
-        if prim.indices.is_empty() {
-            continue;
-        }
-        if prim.normals.len() != prim.positions.len() {
-            prim.normals = smooth_normals(&prim.positions, &prim.indices);
-        }
-        if prim.uvs.len() != prim.positions.len() {
-            prim.uvs.clear();
-        }
-        if prim.colors.len() != prim.positions.len() {
-            prim.colors.clear();
-        }
-        mesh.prims.push(prim);
-    }
-    Ok(())
+    let mut out: Vec<(usize, Prim, Vec<usize>)> = prims
+        .into_iter()
+        .filter(|(_, (p, _, _))| !p.indices.is_empty())
+        .map(|(slot, (mut prim, _, cps))| {
+            if prim.normals.len() != prim.positions.len() {
+                prim.normals = smooth_normals(&prim.positions, &prim.indices);
+            }
+            if prim.uvs.len() != prim.positions.len() {
+                prim.uvs.clear();
+            }
+            if prim.colors.len() != prim.positions.len() {
+                prim.colors.clear();
+            }
+            (slot, prim, cps)
+        })
+        .collect();
+    out.sort_unstable_by_key(|x| x.0);
+    let triangles: usize = out.iter().map(|x| x.1.indices.len() / 3).sum();
+    ensure!(triangles <= MAX_TRIANGLES, "too many triangles to convert");
+    Ok(out)
+}
+
+/// `v` scaled to length one (straight up when it has none).
+fn unit(v: [f64; 3]) -> [f64; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if len > 0.0 { v.map(|c| c / len) } else { [0.0, 1.0, 0.0] }
 }
 
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
+    use crate::document::Pose;
+    use crate::mesh::Mesh;
     use fbxcel::writer::v7400::binary::{FbxFooter, Writer};
+
+    /// The file at `p`, with assets under `dir`, flattened in its rest pose.
+    fn flat(p: &Path, dir: &Path) -> Mesh {
+        let doc = load(
+            crate::formats::Input::file(p),
+            &crate::assets::Folder::new(dir),
+            Keep::ALL,
+        )
+        .unwrap();
+        doc.flatten(Pose::Rest).unwrap().unwrap()
+    }
 
     fn png(rgb: [u8; 3]) -> Vec<u8> {
         let mut b = Vec::new();
@@ -859,7 +1964,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("floor.fbx");
         std::fs::write(&p, z_up_fbx()).unwrap();
-        let mesh = load(crate::formats::Input::file(&p), &crate::assets::Folder::new(dir.path())).unwrap();
+        let mesh = flat(&p, dir.path());
         assert_eq!(mesh.triangles(), 2);
         let prim = &mesh.prims[0];
         for v in &prim.positions {
@@ -973,10 +2078,7 @@ Connections:  {{
         let (a, b) = (dir.path().join("ascii.fbx"), dir.path().join("binary.fbx"));
         std::fs::write(&a, z_up_ascii_fbx()).unwrap();
         std::fs::write(&b, z_up_fbx()).unwrap();
-        let (a, b) = (
-            load(crate::formats::Input::file(&a), &crate::assets::Folder::new(dir.path())).unwrap(),
-            load(crate::formats::Input::file(&b), &crate::assets::Folder::new(dir.path())).unwrap(),
-        );
+        let (a, b) = (flat(&a, dir.path()), flat(&b, dir.path()));
         assert_eq!(a.triangles(), 2);
         assert_eq!(a.prims[0].positions, b.prims[0].positions);
         assert_eq!(a.prims[0].normals, b.prims[0].normals);
@@ -1000,7 +2102,7 @@ Connections:  {{
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("big_ids.fbx");
         std::fs::write(&p, text).unwrap();
-        let mesh = load(crate::formats::Input::file(&p), &crate::assets::Folder::new(dir.path())).unwrap();
+        let mesh = flat(&p, dir.path());
         assert_eq!(mesh.triangles(), 2);
         assert!(
             mesh.prims[0].positions.iter().all(|v| (v[1] - 1.0).abs() < 1e-5),
