@@ -220,7 +220,7 @@ fn ascii(mut blocks: Blocks<'_>) -> Result<Vec<(Option<String>, Prim)>> {
     let size = blocks.size_hint();
     let mut w = Welder::with_capacity((size / 250).min(4096));
     let mut solids: Vec<(Option<String>, Prim)> = Vec::new();
-    // The current solid's name, and whether its `solid` line is still being read.
+    // The current solid's name, and whether its `solid` line goes on into the next block.
     let (mut name, mut naming): (Vec<u8>, bool) = (Vec::new(), false);
     let mut seen = false;
     let mut total = 0;
@@ -245,14 +245,12 @@ fn ascii(mut blocks: Blocks<'_>) -> Result<Vec<(Option<String>, Prim)>> {
         read += text.len();
         let mut i = 0;
         let n = text.len();
+        if naming {
+            naming = !solid_name(text, &mut i, &mut name);
+        }
         loop {
-            let gap = i;
             while i < n && stream::space(text[i]) {
                 i += 1;
-            }
-            // A name ends with its line.
-            if naming && text[gap..i].iter().any(|&c| c == b'\n' || c == b'\r') {
-                naming = false;
             }
             if i == n {
                 break;
@@ -262,17 +260,6 @@ fn ascii(mut blocks: Blocks<'_>) -> Result<Vec<(Option<String>, Prim)>> {
                 i += 1;
             }
             let word = &text[start..i];
-            if naming {
-                if word.eq_ignore_ascii_case(b"facet") || word.eq_ignore_ascii_case(b"endsolid") {
-                    naming = false;
-                } else {
-                    if !name.is_empty() {
-                        name.push(b' ');
-                    }
-                    name.extend_from_slice(word);
-                    continue;
-                }
-            }
             if want > 0 {
                 let c = &mut tri[corner][3 - want];
                 *c = stream::f32_from(word).ok_or_else(|| invalid!("bad vertex line in STL"))?;
@@ -294,8 +281,9 @@ fn ascii(mut blocks: Blocks<'_>) -> Result<Vec<(Option<String>, Prim)>> {
                 if seen {
                     finish_solid(&mut solids, &name, std::mem::replace(&mut w, Welder::with_capacity(0)));
                 }
-                (seen, naming) = (true, true);
+                seen = true;
                 name.clear();
+                naming = !solid_name(text, &mut i, &mut name);
             }
         }
     }
@@ -303,6 +291,38 @@ fn ascii(mut blocks: Blocks<'_>) -> Result<Vec<(Option<String>, Prim)>> {
     finish_solid(&mut solids, &name, w);
     ensure!(!solids.is_empty(), "STL has no triangles");
     Ok(solids)
+}
+
+/// Reads a `solid` line's name from `text[*i..]` onto `name`, a word at a time: up to the end of
+/// the line, or a `facet` or `endsolid` keyword (left for the caller to read), for files written
+/// on one line. `false` when `text` ends first and the name may go on in the next block.
+fn solid_name(text: &[u8], i: &mut usize, name: &mut Vec<u8>) -> bool {
+    let n = text.len();
+    loop {
+        let gap = *i;
+        while *i < n && stream::space(text[*i]) {
+            *i += 1;
+        }
+        if text[gap..*i].iter().any(|&c| c == b'\n' || c == b'\r') {
+            return true;
+        }
+        if *i == n {
+            return false;
+        }
+        let start = *i;
+        while *i < n && !stream::space(text[*i]) {
+            *i += 1;
+        }
+        let word = &text[start..*i];
+        if word.eq_ignore_ascii_case(b"facet") || word.eq_ignore_ascii_case(b"endsolid") {
+            *i = start;
+            return true;
+        }
+        if !name.is_empty() {
+            name.push(b' ');
+        }
+        name.extend_from_slice(word);
+    }
 }
 
 /// Adds a solid's triangles, if it has any, under its name.
