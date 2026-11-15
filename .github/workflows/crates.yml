@@ -1,0 +1,83 @@
+name: Publish to crates.io
+
+# Publishes the one polysmelt crate. Auto release dispatches this after tagging a version;
+# run it by hand (Actions → Publish to crates.io → Run workflow) with an existing tag to retry.
+# The token is the CARGO_REGISTRY_TOKEN repository secret.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing version tag to publish (for example v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Serialize publication, including manual retries.
+concurrency:
+  group: crates-io
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Select version tag
+        id: version
+        env:
+          REQUESTED_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if [[ ! "$REQUESTED_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Supply a version tag such as v0.1.0."
+            exit 1
+          fi
+          echo "tag=$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ steps.version.outputs.tag }}
+          persist-credentials: false
+      - name: Check publishing credential
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
+            echo "::error::Add the CARGO_REGISTRY_TOKEN repository secret, allowed to publish polysmelt (and to create it, for the first release)."
+            exit 1
+          fi
+      - name: Check the tag against the manifest
+        id: pending
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          version="$(sed -n '/^\[package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::$TAG doesn't match Cargo.toml's version $version."
+            exit 1
+          fi
+          status="$(curl -s -o /dev/null -w '%{http_code}' -A 'polysmelt release workflow (github.com/Azazel-Labs/polysmelt)' \
+            "https://crates.io/api/v1/crates/polysmelt/$version")"
+          case "$status" in
+            200) echo "polysmelt $version is already published; skipping"; echo "publish=false" >> "$GITHUB_OUTPUT" ;;
+            404) echo "publish=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::crates.io answered $status"; exit 1 ;;
+          esac
+      - name: Install toolchain (from rust-toolchain.toml)
+        if: steps.pending.outputs.publish == 'true'
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        if: steps.pending.outputs.publish == 'true'
+      - name: Verify package
+        if: steps.pending.outputs.publish == 'true'
+        run: cargo publish --dry-run --locked
+      - name: Publish
+        if: steps.pending.outputs.publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
