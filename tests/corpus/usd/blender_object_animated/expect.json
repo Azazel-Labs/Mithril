@@ -1,0 +1,103 @@
+{
+  "spec": "OpenUSD as Blender's exporter writes it: an object's location, rotation and scale animated",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.wm.usd_export), tools/corpus/blender_export.py",
+  "triangles": 968,
+  "bounds": {
+    "min": [
+      -1.4395,
+      0.0156,
+      -1.0955
+    ],
+    "max": [
+      1.0388,
+      1.9844,
+      0.9672
+    ]
+  },
+  "tolerance": 0.001,
+  "document": {
+    "animations": 1
+  },
+  "poses": [
+    {
+      "animation": 0,
+      "time": 0.0,
+      "bounds": {
+        "min": [
+          -1.4395,
+          0.0156,
+          -1.0955
+        ],
+        "max": [
+          1.0388,
+          1.9844,
+          0.9672
+        ]
+      }
+    },
+    {
+      "animation": 0,
+      "time": 0.208333,
+      "bounds": {
+        "min": [
+          -1.0234,
+          0.1277,
+          -1.5565
+        ],
+        "max": [
+          1.358,
+          2.0965,
+          0.9203
+        ]
+      }
+    },
+    {
+      "animation": 0,
+      "time": 0.5,
+      "bounds": {
+        "min": [
+          -0.0122,
+          0.5156,
+          -1.9003
+        ],
+        "max": [
+          2.6024,
+          2.4844,
+          0.8403
+        ]
+      }
+    },
+    {
+      "animation": 0,
+      "time": 0.791667,
+      "bounds": {
+        "min": [
+          1.118,
+          0.9035,
+          -2.897
+        ],
+        "max": [
+          3.8288,
+          2.8723,
+          0.3131
+        ]
+      }
+    },
+    {
+      "animation": 0,
+      "time": 1.0,
+      "bounds": {
+        "min": [
+          1.3093,
+          1.0156,
+          -3.0603
+        ],
+        "max": [
+          4.312,
+          2.9844,
+          0.1234
+        ]
+      }
+    }
+  ]
+}

@@ -129,6 +129,89 @@ def mat_expect(m, **extra):
     return out
 
 
+def armature_scene():
+    """A column skinned to two bones, the upper one bending, the lower one turning."""
+    reset()
+    animated()
+    body = add(bpy.ops.mesh.primitive_cylinder_add, vertices=8, radius=0.25, depth=2, location=(0, 0, 1))
+    bm = bmesh.new()
+    bm.from_mesh(body.data)
+    tall = [e for e in bm.edges if abs(e.verts[0].co.z - e.verts[1].co.z) > 1e-6]
+    bmesh.ops.subdivide_edges(bm, edges=tall, cuts=5, use_grid_fill=True)
+    bm.to_mesh(body.data)
+    bm.free()
+    arm_data = bpy.data.armatures.new("Armature")
+    arm = bpy.data.objects.new("Armature", arm_data)
+    bpy.context.collection.objects.link(arm)
+    bpy.context.view_layer.objects.active = arm
+    bpy.ops.object.mode_set(mode="EDIT")
+    lower = arm_data.edit_bones.new("Lower")
+    lower.head, lower.tail = (0, 0, 0), (0, 0, 1)
+    upper = arm_data.edit_bones.new("Upper")
+    upper.head, upper.tail = (0, 0, 1), (0, 0, 2)
+    upper.parent, upper.use_connect = lower, True
+    bpy.ops.object.mode_set(mode="OBJECT")
+    groups = {n: body.vertex_groups.new(name=n) for n in ("Lower", "Upper")}
+    for v in body.data.vertices:
+        t = min(max(v.co.z + 1 - 0.5, 0.0), 1.0)  # world height 0.5 to 1.5 blends lower into upper
+        if t < 1:
+            groups["Lower"].add([v.index], 1 - t, "REPLACE")
+        if t > 0:
+            groups["Upper"].add([v.index], t, "REPLACE")
+    body.parent = arm
+    body.modifiers.new("Armature", "ARMATURE").object = arm
+    for name, rot in (("Upper", (math.radians(90), 0, 0)), ("Lower", (0, math.radians(30), 0))):
+        pb = arm.pose.bones[name]
+        pb.rotation_mode = "XYZ"
+        pb.keyframe_insert("rotation_euler", frame=0)
+        pb.rotation_euler = rot
+        pb.keyframe_insert("rotation_euler", frame=24)
+    bpy.context.scene.frame_set(0)
+
+
+def shape_key_scene():
+    """A cube whose shape key's value is animated from 0 to 1."""
+    reset()
+    animated()
+    ob = add(bpy.ops.mesh.primitive_cube_add)
+    ob.shape_key_add(name="Basis")
+    key = ob.shape_key_add(name="Tall")
+    for v in key.data:
+        if v.co.z > 0:
+            v.co.z += 2
+    key.value = 0.0
+    key.keyframe_insert("value", frame=0)
+    key.value = 1.0
+    key.keyframe_insert("value", frame=24)
+    bpy.context.scene.frame_set(0)
+
+
+def object_scene():
+    """An object moving, turning half a turn and growing, under a still parent."""
+    reset()
+    animated()
+    parent = add(bpy.ops.object.empty_add, location=(0, 0, 1), rotation=(0, 0, 0.5))
+    ob = add(bpy.ops.mesh.primitive_monkey_add)
+    ob.parent = parent
+    ob.keyframe_insert("location", frame=0)
+    ob.keyframe_insert("rotation_euler", frame=0)
+    ob.keyframe_insert("scale", frame=0)
+    ob.location, ob.rotation_euler, ob.scale = (3, 0, 1), (0, 0, math.pi), (1, 2, 1)
+    ob.keyframe_insert("location", frame=24)
+    ob.keyframe_insert("rotation_euler", frame=24)
+    ob.keyframe_insert("scale", frame=24)
+    bpy.context.scene.frame_set(0)
+
+
+def cameras_lights_scene():
+    """A cube with a camera and point, sun and spot lights."""
+    reset()
+    add(bpy.ops.mesh.primitive_cube_add)
+    add(bpy.ops.object.camera_add, location=(0, -8, 2), rotation=(math.radians(80), 0, 0))
+    for kind, loc in (("POINT", (2, 0, 3)), ("SUN", (0, 0, 5)), ("SPOT", (-2, 0, 3))):
+        add(bpy.ops.object.light_add, type=kind, location=loc)
+
+
 # --- writing cases ----------------------------------------------------------------------------
 
 def clear_blender_cases(fmt):
@@ -461,93 +544,26 @@ def fbx_cases():
     # One take: the scene's animation, every frame keyed.
     take = dict(bake_anim_use_all_actions=False, bake_anim_use_nla_strips=False, bake_anim_simplify_factor=0.0)
 
-    # A column skinned to two bones, the upper one bending, the lower one turning.
-    reset()
-    animated()
-    body = add(bpy.ops.mesh.primitive_cylinder_add, vertices=8, radius=0.25, depth=2, location=(0, 0, 1))
-    bm = bmesh.new()
-    bm.from_mesh(body.data)
-    tall = [e for e in bm.edges if abs(e.verts[0].co.z - e.verts[1].co.z) > 1e-6]
-    bmesh.ops.subdivide_edges(bm, edges=tall, cuts=5, use_grid_fill=True)
-    bm.to_mesh(body.data)
-    bm.free()
-    arm_data = bpy.data.armatures.new("Armature")
-    arm = bpy.data.objects.new("Armature", arm_data)
-    bpy.context.collection.objects.link(arm)
-    bpy.context.view_layer.objects.active = arm
-    bpy.ops.object.mode_set(mode="EDIT")
-    lower = arm_data.edit_bones.new("Lower")
-    lower.head, lower.tail = (0, 0, 0), (0, 0, 1)
-    upper = arm_data.edit_bones.new("Upper")
-    upper.head, upper.tail = (0, 0, 1), (0, 0, 2)
-    upper.parent, upper.use_connect = lower, True
-    bpy.ops.object.mode_set(mode="OBJECT")
-    groups = {n: body.vertex_groups.new(name=n) for n in ("Lower", "Upper")}
-    for v in body.data.vertices:
-        t = min(max(v.co.z + 1 - 0.5, 0.0), 1.0)  # world height 0.5 to 1.5 blends lower into upper
-        if t < 1:
-            groups["Lower"].add([v.index], 1 - t, "REPLACE")
-        if t > 0:
-            groups["Upper"].add([v.index], t, "REPLACE")
-    body.parent = arm
-    body.modifiers.new("Armature", "ARMATURE").object = arm
-    for name, rot in (("Upper", (math.radians(90), 0, 0)), ("Lower", (0, math.radians(30), 0))):
-        pb = arm.pose.bones[name]
-        pb.rotation_mode = "XYZ"
-        pb.keyframe_insert("rotation_euler", frame=0)
-        pb.rotation_euler = rot
-        pb.keyframe_insert("rotation_euler", frame=24)
-    bpy.context.scene.frame_set(0)
+    armature_scene()
     fbx_export("armature_animated", **take)
     write_case("fbx", "armature_animated", FBX_SPEC + ": a column skinned to two bones, both animated", FBX_OP,
                {**stats(), "tolerance": 1e-3,
                 "document": {"skins": 1, "animations": 1, "node_names": ["Armature", "Lower", "Upper"]},
                 "poses": poses([0, 6, 12, 24])})
 
-    # A shape key's value animated from 0 to 1.
-    reset()
-    animated()
-    ob = add(bpy.ops.mesh.primitive_cube_add)
-    ob.shape_key_add(name="Basis")
-    key = ob.shape_key_add(name="Tall")
-    for v in key.data:
-        if v.co.z > 0:
-            v.co.z += 2
-    key.value = 0.0
-    key.keyframe_insert("value", frame=0)
-    key.value = 1.0
-    key.keyframe_insert("value", frame=24)
-    bpy.context.scene.frame_set(0)
+    shape_key_scene()
     fbx_export("shape_key_animated", **take)
     write_case("fbx", "shape_key_animated", FBX_SPEC + ": a shape key whose value is animated", FBX_OP,
                {**stats(), "tolerance": 1e-3, "document": {"morph_targets": 1, "animations": 1},
                 "poses": poses([0, 8, 16, 24])})
 
-    # An object moving, turning half a turn and growing, under a still parent.
-    reset()
-    animated()
-    parent = add(bpy.ops.object.empty_add, location=(0, 0, 1), rotation=(0, 0, 0.5))
-    ob = add(bpy.ops.mesh.primitive_monkey_add)
-    ob.parent = parent
-    ob.keyframe_insert("location", frame=0)
-    ob.keyframe_insert("rotation_euler", frame=0)
-    ob.keyframe_insert("scale", frame=0)
-    ob.location, ob.rotation_euler, ob.scale = (3, 0, 1), (0, 0, math.pi), (1, 2, 1)
-    ob.keyframe_insert("location", frame=24)
-    ob.keyframe_insert("rotation_euler", frame=24)
-    ob.keyframe_insert("scale", frame=24)
-    bpy.context.scene.frame_set(0)
+    object_scene()
     fbx_export("object_animated", **take)
     write_case("fbx", "object_animated", FBX_SPEC + ": an object's location, rotation and scale animated", FBX_OP,
                {**stats(), "tolerance": 1e-3, "document": {"animations": 1},
                 "poses": poses([0, 5, 12, 19, 24])})
 
-    # Cameras and lights beside a cube.
-    reset()
-    add(bpy.ops.mesh.primitive_cube_add)
-    add(bpy.ops.object.camera_add, location=(0, -8, 2), rotation=(math.radians(80), 0, 0))
-    for kind, loc in (("POINT", (2, 0, 3)), ("SUN", (0, 0, 5)), ("SPOT", (-2, 0, 3))):
-        add(bpy.ops.object.light_add, type=kind, location=loc)
+    cameras_lights_scene()
     fbx_export("cameras_lights")
     write_case("fbx", "cameras_lights", FBX_SPEC + ": a camera and point, sun and spot lights", FBX_OP,
                {**stats(), "document": {"cameras": 1, "lights": 3}})
@@ -730,6 +746,32 @@ def usd_cases():
     scene.frame_set(1)
     write_case("usd", "animated", USD_SPEC + ": an animated transform; the first frame shows", USD_OP,
                {**stats(), "faces_outward": True})
+
+    # Animation: an armature, a shape key and an object, each keyed from frame 0 to 24.
+    anim = dict(export_animation=True)
+    armature_scene()
+    usd_export("armature_animated", **anim)
+    write_case("usd", "armature_animated", USD_SPEC + ": a column skinned to two bones, both animated", USD_OP,
+               {**stats(), "tolerance": 1e-3,
+                "document": {"skins": 1, "animations": 1, "node_names": ["Lower", "Upper"]},
+                "poses": poses([0, 6, 12, 24])})
+
+    shape_key_scene()
+    usd_export("shape_key_animated", **anim)
+    write_case("usd", "shape_key_animated", USD_SPEC + ": a shape key whose value is animated", USD_OP,
+               {**stats(), "tolerance": 1e-3, "document": {"morph_targets": 1, "animations": 1},
+                "poses": poses([0, 8, 16, 24])})
+
+    object_scene()
+    usd_export("object_animated", **anim)
+    write_case("usd", "object_animated", USD_SPEC + ": an object's location, rotation and scale animated", USD_OP,
+               {**stats(), "tolerance": 1e-3, "document": {"animations": 1},
+                "poses": poses([0, 5, 12, 19, 24])})
+
+    cameras_lights_scene()
+    usd_export("cameras_lights", export_cameras=True, export_lights=True)
+    write_case("usd", "cameras_lights", USD_SPEC + ": a camera and point, sun and spot lights", USD_OP,
+               {**stats(), "document": {"cameras": 1, "lights": 3}})
 
     print("blender usd cases written")
 

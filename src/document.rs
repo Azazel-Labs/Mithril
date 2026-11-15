@@ -625,7 +625,7 @@ impl Builder {
 
     /// A float accessor of `kind` (`SCALAR`, `VEC3`, `VEC4`, `MAT4`) with no target, for skins
     /// and animations; `bounds` adds the `min` and `max` an animation's times need.
-    #[cfg(feature = "fbx")]
+    #[cfg(any(feature = "fbx", feature = "usd"))]
     pub(crate) fn floats(&mut self, v: Vec<f32>, kind: &str, bounds: bool) -> usize {
         let width = match kind {
             "VEC2" => 2,

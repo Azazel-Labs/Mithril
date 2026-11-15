@@ -46,6 +46,8 @@ mod threemf;
 mod usd;
 #[cfg(feature = "vox")]
 mod vox;
+#[cfg(any(feature = "fbx", feature = "usd"))]
+mod xform;
 
 /// The extensions [`load`] handles, whether or not this build has their feature.
 pub const EXTENSIONS: &[&str] = &[
@@ -209,7 +211,7 @@ impl<'a> Input<'a> {
 fn read<'a>(input: Input<'a>, ext: &str, assets: &'a dyn Assets, keep: Keep) -> Result<Document<'a>> {
     let mut doc = convert(input, ext, assets, keep)?;
     doc.prune(keep);
-    if matches!(ext, "gltf" | "glb" | "fbx") {
+    if matches!(ext, "gltf" | "glb" | "fbx" | "usd" | "usda" | "usdc" | "usdz") {
         let c = doc.counts();
         for (key, n) in [("triangles", c.triangles), ("points", c.points), ("lines", c.lines)] {
             if n > 0 || key == "triangles" {
@@ -255,9 +257,7 @@ fn convert<'a>(input: Input<'a>, ext: &str, assets: &'a dyn Assets, keep: Keep) 
             Ok(counted(mesh))
         }
         #[cfg(feature = "usd")]
-        "usd" | "usda" | "usdc" | "usdz" => {
-            Ok(usd::load(input, assets)?.map_or_else(|| Document::empty(Map::new()), counted))
-        }
+        "usd" | "usda" | "usdc" | "usdz" => usd::load(input, assets, keep),
         #[cfg(feature = "obj")]
         "obj" => Ok(counted(colors_and_textures(
             obj::obj(input, assets)?,

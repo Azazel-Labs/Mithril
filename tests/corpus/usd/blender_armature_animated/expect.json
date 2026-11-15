@@ -1,0 +1,93 @@
+{
+  "spec": "OpenUSD as Blender's exporter writes it: a column skinned to two bones, both animated",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.wm.usd_export), tools/corpus/blender_export.py",
+  "triangles": 108,
+  "bounds": {
+    "min": [
+      -0.25,
+      0.0,
+      -0.25
+    ],
+    "max": [
+      0.25,
+      2.0,
+      0.25
+    ]
+  },
+  "area": 3.415,
+  "tolerance": 0.001,
+  "document": {
+    "skins": 1,
+    "animations": 1,
+    "node_names": [
+      "Lower",
+      "Upper"
+    ]
+  },
+  "poses": [
+    {
+      "animation": 0,
+      "time": 0.0,
+      "bounds": {
+        "min": [
+          -0.25,
+          0.0,
+          -0.25
+        ],
+        "max": [
+          0.25,
+          2.0,
+          0.25
+        ]
+      }
+    },
+    {
+      "animation": 0,
+      "time": 0.25,
+      "bounds": {
+        "min": [
+          -0.2503,
+          0.0,
+          -0.2614
+        ],
+        "max": [
+          0.269,
+          2.0308,
+          0.4839
+        ]
+      }
+    },
+    {
+      "animation": 0,
+      "time": 0.5,
+      "bounds": {
+        "min": [
+          -0.2516,
+          0.0,
+          -0.2676
+        ],
+        "max": [
+          0.4245,
+          1.8839,
+          0.8538
+        ]
+      }
+    },
+    {
+      "animation": 0,
+      "time": 1.0,
+      "bounds": {
+        "min": [
+          -0.2545,
+          0.0,
+          -0.2641
+        ],
+        "max": [
+          0.7165,
+          1.2639,
+          0.991
+        ]
+      }
+    }
+  ]
+}
