@@ -17,10 +17,10 @@ mod glb;
 
 use std::path::{Path, PathBuf};
 
-use mithril::assets::{Folder, Memory};
-use mithril::document::{Document, Keep, Pose};
-use mithril::formats::{self, EXTENSIONS};
-use mithril::mesh::Mesh;
+use polysmelt::assets::{Folder, Memory};
+use polysmelt::document::{Document, Keep, Pose};
+use polysmelt::formats::{self, EXTENSIONS};
+use polysmelt::mesh::Mesh;
 use serde_json::{Map, Value};
 
 fn corpus() -> PathBuf {
@@ -133,7 +133,7 @@ fn relative(p: &Path, root: &Path) -> String {
 
 /// Reads the case from memory, with every file in its folder as an asset, and checks it reads as it did from its
 /// file: the same document and facts, or an error where that failed.
-fn same_from_memory(case: &Case, ext: &str, from_file: &mithril::Result<Loaded>) -> Result<(), String> {
+fn same_from_memory(case: &Case, ext: &str, from_file: &polysmelt::Result<Loaded>) -> Result<(), String> {
     let mut memory = Memory::new();
     let mut dirs = vec![case.dir.clone()];
     while let Some(dir) = dirs.pop() {
@@ -161,7 +161,7 @@ fn same_from_memory(case: &Case, ext: &str, from_file: &mithril::Result<Loaded>)
 /// A case's document and the mesh it flattens to.
 type Loaded<'a> = (Document<'a>, Option<Mesh>);
 
-fn flattened(doc: Document<'_>) -> mithril::Result<Loaded<'_>> {
+fn flattened(doc: Document<'_>) -> polysmelt::Result<Loaded<'_>> {
     let mesh = doc.flatten(Pose::Rest)?;
     Ok((doc, mesh))
 }
@@ -354,7 +354,7 @@ fn run(case: &Case) -> Result<(), String> {
         };
     }
     let mesh = mesh.ok_or("produced no mesh")?;
-    let bytes = mithril::mesh::to_glb(&mesh).map_err(|err| format!("to_glb failed: {err}"))?;
+    let bytes = polysmelt::mesh::to_glb(&mesh).map_err(|err| format!("to_glb failed: {err}"))?;
     let g = glb::validate(&bytes).map_err(|err| format!("invalid GLB: {err}"))?;
     if g.triangles() != mesh.triangles() {
         return Err(format!(

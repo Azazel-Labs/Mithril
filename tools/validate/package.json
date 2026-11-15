@@ -1,5 +1,5 @@
 {
-  "name": "mithril-validate",
+  "name": "polysmelt-validate",
   "private": true,
   "description": "Runs the Khronos glTF validator over every GLB the conformance tests write",
   "type": "module",

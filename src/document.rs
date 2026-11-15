@@ -332,7 +332,7 @@ impl<'a> Document<'a> {
     /// A document that draws nothing: only the `asset` glTF requires.
     #[must_use]
     pub fn empty(facts: Map<String, Value>) -> Document<'static> {
-        let Value::Object(json) = json!({ "asset": { "version": "2.0", "generator": "mithril" } }) else {
+        let Value::Object(json) = json!({ "asset": { "version": "2.0", "generator": "polysmelt" } }) else {
             unreachable!()
         };
         Document {
@@ -715,7 +715,7 @@ impl Builder {
         let asset = json.entry("asset").or_insert_with(|| json!({}));
         asset["version"] = json!("2.0");
         if asset.get("generator").is_none() {
-            asset["generator"] = json!("mithril");
+            asset["generator"] = json!("polysmelt");
         }
         let mut buffers = Vec::new();
         if !self.views.is_empty() {

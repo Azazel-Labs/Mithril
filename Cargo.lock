@@ -494,25 +494,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mithril"
-version = "0.1.0"
-dependencies = [
- "base64",
- "bytemuck",
- "draco-core",
- "fbxcel",
- "gltf",
- "image",
- "openusd",
- "openusd-schemas",
- "quick-xml",
- "serde_json",
- "tempfile",
- "thiserror",
- "zip 9.5.1",
-]
-
-[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -609,6 +590,25 @@ dependencies = [
  "fdeflate",
  "flate2",
  "miniz_oxide 0.8.9",
+]
+
+[[package]]
+name = "polysmelt"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bytemuck",
+ "draco-core",
+ "fbxcel",
+ "gltf",
+ "image",
+ "openusd",
+ "openusd-schemas",
+ "quick-xml",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "zip 9.5.1",
 ]
 
 [[package]]

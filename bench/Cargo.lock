@@ -300,27 +300,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mithril"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "mithril-bench"
-version = "0.0.0"
-dependencies = [
- "gltf",
- "mithril",
- "ply-rs",
- "serde_json",
- "stl_io",
- "tobj",
-]
-
-[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -395,6 +374,27 @@ dependencies = [
  "fdeflate",
  "flate2",
  "miniz_oxide 0.8.9",
+]
+
+[[package]]
+name = "polysmelt"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "polysmelt-bench"
+version = "0.0.0"
+dependencies = [
+ "gltf",
+ "ply-rs",
+ "polysmelt",
+ "serde_json",
+ "stl_io",
+ "tobj",
 ]
 
 [[package]]

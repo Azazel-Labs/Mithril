@@ -1,22 +1,22 @@
 [package]
-name = "mithril-bench"
+name = "polysmelt-bench"
 version = "0.0.0"
 edition = "2024"
 publish = false
-description = "Load speed and peak memory of Mithril's readers against the leading crate for each format"
+description = "Load speed and peak memory of Polysmelt's readers against the leading crate for each format"
 
-# Its own workspace, so the competitors never enter Mithril's dependency graph or lockfile.
+# Its own workspace, so the competitors never enter Polysmelt's dependency graph or lockfile.
 [workspace]
 
 [features]
-# Bench another commit's Mithril alongside this one. The workflow checks it out and adds the
-# `mithril_base` dependency; see bench.yml.
+# Bench another commit's Polysmelt alongside this one. The workflow checks it out and adds the
+# `polysmelt_base` dependency; see bench.yml.
 baseline = []
 # The baseline commit has the Document API (set by the workflow).
 base-document = []
 
 [dependencies]
-mithril = { path = "..", default-features = false, features = ["minimal"] }
+polysmelt = { path = "..", default-features = false, features = ["minimal"] }
 serde_json = "1"
 tobj = "4.0.5"
 stl_io = "0.11"

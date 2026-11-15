@@ -42,7 +42,7 @@ cases.
 - **Generated** cases are written byte by byte by `tools/corpus/<format>.py` (3DS is
   `tds.py`, 3MF is `threemf.py`). Each one targets one clause of the format's specification,
   or one variant that real exporters write. The expectations come from what the generator
-  wrote, never from reading the file back with Mithril, so a case tests the reader against
+  wrote, never from reading the file back with Polysmelt, so a case tests the reader against
   the standard rather than against itself.
 - **USD** expectations are computed with Pixar's `usd-core` (the `pxr` module). It composes
   the stage and measures it: triangles, bounds, visibility, purpose and transforms.
@@ -139,5 +139,5 @@ Each `materials` entry is matched by `name`, or by position when it has no name:
 
 Add the case to the format's generator rather than hand-editing a folder, so regenerating
 keeps it. Name the case after what it tests (`texture_subfolder`, `rotation_order_zyx`).
-Expect what the standard says, not what Mithril currently does. If the reader is wrong, fix
+Expect what the standard says, not what Polysmelt currently does. If the reader is wrong, fix
 the reader.

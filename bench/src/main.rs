@@ -1,4 +1,4 @@
-//! Load speed and peak memory of Mithril's readers against the leading crate for each format.
+//! Load speed and peak memory of Polysmelt's readers against the leading crate for each format.
 //!
 //! The inputs are generated, so every run measures the same bytes: a torus of quads with
 //! normals and texture coordinates, at three sizes, written as OBJ, binary and ASCII STL, and
@@ -13,7 +13,7 @@
 //! cargo run --release -- [--sizes small,medium,large] [--budget 3] [--json out.json] [--markdown out.md]
 //! ```
 //!
-//! With the `baseline` feature, another commit's Mithril (the `mithril_base` dependency, which
+//! With the `baseline` feature, another commit's Polysmelt (the `polysmelt_base` dependency, which
 //! the bench workflow adds) takes turns with the rest, so a regression check runs both commits
 //! on one machine. Times from separate runs aren't comparable: each may get different hardware.
 
@@ -225,9 +225,9 @@ fn write_ply(t: &Torus, path: &Path, binary: bool) -> std::io::Result<()> {
     f.flush()
 }
 
-/// The torus as Mithril writes a GLB: positions, normals, UVs and u32 indices.
+/// The torus as Polysmelt writes a GLB: positions, normals, UVs and u32 indices.
 fn write_glb(t: &Torus, path: &Path) -> std::io::Result<()> {
-    let mut prim = mithril::mesh::Prim::default();
+    let mut prim = polysmelt::mesh::Prim::default();
     for (p, n, uv) in t.vertices() {
         prim.positions.push(p);
         prim.normals.push(n);
@@ -236,12 +236,12 @@ fn write_glb(t: &Torus, path: &Path) -> std::io::Result<()> {
     for [a, b, c, d] in t.quads() {
         prim.indices.extend([a, b, c, a, c, d].map(|i| i as u32));
     }
-    let mesh = mithril::mesh::Mesh {
+    let mesh = polysmelt::mesh::Mesh {
         prims: vec![prim],
-        materials: vec![mithril::mesh::Material::plain("Torus", [0.8, 0.8, 0.8, 1.0])],
+        materials: vec![polysmelt::mesh::Material::plain("Torus", [0.8, 0.8, 0.8, 1.0])],
         images: Vec::new(),
     };
-    std::fs::write(path, mithril::mesh::to_glb(&mesh).map_err(std::io::Error::other)?)
+    std::fs::write(path, polysmelt::mesh::to_glb(&mesh).map_err(std::io::Error::other)?)
 }
 
 struct Input {
@@ -293,10 +293,10 @@ fn inputs(dir: &Path, sizes: &[String]) -> Vec<Input> {
 /// number of triangles it holds.
 type Load = fn(&Input) -> (Box<dyn std::any::Any>, usize);
 
-fn mithril(input: &Input) -> (Box<dyn std::any::Any>, usize) {
-    use mithril::document::{Keep, Pose};
+fn polysmelt(input: &Input) -> (Box<dyn std::any::Any>, usize) {
+    use polysmelt::document::{Keep, Pose};
     let dir = input.path.parent().unwrap();
-    let doc = mithril::formats::load(&input.path, input.ext, &mithril::assets::Folder::new(dir), Keep::ALL).unwrap();
+    let doc = polysmelt::formats::load(&input.path, input.ext, &polysmelt::assets::Folder::new(dir), Keep::ALL).unwrap();
     // A GLB is already the document, its arrays left in the file: the triangles drawn, decoded,
     // are the like-for-like result (the gltf crate decodes them). The other formats' document
     // holds their arrays, as their competitors' results do.
@@ -309,15 +309,15 @@ fn mithril(input: &Input) -> (Box<dyn std::any::Any>, usize) {
     (Box::new(doc), n)
 }
 
-/// The name the baseline commit's Mithril goes by in the tables.
-const BASELINE: &str = "mithril @ base";
+/// The name the baseline commit's Polysmelt goes by in the tables.
+const BASELINE: &str = "polysmelt @ base";
 
 #[cfg(all(feature = "baseline", feature = "base-document"))]
-fn mithril_base(input: &Input) -> (Box<dyn std::any::Any>, usize) {
-    use mithril_base::document::{Keep, Pose};
+fn polysmelt_base(input: &Input) -> (Box<dyn std::any::Any>, usize) {
+    use polysmelt_base::document::{Keep, Pose};
     let dir = input.path.parent().unwrap();
     let doc =
-        mithril_base::formats::load(&input.path, input.ext, &mithril_base::assets::Folder::new(dir), Keep::ALL)
+        polysmelt_base::formats::load(&input.path, input.ext, &polysmelt_base::assets::Folder::new(dir), Keep::ALL)
             .unwrap();
     if input.ext == "glb" {
         let mesh = doc.flatten(Pose::Rest).unwrap().unwrap();
@@ -329,17 +329,17 @@ fn mithril_base(input: &Input) -> (Box<dyn std::any::Any>, usize) {
 }
 
 #[cfg(all(feature = "baseline", not(feature = "base-document")))]
-fn mithril_base(input: &Input) -> (Box<dyn std::any::Any>, usize) {
+fn polysmelt_base(input: &Input) -> (Box<dyn std::any::Any>, usize) {
     let dir = input.path.parent().unwrap();
     let loaded =
-        mithril_base::formats::load(&input.path, input.ext, &mithril_base::assets::Folder::new(dir)).unwrap();
+        polysmelt_base::formats::load(&input.path, input.ext, &polysmelt_base::assets::Folder::new(dir)).unwrap();
     let mesh = loaded.mesh.unwrap();
     let n = mesh.triangles();
     (Box::new(mesh), n)
 }
 
 fn tobj(input: &Input) -> (Box<dyn std::any::Any>, usize) {
-    // GPU_LOAD_OPTIONS: triangulated, one index per vertex. The form a renderer or a GLB needs, like Mithril's.
+    // GPU_LOAD_OPTIONS: triangulated, one index per vertex. The form a renderer or a GLB needs, like Polysmelt's.
     let (models, _) = tobj::load_obj(&input.path, &tobj::GPU_LOAD_OPTIONS).unwrap();
     let n = models.iter().map(|m| m.mesh.indices.len() / 3).sum();
     (Box::new(models), n)
@@ -463,9 +463,9 @@ fn gltf_import(input: &Input) -> (Box<dyn std::any::Any>, usize) {
 }
 
 fn competitors(ext: &str) -> Vec<(&'static str, Load)> {
-    let mut out: Vec<(&'static str, Load)> = vec![("mithril", mithril)];
+    let mut out: Vec<(&'static str, Load)> = vec![("polysmelt", polysmelt)];
     #[cfg(feature = "baseline")]
-    out.push((BASELINE, mithril_base));
+    out.push((BASELINE, polysmelt_base));
     match ext {
         "obj" => out.push(("tobj", tobj)),
         "stl" => out.push(("stl_io", stl_io)),
@@ -564,17 +564,17 @@ fn main() {
         .map(|s| s.trim().to_owned())
         .collect();
     let budget = Duration::from_secs_f64(arg("--budget").map_or(3.0, |b| b.parse().expect("--budget seconds")));
-    let dir = std::env::temp_dir().join("mithril-bench");
+    let dir = std::env::temp_dir().join("polysmelt-bench");
 
     let inputs = inputs(&dir, &sizes);
     let mut md = String::new();
     let mut results = Vec::new();
     let (mut fastest, mut leanest) = (0, 0);
-    writeln!(md, "## Mithril load benchmarks\n").unwrap();
+    writeln!(md, "## Polysmelt load benchmarks\n").unwrap();
     writeln!(
         md,
         "Median and fastest of interleaved rounds ({budget:?} budget per input); peak heap during the load and \
-         heap the result keeps, from a counting allocator. `×` is relative to Mithril: above 1 means Mithril wins.\n"
+         heap the result keeps, from a counting allocator. `×` is relative to Polysmelt: above 1 means Polysmelt wins.\n"
     )
     .unwrap();
     for input in &inputs {
@@ -605,7 +605,7 @@ fn main() {
             writeln!(
                 md,
                 "| {} | {:.2} | {:.2} | {:.0} | {:.2} | {:.1} | {:.2} | {:.1} | {} |",
-                if r.loader == "mithril" { "**mithril**" } else { r.loader },
+                if r.loader == "polysmelt" { "**polysmelt**" } else { r.loader },
                 ms(r.median),
                 ms(r.best),
                 mb(input.bytes as usize) / r.median.as_secs_f64(),
@@ -626,7 +626,7 @@ fn main() {
     }
     writeln!(
         md,
-        "**Mithril is fastest on {fastest} of {n} inputs and leanest on {leanest} of {n}.**",
+        "**Polysmelt is fastest on {fastest} of {n} inputs and leanest on {leanest} of {n}.**",
         n = inputs.len()
     )
     .unwrap();

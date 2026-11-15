@@ -13,7 +13,7 @@ use crate::document::Document;
 /// Only the data itself goes; buffer views and accessors it used stay (unreferenced).
 ///
 /// ```
-/// use mithril::document::Keep;
+/// use polysmelt::document::Keep;
 /// // Static meshes for an engine that animates nothing, but still skins them.
 /// let keep = Keep { animations: false, ..Keep::ALL };
 /// # assert!(keep.skins);
@@ -145,7 +145,7 @@ fn extensions_present(v: &Value, out: &mut BTreeSet<String>) {
 
 impl Document<'_> {
     /// Drops what `keep` doesn't keep. The JSON stays valid glTF: references to what went are
-    /// removed with it, and extensions no longer used are unlisted. Extensions Mithril doesn't
+    /// removed with it, and extensions no longer used are unlisted. Extensions Polysmelt doesn't
     /// know that refer to dropped materials, textures or cameras may be left pointing at them.
     pub fn prune(&mut self, keep: Keep) {
         if keep == Keep::ALL {

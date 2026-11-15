@@ -1,5 +1,5 @@
 [package]
-name = "mithril"
+name = "polysmelt"
 version = "0.1.0"
 edition = "2024"
 license = "MIT-0"
@@ -9,6 +9,13 @@ rust-version = "1.88"
 description = "Pure-Rust 3D asset interchange: glTF/GLB reading and writing, meshopt compression, and readers for common mesh formats"
 keywords = ["gltf", "glb", "meshopt", "3d", "mesh"]
 categories = ["graphics", "game-development", "parser-implementations", "encoding"]
+repository = "https://github.com/Azazel-Labs/polysmelt"
+readme = "README.md"
+# One crate on crates.io: the library alone. The corpus, its tools and the benchmarks stay in the repository.
+include = ["/src", "/examples", "/README.md", "/LICENSE", "/Cargo.toml"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 default = ["minimal", "fbx", "3mf", "usd", "draco"]

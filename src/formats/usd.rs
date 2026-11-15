@@ -1192,7 +1192,7 @@ impl ar::Resolver for MemResolver {
     }
 
     fn identity(&self) -> String {
-        format!("mithril-memory-{}", self.id)
+        format!("polysmelt-memory-{}", self.id)
     }
 
     fn cache_id(&self) -> Option<u64> {

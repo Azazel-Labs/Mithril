@@ -2116,7 +2116,7 @@ Connections:  {{
 #[test]
 #[ignore = "writes files; run by hand"]
 fn write_fbx_fixture() {
-    let Some(out) = std::env::var_os("MITHRIL_FIXTURE_OUT") else {
+    let Some(out) = std::env::var_os("POLYSMELT_FIXTURE_OUT") else {
         return;
     };
     let out = std::path::PathBuf::from(out);

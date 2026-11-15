@@ -1,6 +1,6 @@
 name: Benchmarks
 
-# Load speed and peak memory of Mithril's readers against tobj, stl_io and ply-rs, on a fresh
+# Load speed and peak memory of Polysmelt's readers against tobj, stl_io and ply-rs, on a fresh
 # GitHub-hosted runner. Run it from the Actions tab or `gh workflow run bench.yml`. The tables
 # land in the run summary and the raw numbers in the bench-results artifact.
 #
@@ -47,12 +47,14 @@ jobs:
           git worktree add baseline "$rev"
           # A different version, so Cargo can hold both copies of the crate in one build.
           sed -i 's/^version = .*/version = "0.0.0-base"/' baseline/Cargo.toml
-          sed -i 's/^baseline = \[\]/baseline = ["dep:mithril_base"]/' bench/Cargo.toml
-          sed -i '/^mithril = /a mithril_base = { package = "mithril", path = "../baseline", default-features = false, features = ["minimal"], optional = true }' bench/Cargo.toml
+          sed -i 's/^baseline = \[\]/baseline = ["dep:polysmelt_base"]/' bench/Cargo.toml
+          # The crate was called mithril before it was polysmelt: take the baseline's own name.
+          pkg=$(sed -n 's/^name = "\(.*\)"/\1/p' baseline/Cargo.toml | head -1)
+          sed -i "/^polysmelt = /a polysmelt_base = { package = \"$pkg\", path = \"../baseline\", default-features = false, features = [\"minimal\"], optional = true }" bench/Cargo.toml
           # The baseline's API: a Document (and a `Keep`) from the lossless rewrite on, a `Loaded` before.
           if [ -f baseline/src/document.rs ]; then features=baseline,base-document; else features=baseline; fi
           echo "FEATURES=--features $features" >> "$GITHUB_ENV"
-          echo "Baseline: \`$(git -C baseline rev-parse --short HEAD)\` (\`$BASE\`), as \"mithril @ base\"" >> "$GITHUB_STEP_SUMMARY"
+          echo "Baseline: \`$(git -C baseline rev-parse --short HEAD)\` (\`$BASE\`), as \"polysmelt @ base\"" >> "$GITHUB_STEP_SUMMARY"
       - name: Build
         run: cargo build --release --manifest-path bench/Cargo.toml $FEATURES
       - name: Machine
@@ -64,7 +66,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Run
         run: |
-          bench/target/release/mithril-bench \
+          bench/target/release/polysmelt-bench \
             --sizes "${{ inputs.sizes }}" --budget "${{ inputs.budget }}" \
             --json bench-results.json --markdown bench-results.md
           cat bench-results.md >> "$GITHUB_STEP_SUMMARY"

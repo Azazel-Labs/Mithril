@@ -2,7 +2,7 @@
 
 Each generator writes cases under tests/corpus/<format>/<case>/: the model file, whatever it
 refers to, and an expect.json. Expectations come from what the generator wrote (the geometry
-it chose, the colors it set), never from reading the result back with Mithril, so a case
+it chose, the colors it set), never from reading the result back with Polysmelt, so a case
 checks the reader against the standard rather than against itself.
 
 Run from the repository root:  python tools/corpus/<format>.py

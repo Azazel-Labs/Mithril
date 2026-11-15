@@ -303,7 +303,7 @@ impl<'d> Reader<'d> {
             !list(json, "extensionsRequired")
                 .iter()
                 .any(|e| e.as_str() == Some("KHR_draco_mesh_compression")),
-            "glTF uses Draco compression, which needs Mithril's `draco` feature"
+            "glTF uses Draco compression, which needs Polysmelt's `draco` feature"
         );
         let n = |key| list(json, key).len();
         Ok(Self {
@@ -995,7 +995,7 @@ impl Reader<'_> {
                 let _ = ext;
                 ensure!(
                     self.acc(pos)?.view.is_some(),
-                    "glTF uses Draco compression, which needs Mithril's `draco` feature"
+                    "glTF uses Draco compression, which needs Polysmelt's `draco` feature"
                 );
             }
         }

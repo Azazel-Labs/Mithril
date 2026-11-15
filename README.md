@@ -1,4 +1,4 @@
-# mithril
+# polysmelt
 
 Pure-Rust 3D asset interchange, with glTF as the hub. Read what other tools write, keep what
 you don't understand, and write compact or plain files back out.
@@ -38,7 +38,7 @@ Early. What exists today:
   rest are Blender 5.2 exports. See [tests/corpus/README.md](tests/corpus/README.md). Every
   GLB the conformance tests write passes the Khronos glTF validator (`tools/validate`), which
   CI runs.
-- **Benchmarks**: `bench/` races Mithril's readers against tobj, stl_io, ply-rs and gltf on load
+- **Benchmarks**: `bench/` races Polysmelt's readers against tobj, stl_io, ply-rs and gltf on load
   time and peak heap. Run it on a clean GitHub runner with `gh workflow run bench.yml` (or
   from the Actions tab); the tables land in the run summary.
 - **`mesh`**: the flat triangle-list model `flatten` produces (primitives, materials,
@@ -74,11 +74,11 @@ Without `fs` the file APIs don't exist, so a build that has no file system (such
 memory instead:
 
 ```toml
-mithril = { version = "0.1", default-features = false, features = ["stl", "ply", "obj", "gltf", "usd"] }
+polysmelt = { version = "0.1", default-features = false, features = ["stl", "ply", "obj", "gltf", "usd"] }
 ```
 
 ```rust
-use mithril::{assets::Memory, document::{Keep, Pose}, formats};
+use polysmelt::{assets::Memory, document::{Keep, Pose}, formats};
 
 let assets = Memory::new().with("scene.bin", bin).with("albedo.png", png);
 let mut doc = formats::load_bytes(&gltf, "scene.gltf", "gltf", &assets, Keep::ALL)?;
