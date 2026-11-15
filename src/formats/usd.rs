@@ -863,8 +863,9 @@ fn instance_matrix(s: [f32; 3], q: [f32; 4], t: [f32; 3]) -> gf::Matrix4d {
     ];
     let mut m = gf::Matrix4d::IDENTITY;
     for row in 0..3 {
-        for col in 0..3 {
-            m.0[row * 4 + col] = f64::from(s[row]) * r[col][row];
+        // USD matrices are row vectors, so row `row` of the transform is column `row` of `r`.
+        for (col, r_col) in r.iter().enumerate() {
+            m.0[row * 4 + col] = f64::from(s[row]) * r_col[row];
         }
         m.0[12 + row] = f64::from(t[row]);
     }
