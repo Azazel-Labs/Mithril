@@ -4,7 +4,8 @@
 //!   cargo feature, producing a [`Mesh`](mesh::Mesh).
 //! - [`mesh`]: that triangle-list model, written out as a GLB.
 //! - [`assets`]: how readers find the textures and material libraries a model refers to.
-//! - [`meshopt`]: the `EXT_meshopt_compression` bitstreams.
+//! - [`gltf`]: GLB packing, and meshopt compression added to or decoded away from a GLB.
+//! - [`meshopt`]: the `EXT_meshopt_compression` and `KHR_meshopt_compression` bitstreams.
 
 use std::fmt::Display;
 
@@ -34,6 +35,7 @@ macro_rules! invalid {
 
 pub mod assets;
 pub mod formats;
+pub mod gltf;
 pub mod mesh;
 pub mod meshopt;
 
