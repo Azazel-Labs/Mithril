@@ -249,7 +249,7 @@ fn convert<'a>(input: Input<'a>, ext: &str, assets: &'a dyn Assets, keep: Keep) 
         #[cfg(feature = "vox")]
         "vox" => vox::vox(&input.read()?, keep),
         #[cfg(feature = "3mf")]
-        "3mf" => threemf::load(input).map(|(mesh, facts)| of_mesh(mesh, facts)),
+        "3mf" => threemf::load(input),
         #[cfg(feature = "3ds")]
         "3ds" => {
             let mut mesh = tds::load(input, assets)?;

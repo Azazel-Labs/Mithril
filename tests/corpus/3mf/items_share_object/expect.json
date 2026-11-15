@@ -16,5 +16,9 @@
   },
   "facts": {
     "objects": 2
+  },
+  "document": {
+    "nodes": 3,
+    "meshes": 1
   }
 }

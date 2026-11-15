@@ -17,5 +17,11 @@
   "facts": {
     "unit": "inch"
   },
-  "tolerance": 1e-05
+  "tolerance": 1e-05,
+  "document": {
+    "source": {
+      "unit": "inch",
+      "metersPerUnit": 0.0254
+    }
+  }
 }

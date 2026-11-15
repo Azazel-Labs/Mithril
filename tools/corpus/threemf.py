@@ -54,7 +54,8 @@ def package(parts, compression=zipfile.ZIP_DEFLATED, root=True):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression) as z:
         for name, data in files.items():
-            z.writestr(name, data)
+            # A fixed date, so the corpus regenerates byte for byte.
+            z.writestr(zipfile.ZipInfo(name, (2024, 1, 1, 0, 0, 0)), data, compression)
     return buf.getvalue()
 
 
@@ -120,13 +121,16 @@ def one_cube(**kw):
 
 case(FMT, "cube", {"cube.3mf": package({"3D/3dmodel.model": one_cube()})},
      {"spec": CORE + ": one mesh object, one build item", "source": SRC, **CUBE,
-      "facts": {"unit": "millimeter", "objects": 1, "triangles": 12}, "material_count": 1})
+      "facts": {"unit": "millimeter", "objects": 1, "triangles": 12}, "material_count": 1,
+      "document": {"nodes": 2, "meshes": 1, "node_names": ["RootNode"],
+                   "source": {"format": "3MF", "unit": "millimeter", "metersPerUnit": 0.001, "upAxis": "Z"}}})
 
 UNITS = {"micron": 1e-6, "millimeter": 1e-3, "centimeter": 1e-2, "inch": 0.0254, "foot": 0.3048, "meter": 1.0}
 for unit, m in UNITS.items():
     case(FMT, f"unit_{unit}", {"cube.3mf": package({"3D/3dmodel.model": one_cube(unit=unit)})},
          {"spec": CORE + f": unit=\"{unit}\", scaled to metres", "source": SRC, "triangles": 12,
-          "bounds": box((0, 0, 0), (SIZE,) * 3, m), "facts": {"unit": unit}, "tolerance": 1e-5})
+          "bounds": box((0, 0, 0), (SIZE,) * 3, m), "facts": {"unit": unit}, "tolerance": 1e-5,
+          "document": {"source": {"unit": unit, "metersPerUnit": m}}})
 
 case(FMT, "unit_unsaid", {"cube.3mf": package({"3D/3dmodel.model": one_cube(unit=None)})},
      {"spec": CORE + ": no unit attribute means millimetres", "source": SRC, **CUBE,
@@ -174,7 +178,14 @@ case(FMT, "metadata_application",
          metadata='<metadata name="Application">Corpus Generator 1.0</metadata>'
                   '<metadata name="Title">A cube</metadata>\n')})},
      {"spec": CORE + ": the Application metadata", "source": SRC, **CUBE,
-      "facts": {"application": "Corpus Generator 1.0"}})
+      "facts": {"application": "Corpus Generator 1.0"},
+      "document": {"source": {"metadata": {"Application": "Corpus Generator 1.0", "Title": "A cube"}}}})
+
+case(FMT, "object_names",
+     {"cube.3mf": package({"3D/3dmodel.model": model(
+         obj(1, CUBE_MESH, ' name="Bracket" partnumber="BR-1"'), item(1, attrs=' partnumber="BR-1-A"'))})},
+     {"spec": CORE + ": an object's name and part number, and the item's, kept on its node", "source": SRC,
+      **CUBE, "document": {"nodes": 2, "node_names": ["Bracket", "RootNode"]}})
 
 case(FMT, "triangle_index_out_of_range",
      {"cube.3mf": package({"3D/3dmodel.model": model(obj(1, mesh(CUBE_P, CUBE_T + [(0, 1, 99)])), item(1))})},
@@ -198,7 +209,7 @@ case(FMT, "items_share_object",
      {"two.3mf": package({"3D/3dmodel.model": model(obj(1, CUBE_MESH),
                                                     item(1) + item(1, "1 0 0 0 1 0 0 0 1 0 30 0"))})},
      {"spec": CORE + ": two build items placing one object", "source": SRC, "triangles": 24,
-      "bounds": box((0, 0, 0), (10, 40, 10)), "facts": {"objects": 2}})
+      "bounds": box((0, 0, 0), (10, 40, 10)), "facts": {"objects": 2}, "document": {"nodes": 3, "meshes": 1}})
 
 comp = obj(2, '<components><component objectid="1"/>'
               '<component objectid="1" transform="1 0 0 0 1 0 0 0 1 20 0 0"/></components>')
@@ -212,7 +223,7 @@ case(FMT, "components_nested",
      {"two.3mf": package({"3D/3dmodel.model": model(obj(1, CUBE_MESH) + comp + nest,
                                                     item(3, "1 0 0 0 1 0 0 0 1 5 0 0"))})},
      {"spec": CORE + ": components of components; transforms compose inside out", "source": SRC,
-      "triangles": 24, "bounds": box((5, 0, 10), (35, 10, 20))})
+      "triangles": 24, "bounds": box((5, 0, 10), (35, 10, 20)), "document": {"nodes": 5, "meshes": 1}})
 
 case(FMT, "component_mirrored",
      {"cube.3mf": package({"3D/3dmodel.model": model(
@@ -250,7 +261,8 @@ case(FMT, "base_materials",
                     ' pid="7" pindex="0"'), item(1))})},
      {"spec": MAT + ": base materials by object pid/pindex and per triangle; displaycolor is sRGB with alpha",
       "source": SRC, **CUBE, "primitives": 2, "facts": {"colors": 2},
-      "materials": [{"color": lin(RED)}, {"color": lin(BLUE, 0x80), "alpha_mode": "BLEND"}]})
+      "materials": [{"name": "Red PLA", "color": lin(RED)},
+                    {"name": "Glass", "color": lin(BLUE, 0x80), "alpha_mode": "BLEND"}]})
 
 SIX = [(230, 30, 30), (30, 200, 30), (30, 30, 230), (240, 200, 20), (200, 30, 200), (20, 200, 200)]
 group = '<m:colorgroup id="3">' + "".join(f'<m:color color="#{c[0]:02X}{c[1]:02X}{c[2]:02X}"/>' for c in SIX) + "</m:colorgroup>"
@@ -316,7 +328,8 @@ case(FMT, "bambu_filaments_parts_paint",
                             "Metadata/project_settings.config": '{"filament_colour": ["#FFFFFF", "#FF0000", "#00FF00"]}'})},
      {"spec": "Bambu Studio / OrcaSlicer project: filament colors, a filament per part, a painted triangle",
       "source": SRC, "triangles": 3,
-      "materials": [{"color": [1, 1, 1, 1]}, {"color": [0, 1, 0, 1]}, {"color": [1, 0, 0, 1]}]})
+      "materials": [{"color": [1, 1, 1, 1]}, {"color": [0, 1, 0, 1]}, {"color": [1, 0, 0, 1]}],
+      "document": {"source": {"filaments": ["#FFFFFF", "#FF0000", "#00FF00"]}}})
 
 prusa_cfg = ('<?xml version="1.0" encoding="utf-8"?>\n<config><object id="1" instances_count="1">'
              '<metadata type="object" key="extruder" value="1"/>'

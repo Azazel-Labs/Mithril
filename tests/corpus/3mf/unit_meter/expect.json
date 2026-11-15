@@ -17,5 +17,11 @@
   "facts": {
     "unit": "meter"
   },
-  "tolerance": 1e-05
+  "tolerance": 1e-05,
+  "document": {
+    "source": {
+      "unit": "meter",
+      "metersPerUnit": 1.0
+    }
+  }
 }

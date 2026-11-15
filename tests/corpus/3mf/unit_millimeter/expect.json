@@ -17,5 +17,11 @@
   "facts": {
     "unit": "millimeter"
   },
-  "tolerance": 1e-05
+  "tolerance": 1e-05,
+  "document": {
+    "source": {
+      "unit": "millimeter",
+      "metersPerUnit": 0.001
+    }
+  }
 }

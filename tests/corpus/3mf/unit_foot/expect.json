@@ -17,5 +17,11 @@
   "facts": {
     "unit": "foot"
   },
-  "tolerance": 1e-05
+  "tolerance": 1e-05,
+  "document": {
+    "source": {
+      "unit": "foot",
+      "metersPerUnit": 0.3048
+    }
+  }
 }

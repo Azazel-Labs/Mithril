@@ -27,5 +27,14 @@
         1
       ]
     }
-  ]
+  ],
+  "document": {
+    "source": {
+      "filaments": [
+        "#FFFFFF",
+        "#FF0000",
+        "#00FF00"
+      ]
+    }
+  }
 }
