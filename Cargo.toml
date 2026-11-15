@@ -1,6 +1,6 @@
 [package]
 name = "polysmelt"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 license = "MIT-0"
 # 1.88 for edition 2024's let chains (and `zip` 9). The `usd` feature, on by default, needs
