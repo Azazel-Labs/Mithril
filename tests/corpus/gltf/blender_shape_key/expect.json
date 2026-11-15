@@ -1,0 +1,18 @@
+{
+  "spec": "glTF 2.0 as Blender's exporter writes it: a morph target at its default weight",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.export_scene.gltf), tools/corpus/blender_export.py",
+  "triangles": 12,
+  "bounds": {
+    "min": [
+      -1.0,
+      -1.0,
+      -1.0
+    ],
+    "max": [
+      1.0,
+      2.0,
+      1.0
+    ]
+  },
+  "area": 32.0
+}

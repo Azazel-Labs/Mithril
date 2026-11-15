@@ -620,7 +620,146 @@ def usd_cases():
     print("blender usd cases written")
 
 
-FORMATS = {"obj": obj_cases, "stl": stl_cases, "ply": ply_cases, "fbx": fbx_cases, "usd": usd_cases}
+# --- glTF -------------------------------------------------------------------------------------
+
+GLTF_SPEC = "glTF 2.0 as Blender's exporter writes it"
+GLTF_OP = "bpy.ops.export_scene.gltf"
+
+
+def gltf_export(name, fmt="GLB", **kw):
+    d = case_dir("gltf", name)
+    ext = "glb" if fmt == "GLB" else "gltf"
+    args = dict(filepath=os.path.join(d, name + "." + ext), export_format=fmt, export_cameras=False,
+                export_lights=False, export_apply=True)
+    args.update(kw)
+    bpy.ops.export_scene.gltf(**args)
+    return d
+
+
+def gltf_mat(m, **extra):
+    """Blender's glTF materials carry the base color (linear), roughness and metallic as they are."""
+    bsdf = m.node_tree.nodes["Principled BSDF"]
+    return mat_expect(m, metallic=r(bsdf.inputs["Metallic"].default_value, 4), **extra)
+
+
+def gltf_cases():
+    clear_blender_cases("gltf")
+
+    reset()
+    ob = add(bpy.ops.mesh.primitive_cube_add)
+    m = material("Painted", color=(0.8, 0.1, 0.05), roughness=0.4, metallic=0.3)
+    ob.data.materials.append(m)
+    for name, fmt in [("cube_glb", "GLB"), ("cube_separate", "GLTF_SEPARATE")]:
+        gltf_export(name, fmt)
+        write_case("gltf", name, GLTF_SPEC + f": {fmt}, UVs, flat normals, one material", GLTF_OP,
+                   {**stats(), "uvs": True, "normals_in": AXES, "winding_matches_normals": True,
+                    "faces_outward": True, "material_count": 1, "materials": [gltf_mat(m)]})
+
+    reset()
+    add(bpy.ops.mesh.primitive_monkey_add)
+    bpy.ops.object.shade_smooth()
+    gltf_export("suzanne_smooth")
+    write_case("gltf", "suzanne_smooth", GLTF_SPEC + ": smooth normals", GLTF_OP, {**stats(), "uvs": True})
+
+    reset()
+    star = []
+    for i in range(10):
+        a = math.pi / 2 + i * math.pi / 5
+        rad = 1.0 if i % 2 == 0 else 0.4
+        star.append((rad * math.cos(a), rad * math.sin(a), 0.0))
+    from_polygon("Star", star)
+    gltf_export("concave_star")
+    write_case("gltf", "concave_star", GLTF_SPEC + ": a concave polygon, triangulated by the exporter", GLTF_OP,
+               {**stats(), "normals_in": [[0, 1, 0]], "winding_matches_normals": True})
+
+    reset()
+    ob = add(bpy.ops.mesh.primitive_cube_add)
+    gray = material("Gray", color=(0.5, 0.5, 0.5), roughness=0.9)
+    red = material("Red", color=(0.9, 0.0, 0.0), roughness=0.2, metallic=1.0)
+    ob.data.materials.append(gray)
+    ob.data.materials.append(red)
+    max(ob.data.polygons, key=lambda p: p.center.z).material_index = 1
+    gltf_export("two_materials")
+    write_case("gltf", "two_materials", GLTF_SPEC + ": one primitive per material", GLTF_OP,
+               {**stats(), "primitives": 2, "material_count": 2, "materials": [gltf_mat(gray), gltf_mat(red)]})
+
+    for name, fmt, color in [("textured_embedded", "GLB", (255, 0, 0)), ("textured_external", "GLTF_SEPARATE", (0, 255, 0))]:
+        reset()
+        d = case_dir("gltf", name)
+        tex = os.path.join(d, "..", name + "_source.png")
+        with open(tex, "wb") as f:
+            f.write(png(color, 4))
+        ob = add(bpy.ops.mesh.primitive_plane_add)
+        m = material("Textured", image=tex)
+        ob.data.materials.append(m)
+        gltf_export(name, fmt)
+        os.remove(tex)
+        write_case("gltf", name, GLTF_SPEC + f": an image texture, {fmt}", GLTF_OP,
+                   {**stats(), "uvs": True, "image_count": 1,
+                    "materials": [{"name": "Textured", "textured": True, "pixel": list(color)}]})
+
+    reset()
+    ob = add(bpy.ops.mesh.primitive_plane_add)
+    attr = ob.data.color_attributes.new("Col", "FLOAT_COLOR", "CORNER")
+    linear = [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0), (0.214, 0.214, 0.214)]
+    for i, c in enumerate(linear):
+        attr.data[i].color = (*c, 1.0)
+    ob.data.color_attributes.active_color = attr
+    gltf_export("vertex_colors", export_vertex_color="ACTIVE")
+    write_case("gltf", "vertex_colors", GLTF_SPEC + ": COLOR_0, linear", GLTF_OP,
+               {**stats(), "colors": True, "tolerance": 5e-3, "colors_include": [[*c, 1] for c in linear]})
+
+    reset()
+    ob = add(bpy.ops.mesh.primitive_cube_add)
+    m = material("Lamp", color=(1, 1, 1), emission=(1.0, 0.5, 0.0))
+    m.node_tree.nodes["Principled BSDF"].inputs["Emission Strength"].default_value = 0.5
+    ob.data.materials.append(m)
+    gltf_export("emission")
+    write_case("gltf", "emission", GLTF_SPEC + ": emission color times strength", GLTF_OP,
+               {**stats(), "materials": [{"name": "Lamp", "emissive": [0.5, 0.25, 0]}]})
+
+    # A hierarchy of transformed objects, one of them mirrored.
+    reset()
+    parent = add(bpy.ops.mesh.primitive_cube_add, location=(2, 0, 1), rotation=(0.3, 0.5, 0.2), scale=(1, 2, 0.5))
+    child = add(bpy.ops.mesh.primitive_cone_add, location=(0, 3, 0), rotation=(0, 0, 0.7))
+    child.parent = parent
+    add(bpy.ops.mesh.primitive_monkey_add, location=(-3, 0, 0), scale=(-1, 1, 1))
+    gltf_export("hierarchy")
+    write_case("gltf", "hierarchy", GLTF_SPEC + ": parented, rotated, non-uniformly scaled and mirrored objects",
+               GLTF_OP, {**stats(), "winding_matches_normals": True})
+
+    # One mesh shared by two objects: the exporter writes it once, used by two nodes.
+    reset()
+    a = add(bpy.ops.mesh.primitive_cube_add, location=(0, 0, 0))
+    b = add(bpy.ops.mesh.primitive_cube_add, location=(4, 0, 0), rotation=(0, 0, 0.5))
+    b.data = a.data
+    gltf_export("shared_mesh")
+    write_case("gltf", "shared_mesh", GLTF_SPEC + ": one mesh drawn by two nodes", GLTF_OP,
+               {**stats(), "winding_matches_normals": True})
+
+    # A shape key at 0.5: the exporter writes a morph target and the weight as the default.
+    reset()
+    ob = add(bpy.ops.mesh.primitive_cube_add)
+    ob.shape_key_add(name="Basis")
+    key = ob.shape_key_add(name="Tall")
+    for v in key.data:
+        if v.co.z > 0:
+            v.co.z += 2
+    key.value = 0.5
+    gltf_export("shape_key", export_apply=False)
+    write_case("gltf", "shape_key", GLTF_SPEC + ": a morph target at its default weight", GLTF_OP, stats())
+
+    # Draco: refused with a clear message.
+    reset()
+    add(bpy.ops.mesh.primitive_cube_add)
+    gltf_export("draco", export_draco_mesh_compression_enable=True)
+    write_case("gltf", "draco", GLTF_SPEC + ": Draco-compressed (KHR_draco_mesh_compression), not read", GLTF_OP,
+               {"error": "Draco"})
+
+    print("blender gltf cases written")
+
+
+FORMATS = {"obj": obj_cases, "stl": stl_cases, "ply": ply_cases, "fbx": fbx_cases, "usd": usd_cases, "gltf": gltf_cases}
 
 if __name__ == "__main__":
     wanted = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else list(FORMATS)

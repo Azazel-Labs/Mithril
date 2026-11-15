@@ -16,15 +16,16 @@ Early. What exists today:
   a `.gltf` and its files into one GLB, with `files_in` as a fetch that stays inside the
   model's folder. `cargo run --example meshopt -- sample out.glb` writes a small test file.
 - **`formats`**: readers for STL (binary and ASCII), PLY, MagicaVoxel `.vox`, OBJ with MTL
-  materials and textures, FBX (binary and ASCII), 3DS, 3MF and USD (`.usda`, `.usdc`,
-  `.usdz`). Each produces a `mesh::Mesh`, with textures embedded. `formats::load` dispatches
+  materials and textures, FBX (binary and ASCII), 3DS, 3MF, USD (`.usda`, `.usdc`,
+  `.usdz`) and glTF 2.0 (`.gltf`, `.glb`, meshopt-compressed or not). Each produces a `mesh::Mesh`, with textures embedded. `formats::load` dispatches
   on the extension.
-- **Conformance corpus**: 430 cases under `tests/corpus`, each a file and the GLB it must
+- **Conformance corpus**: 489 cases under `tests/corpus`, each a file and the GLB it must
   become. They cover every format above and the variants exporters really write: OBJ's face
   forms and MTL dialects, both PLY byte orders, every FBX version and axis system, and USD's
-  three encodings and its composition. Most are generated against the specifications; the
+  three encodings and its composition, and glTF's accessor types, node hierarchy, skins and
+  extensions. Most are generated against the specifications; the
   rest are Blender 5.2 exports. See [tests/corpus/README.md](tests/corpus/README.md).
-- **Benchmarks**: `bench/` races Mithril's readers against tobj, stl_io and ply-rs on load
+- **Benchmarks**: `bench/` races Mithril's readers against tobj, stl_io, ply-rs and gltf on load
   time and peak heap. Run it on a clean GitHub runner with `gh workflow run bench.yml` (or
   from the Actions tab); the tables land in the run summary.
 - **`mesh`**: that triangle-list model (primitives, materials, images), written out as a
@@ -42,11 +43,12 @@ Early. What exists today:
 | `vox` | MagicaVoxel | none |
 | `obj` | OBJ + MTL | none |
 | `3ds` | 3DS | none |
+| `gltf` | glTF 2.0 + GLB | none |
 | `fbx` | FBX | `fbxcel`, `base64` |
 | `3mf` | 3MF | `zip`, `quick-xml` |
 | `usd` | USD | `openusd`, `openusd-schemas`, `zip` |
 
-Every reader is on by default. `minimal` is the five with no dependencies, for
+Every reader is on by default. `minimal` is the six with no dependencies, for
 `default-features = false, features = ["minimal"]`. Asking `formats::load` for a format whose feature is off
 returns an error that names the feature.
 
@@ -54,10 +56,11 @@ returns an error that names the feature.
 
 - **glTF document**: a lossless JSON document, so unknown extensions and extras survive a
   round trip. Typed views over meshes, accessors, nodes, skins and animations.
-- **Accessors**: reading every component type, normalized and sparse.
-- **Compression**: meshopt v1 encoding and filter encoders beyond octahedral. Also
-  `KHR_mesh_quantization` and `KHR_texture_transform` baking.
-- **Scene**: `EXT_mesh_gpu_instancing`, and animations read and written.
+- **Accessors**: typed access through the document (the mesh reader already reads every
+  component type, normalized and sparse).
+- **Compression**: meshopt v1 encoding and filter encoders beyond octahedral, and
+  writing `KHR_mesh_quantization`.
+- **Scene**: animations read and written, and instancing kept rather than baked.
 - **Writer**: a builder with plain output (any viewer, Blender) or compact output
   (quantized and meshopt-compressed).
 - **Validation** of glTF documents.

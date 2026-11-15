@@ -1,0 +1,5 @@
+{
+  "spec": "glTF 2.0 as Blender's exporter writes it: Draco-compressed (KHR_draco_mesh_compression), not read",
+  "source": "exported by Blender 5.2.1 LTS (bpy.ops.export_scene.gltf), tools/corpus/blender_export.py",
+  "error": "Draco"
+}

@@ -37,6 +37,7 @@ cases.
 | 3MF | 38 | 38 | none |
 | FBX | 99 | 85 | 14 |
 | USD | 125 | 105 | 20 |
+| glTF | 59 | 46 | 13 |
 
 - **Generated** cases are written byte by byte by `tools/corpus/<format>.py` (3DS is
   `tds.py`, 3MF is `threemf.py`). Each one targets one clause of the format's specification,
@@ -90,6 +91,15 @@ python tools/corpus/obj.py
   composition: references, payloads, sublayers, variants, instancing, classes and overs.
   Also visibility and purpose, UsdPreviewSurface, textures (beside the file, in a subfolder,
   inside a `.usdz`, missing), GeomSubsets, gprims, point instancers and time samples.
+- **glTF**: GLB, `.gltf` with an external buffer (in a subfolder, percent-encoded) or a data
+  URI, and a byte order mark. Covers u8, u16 and u32 indices, missing indices and normals,
+  interleaved views, sparse accessors (over a view and over zeros), `KHR_mesh_quantization`
+  (integer and normalized types), strips and fans, points and lines. Also the node hierarchy
+  (TRS and matrices, mirrors, the default scene, no scenes, no nodes), skins and morph
+  targets at rest, `EXT_mesh_gpu_instancing`, metallic-roughness and specular-glossiness
+  materials, and textures (embedded, external, data URI, missing, WebP fallback, a second UV
+  set, `KHR_texture_transform`). Errors: Draco, glTF 1.0, truncation, buffers outside the
+  model's folder, and accessors that overrun their views.
 
 ## `expect.json`
 

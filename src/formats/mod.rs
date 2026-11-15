@@ -1,5 +1,6 @@
 //! Model formats read natively: STL (binary and ASCII), PLY (ASCII and binary), MagicaVoxel
-//! `.vox`, OBJ (with its MTL materials and textures), FBX (binary and ASCII), 3DS, 3MF and USD.
+//! `.vox`, OBJ (with its MTL materials and textures), FBX (binary and ASCII), 3DS, 3MF, USD and
+//! glTF (`.gltf` and `.glb`).
 //! Each becomes a [`Mesh`]; textures are embedded so the mesh stands on its own. Each format is
 //! behind a cargo feature of its name (`3ds` and `3mf` for those two).
 
@@ -15,6 +16,8 @@ use crate::mesh::Mesh;
 mod fbx;
 #[cfg(feature = "fbx")]
 pub mod fbx_ascii;
+#[cfg(feature = "gltf")]
+mod gltf;
 #[cfg(feature = "obj")]
 mod obj;
 #[cfg(feature = "ply")]
@@ -34,7 +37,7 @@ mod vox;
 
 /// The extensions [`load`] handles, whether or not this build has their feature.
 pub const EXTENSIONS: &[&str] = &[
-    "stl", "ply", "vox", "obj", "fbx", "3ds", "3mf", "usd", "usda", "usdc", "usdz",
+    "stl", "ply", "vox", "obj", "fbx", "3ds", "3mf", "usd", "usda", "usdc", "usdz", "gltf", "glb",
 ];
 
 /// A model read from a file.
@@ -91,8 +94,24 @@ pub fn load(path: &Path, ext: &str, assets: &dyn Assets) -> Result<Loaded> {
             guess_color_texture(&mut mesh, path, assets);
             Ok(counted(mesh))
         }
-        e if EXTENSIONS.contains(&e) => bail!("built without the `{e}` feature"),
+        #[cfg(feature = "gltf")]
+        "gltf" | "glb" => gltf::load(path, assets).map(|(mesh, mut facts)| {
+            if let Some(m) = &mesh {
+                facts.insert("triangles".into(), json!(m.triangles()));
+            }
+            Loaded { mesh, facts }
+        }),
+        e if EXTENSIONS.contains(&e) => bail!("built without the `{}` feature", feature_for(e)),
         _ => bail!("not a model format handled here: .{ext}"),
+    }
+}
+
+/// The cargo feature that reads extension `ext`.
+fn feature_for(ext: &str) -> &str {
+    match ext {
+        "usda" | "usdc" | "usdz" => "usd",
+        "glb" => "gltf",
+        e => e,
     }
 }
 
@@ -209,7 +228,9 @@ vt 0 1
         };
         assert!(err("dae").contains("not a model format"));
         #[cfg(not(feature = "usd"))]
-        assert!(err("usdz").contains("without the `usdz` feature"));
+        assert!(err("usdz").contains("without the `usd` feature"));
+        #[cfg(not(feature = "gltf"))]
+        assert!(err("glb").contains("without the `gltf` feature"));
     }
 
     #[test]

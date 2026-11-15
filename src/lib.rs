@@ -1,6 +1,6 @@
 //! Pure-Rust 3D asset interchange, with glTF as the hub.
 //!
-//! - [`formats`]: readers for STL, PLY, MagicaVoxel, OBJ, FBX, 3DS, 3MF and USD, each behind a
+//! - [`formats`]: readers for STL, PLY, MagicaVoxel, OBJ, FBX, 3DS, 3MF, USD and glTF, each behind a
 //!   cargo feature, producing a [`Mesh`](mesh::Mesh).
 //! - [`mesh`]: that triangle-list model, written out as a GLB.
 //! - [`assets`]: how readers find the textures and material libraries a model refers to.

@@ -204,6 +204,25 @@ fn write_ply(t: &Torus, path: &Path, binary: bool) -> std::io::Result<()> {
     f.flush()
 }
 
+/// The torus as Mithril writes a GLB: positions, normals, UVs and u32 indices.
+fn write_glb(t: &Torus, path: &Path) -> std::io::Result<()> {
+    let mut prim = mithril::mesh::Prim::default();
+    for (p, n, uv) in t.vertices() {
+        prim.positions.push(p);
+        prim.normals.push(n);
+        prim.uvs.push(uv);
+    }
+    for [a, b, c, d] in t.quads() {
+        prim.indices.extend([a, b, c, a, c, d].map(|i| i as u32));
+    }
+    let mesh = mithril::mesh::Mesh {
+        prims: vec![prim],
+        materials: vec![mithril::mesh::Material::plain("Torus", [0.8, 0.8, 0.8, 1.0])],
+        images: Vec::new(),
+    };
+    std::fs::write(path, mithril::mesh::to_glb(&mesh).map_err(std::io::Error::other)?)
+}
+
 struct Input {
     name: String,
     path: PathBuf,
@@ -223,12 +242,13 @@ fn inputs(dir: &Path, sizes: &[String]) -> Vec<Input> {
             other => panic!("unknown size {other:?}: small, medium or large"),
         };
         type Writer = fn(&Torus, &Path) -> std::io::Result<()>;
-        let kinds: [(&str, &str, Writer); 5] = [
+        let kinds: [(&str, &str, Writer); 6] = [
             ("obj", "obj", write_obj),
             ("stl binary", "stl", write_stl_binary),
             ("stl ascii", "stl", write_stl_ascii),
             ("ply binary", "ply", |t, p| write_ply(t, p, true)),
             ("ply ascii", "ply", |t, p| write_ply(t, p, false)),
+            ("glb", "glb", write_glb),
         ];
         for (kind, ext, write) in kinds {
             let path = dir.join(format!("{size}_{}.{ext}", kind.replace(' ', "_")));
@@ -350,11 +370,40 @@ mod ply {
     }
 }
 
+/// The `gltf` crate as its documentation uses it: `import` (the document and its buffers), then each
+/// primitive's attributes and indices read into vectors, the arrays a renderer uploads.
+fn gltf_import(input: &Input) -> (Box<dyn std::any::Any>, usize) {
+    // Held, not read: the arrays a renderer would upload, kept alive to be measured.
+    #[allow(dead_code)]
+    struct Prim {
+        positions: Vec<[f32; 3]>,
+        normals: Vec<[f32; 3]>,
+        uvs: Vec<[f32; 2]>,
+        indices: Vec<u32>,
+    }
+    let (doc, buffers, images) = gltf::import(&input.path).unwrap();
+    let mut prims = Vec::new();
+    for mesh in doc.meshes() {
+        for p in mesh.primitives() {
+            let r = p.reader(|b| Some(&buffers[b.index()]));
+            prims.push(Prim {
+                positions: r.read_positions().map(Iterator::collect).unwrap_or_default(),
+                normals: r.read_normals().map(Iterator::collect).unwrap_or_default(),
+                uvs: r.read_tex_coords(0).map(|t| t.into_f32().collect()).unwrap_or_default(),
+                indices: r.read_indices().map(|i| i.into_u32().collect()).unwrap_or_default(),
+            });
+        }
+    }
+    let n = prims.iter().map(|p| p.indices.len() / 3).sum();
+    (Box::new((doc, buffers, images, prims)), n)
+}
+
 fn competitors(ext: &str) -> Vec<(&'static str, Load)> {
     let mut out: Vec<(&'static str, Load)> = vec![("mithril", mithril)];
     match ext {
         "obj" => out.push(("tobj", tobj)),
         "stl" => out.push(("stl_io", stl_io)),
+        "glb" => out.push(("gltf", gltf_import)),
         "ply" => {
             out.push(("ply-rs (typed)", ply::typed));
             out.push(("ply-rs (generic)", ply::generic));
@@ -490,8 +539,7 @@ fn main() {
     }
     writeln!(
         md,
-        "**Mithril is fastest on {fastest} of {n} inputs and leanest on {leanest} of {n}.**\n\n\
-         glTF: Mithril has no reader that loads a GLB into a mesh yet, so the `gltf` crate has nothing to race.",
+        "**Mithril is fastest on {fastest} of {n} inputs and leanest on {leanest} of {n}.**",
         n = inputs.len()
     )
     .unwrap();

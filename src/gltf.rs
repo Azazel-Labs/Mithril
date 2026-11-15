@@ -847,7 +847,7 @@ pub(crate) fn write_glb(json: &Value, bin: Option<&[u8]>) -> Result<Vec<u8>> {
 }
 
 /// A data URI's MIME type and bytes.
-fn data_uri(uri: &str) -> Result<(Option<String>, Vec<u8>)> {
+pub(crate) fn data_uri(uri: &str) -> Result<(Option<String>, Vec<u8>)> {
     let rest = uri.strip_prefix("data:").context("not a data URI")?;
     let (head, payload) = rest.split_once(',').context("data URI has no ','")?;
     let (mime, base64) = match head.strip_suffix(";base64") {
@@ -914,7 +914,7 @@ fn percent_decode_bytes(s: &str) -> Vec<u8> {
     out
 }
 
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     match percent_decode_bytes(s) {
         b if b == s.as_bytes() => s.to_owned(),
         b => String::from_utf8_lossy(&b).into_owned(),

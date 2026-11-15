@@ -27,12 +27,13 @@ fn enabled(ext: &str) -> bool {
         "fbx" => cfg!(feature = "fbx"),
         "3mf" => cfg!(feature = "3mf"),
         "usd" | "usda" | "usdc" | "usdz" => cfg!(feature = "usd"),
+        "gltf" | "glb" => cfg!(feature = "gltf"),
         _ => false,
     }
 }
 
 /// Every model extension a full build reads, so cases are found in builds without some readers.
-const ALL_EXTENSIONS: &[&str] = &["stl", "ply", "vox", "obj", "3ds", "fbx", "3mf", "usd", "usda", "usdc", "usdz"];
+const ALL_EXTENSIONS: &[&str] = &["stl", "ply", "vox", "obj", "3ds", "fbx", "3mf", "usd", "usda", "usdc", "usdz", "gltf", "glb"];
 
 fn ext_of(p: &Path) -> String {
     p.extension()
@@ -394,6 +395,11 @@ fn fbx() {
 #[test]
 fn usd() {
     check("usd");
+}
+
+#[test]
+fn gltf() {
+    check("gltf");
 }
 
 /// Every extension `formats::load` takes has cases, and every format a corpus folder.
