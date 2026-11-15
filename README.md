@@ -69,4 +69,4 @@ Blender.
 
 ## License
 
-MIT-0. See [LICENSE-MIT0](LICENSE-MIT0).
+MIT-0. See [LICENSE](LICENSE).
