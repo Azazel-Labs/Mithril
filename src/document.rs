@@ -665,6 +665,7 @@ impl Builder {
                 json!({ "bufferView": v, "mimeType": mime })
             })
             .collect();
+        let mut bright = false;
         let materials: Vec<Value> = materials
             .iter()
             .map(|m| {
@@ -685,7 +686,14 @@ impl Builder {
                     mat["alphaMode"] = json!("BLEND");
                 }
                 if m.emissive.iter().any(|&e| e > 0.0) {
-                    mat["emissiveFactor"] = json!(m.emissive.map(|e| e.clamp(0.0, 1.0)));
+                    // Brighter than one: the factor scaled down, and the strength that scales it back.
+                    let strength = m.emissive.iter().copied().fold(1.0, f32::max);
+                    mat["emissiveFactor"] = json!(m.emissive.map(|e| (e / strength).clamp(0.0, 1.0)));
+                    if strength > 1.0 && strength.is_finite() {
+                        mat["extensions"] =
+                            json!({ "KHR_materials_emissive_strength": { "emissiveStrength": strength } });
+                        bright = true;
+                    }
                 }
                 if m.double_sided {
                     mat["doubleSided"] = json!(true);
@@ -695,6 +703,12 @@ impl Builder {
             .collect();
         if !materials.is_empty() {
             json.insert("materials".into(), json!(materials));
+        }
+        if bright {
+            let used = json.entry("extensionsUsed").or_insert_with(|| json!([]));
+            if let Some(list) = used.as_array_mut() {
+                list.push(json!("KHR_materials_emissive_strength"));
+            }
         }
         if !images.is_empty() {
             json.insert(

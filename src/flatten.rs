@@ -13,11 +13,13 @@
 //! - `POSITION`, `NORMAL`, the color texture's `TEXCOORD_n` (its `KHR_texture_transform`
 //!   baked in) and `COLOR_0`, in any component type `KHR_mesh_quantization` allows, sparse
 //!   accessors included. Without `NORMAL` a primitive keeps no normals: glTF shades it flat.
-//! - Materials: base color, metallic and roughness factors, emissive, double-sidedness, and
+//! - Materials: base color, metallic and roughness factors, emissive (with
+//!   `KHR_materials_emissive_strength`), double-sidedness, and
 //!   the color and normal textures (`KHR_materials_pbrSpecularGlossiness` as its diffuse), when
 //!   their images are PNG or JPEG.
 //! - Meshopt-compressed views are decoded as they are read; Draco
 //!   (`KHR_draco_mesh_compression`) needs the `draco` feature.
+//! - A required extension it can't honour is an error, unless it only changes how surfaces look.
 //!
 //! Accessors are read from a buffer in place when it's in memory, and a block at a time from a
 //! file, so the peak is little more than the mesh.
@@ -290,6 +292,27 @@ fn floats<const N: usize>(v: Option<&Value>, default: [f64; N]) -> [f64; N] {
     out
 }
 
+/// Required extensions a flat view draws: the geometry ones it decodes, and any that only change how surfaces
+/// look (materials, textures, lights), which it shows as best it can.
+fn drawable(extension: &str) -> bool {
+    const DECODED: &[&str] = &[
+        "KHR_draco_mesh_compression",
+        "EXT_meshopt_compression",
+        "KHR_meshopt_compression",
+        "KHR_mesh_quantization",
+        "EXT_mesh_gpu_instancing",
+        "KHR_animation_pointer",
+    ];
+    const LOOKS: &[&str] = &[
+        "KHR_materials_",
+        "KHR_texture_",
+        "EXT_texture_",
+        "KHR_lights_",
+        "KHR_xmp",
+    ];
+    DECODED.contains(&extension) || LOOKS.iter().any(|p| extension.starts_with(p))
+}
+
 fn f32s<const N: usize>(v: Option<&Value>, default: [f32; N]) -> [f32; N] {
     floats(v, default.map(f64::from)).map(f32_of)
 }
@@ -305,6 +328,13 @@ impl<'d> Reader<'d> {
                 .any(|e| e.as_str() == Some("KHR_draco_mesh_compression")),
             "glTF uses Draco compression, which needs Polysmelt's `draco` feature"
         );
+        if let Some(e) = list(json, "extensionsRequired")
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|e| !drawable(e))
+        {
+            bail!("glTF requires the `{e}` extension, which polysmelt can't draw");
+        }
         let n = |key| list(json, key).len();
         Ok(Self {
             doc,
@@ -1296,7 +1326,11 @@ impl Reader<'_> {
                     m.roughness = f32_of(pbr.get("roughnessFactor").and_then(Value::as_f64).unwrap_or(1.0));
                 }
             }
-            m.emissive = f32s(d.get("emissiveFactor"), [0.0; 3]);
+            let strength = d
+                .pointer("/extensions/KHR_materials_emissive_strength/emissiveStrength")
+                .and_then(Value::as_f64)
+                .map_or(1.0, f32_of);
+            m.emissive = f32s(d.get("emissiveFactor"), [0.0; 3]).map(|e| e * strength);
             m.double_sided = d.get("doubleSided").and_then(Value::as_bool).unwrap_or(false);
             if d.get("alphaMode").and_then(Value::as_str).unwrap_or("OPAQUE") == "OPAQUE" {
                 m.color[3] = 1.0;
@@ -1735,5 +1769,41 @@ mod tests {
             &mesh,
             &load(dir.path(), "packed.gltf", &serde_json::to_vec(&json).unwrap()),
         );
+    }
+
+    #[test]
+    fn emissive_brighter_than_one_round_trips_as_emissive_strength() {
+        let mut mesh = grid(2);
+        mesh.materials[0].emissive = [4.0, 2.0, 0.0];
+        let doc = crate::document::Document::from_mesh(mesh, serde_json::Map::new());
+        let m = &doc.json["materials"][0];
+        assert_eq!(m["emissiveFactor"], serde_json::json!([1.0, 0.5, 0.0]));
+        assert_eq!(
+            m["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"],
+            4.0
+        );
+        assert_eq!(
+            doc.json["extensionsUsed"],
+            serde_json::json!(["KHR_materials_emissive_strength"])
+        );
+        let back = doc.flatten(Pose::Rest).unwrap().unwrap();
+        assert_eq!(back.materials[0].emissive, [4.0, 2.0, 0.0]);
+    }
+
+    #[test]
+    fn a_required_extension_it_cant_draw_is_an_error() {
+        let mut doc = crate::document::Document::from_mesh(grid(2), serde_json::Map::new());
+        doc.json
+            .insert("extensionsRequired".into(), serde_json::json!(["KHR_materials_unlit"]));
+        assert!(
+            doc.flatten(Pose::Rest).unwrap().is_some(),
+            "a look is drawn as best it can be"
+        );
+        doc.json.insert(
+            "extensionsRequired".into(),
+            serde_json::json!(["EXT_some_future_geometry"]),
+        );
+        let err = doc.flatten(Pose::Rest).unwrap_err().to_string();
+        assert!(err.contains("EXT_some_future_geometry"), "{err}");
     }
 }
