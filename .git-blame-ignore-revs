@@ -1,0 +1,3 @@
+# Formatting-only commits, for `git blame --ignore-revs-file` (GitHub reads this file itself).
+# Format with rustfmt at 120 columns
+4f027278de1e472caa230be4f7bb2f8956493a88
