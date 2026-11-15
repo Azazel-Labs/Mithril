@@ -3,6 +3,10 @@ name: Benchmarks
 # Load speed and peak memory of Mithril's readers against tobj, stl_io and ply-rs, on a fresh
 # GitHub-hosted runner. Run it from the Actions tab or `gh workflow run bench.yml`. The tables
 # land in the run summary and the raw numbers in the bench-results artifact.
+#
+# Runs get different hardware, so compare times only within one run. To check a change against
+# an older commit, pass it as `baseline` (`gh workflow run bench.yml -f baseline=<sha>`): both
+# commits then take turns in one process on one runner.
 
 on:
   workflow_dispatch:
@@ -13,6 +17,9 @@ on:
       budget:
         description: "Seconds of timed rounds per input"
         default: "3"
+      baseline:
+        description: "Optional commit or branch to bench alongside, on the same runner (a regression check)"
+        default: ""
 
 permissions:
   contents: read
@@ -28,8 +35,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: bench
+      - name: Baseline
+        if: inputs.baseline != ''
+        run: |
+          git fetch --no-tags origin "${{ inputs.baseline }}"
+          git worktree add baseline FETCH_HEAD
+          # A different version, so Cargo can hold both copies of the crate in one build.
+          sed -i 's/^version = .*/version = "0.0.0-base"/' baseline/Cargo.toml
+          sed -i 's/^baseline = \[\]/baseline = ["dep:mithril_base"]/' bench/Cargo.toml
+          sed -i '/^mithril = /a mithril_base = { package = "mithril", path = "../baseline", default-features = false, features = ["minimal"], optional = true }' bench/Cargo.toml
+          echo "FEATURES=--features baseline" >> "$GITHUB_ENV"
+          echo "Baseline: \`$(git -C baseline rev-parse --short HEAD)\` (\`${{ inputs.baseline }}\`), as \"mithril @ base\"" >> "$GITHUB_STEP_SUMMARY"
       - name: Build
-        run: cargo build --release --manifest-path bench/Cargo.toml
+        run: cargo build --release --manifest-path bench/Cargo.toml $FEATURES
       - name: Machine
         run: |
           {

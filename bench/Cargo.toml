@@ -8,6 +8,11 @@ description = "Load speed and peak memory of Mithril's readers against the leadi
 # Its own workspace, so the competitors never enter Mithril's dependency graph or lockfile.
 [workspace]
 
+[features]
+# Bench another commit's Mithril alongside this one. The workflow checks it out and adds the
+# `mithril_base` dependency; see bench.yml.
+baseline = []
+
 [dependencies]
 mithril = { path = "..", default-features = false, features = ["minimal"] }
 serde_json = "1"

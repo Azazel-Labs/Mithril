@@ -12,6 +12,10 @@
 //! ```text
 //! cargo run --release -- [--sizes small,medium,large] [--budget 3] [--json out.json] [--markdown out.md]
 //! ```
+//!
+//! With the `baseline` feature, another commit's Mithril (the `mithril_base` dependency, which
+//! the bench workflow adds) takes turns with the rest, so a regression check runs both commits
+//! on one machine. Times from separate runs aren't comparable: each may get different hardware.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fmt::Write as _;
@@ -297,6 +301,19 @@ fn mithril(input: &Input) -> (Box<dyn std::any::Any>, usize) {
     (Box::new(mesh), n)
 }
 
+/// The name the baseline commit's Mithril goes by in the tables.
+const BASELINE: &str = "mithril @ base";
+
+#[cfg(feature = "baseline")]
+fn mithril_base(input: &Input) -> (Box<dyn std::any::Any>, usize) {
+    let dir = input.path.parent().unwrap();
+    let loaded =
+        mithril_base::formats::load(&input.path, input.ext, &mithril_base::assets::Folder::new(dir)).unwrap();
+    let mesh = loaded.mesh.unwrap();
+    let n = mesh.triangles();
+    (Box::new(mesh), n)
+}
+
 fn tobj(input: &Input) -> (Box<dyn std::any::Any>, usize) {
     // GPU_LOAD_OPTIONS: triangulated, one index per vertex. The form a renderer or a GLB needs, like Mithril's.
     let (models, _) = tobj::load_obj(&input.path, &tobj::GPU_LOAD_OPTIONS).unwrap();
@@ -423,6 +440,8 @@ fn gltf_import(input: &Input) -> (Box<dyn std::any::Any>, usize) {
 
 fn competitors(ext: &str) -> Vec<(&'static str, Load)> {
     let mut out: Vec<(&'static str, Load)> = vec![("mithril", mithril)];
+    #[cfg(feature = "baseline")]
+    out.push((BASELINE, mithril_base));
     match ext {
         "obj" => out.push(("tobj", tobj)),
         "stl" => out.push(("stl_io", stl_io)),
@@ -543,10 +562,11 @@ fn main() {
         );
         let rows = run(input, budget);
         let me = &rows[0];
-        if rows[1..].iter().all(|r| me.median <= r.median) {
+        let others = || rows[1..].iter().filter(|r| r.loader != BASELINE);
+        if others().all(|r| me.median <= r.median) {
             fastest += 1;
         }
-        if rows[1..].iter().all(|r| me.peak <= r.peak) {
+        if others().all(|r| me.peak <= r.peak) {
             leanest += 1;
         }
         writeln!(
