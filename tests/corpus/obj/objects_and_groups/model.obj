@@ -1,0 +1,16 @@
+# Two objects, the second in two groups
+# made by hand
+v 0 0 0
+v 1 0 0
+v 1 1 0
+v 0 1 0
+o left
+f 1 2 3
+o right
+g top
+f 1 3 4
+g bottom
+f 1 2 4
+o left
+g
+f 2 3 4

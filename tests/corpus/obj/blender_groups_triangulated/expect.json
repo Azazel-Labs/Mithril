@@ -27,5 +27,16 @@
       ],
       "roughness": 0.6
     }
-  ]
+  ],
+  "document": {
+    "nodes": 2,
+    "node_names": [
+      "Cube_Shared",
+      "Sphere_Shared"
+    ],
+    "source": {
+      "format": "OBJ",
+      "linearColors": true
+    }
+  }
 }

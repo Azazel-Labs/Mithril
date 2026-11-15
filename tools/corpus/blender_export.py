@@ -347,7 +347,9 @@ def obj_cases():
     obj_export("groups_triangulated", export_triangulated_mesh=True, export_smooth_groups=True,
                export_object_groups=True, export_material_groups=True)
     write_case("obj", "groups_triangulated", OBJ_SPEC + ": o/g/s statements, triangulated, two transformed objects",
-               OBJ_OP, {**stats(), "material_count": 1, "materials": [mat_expect(m)]})
+               OBJ_OP, {**stats(), "material_count": 1, "materials": [mat_expect(m)],
+                        "document": {"nodes": 2, "node_names": ["Cube_Shared", "Sphere_Shared"],
+                                     "source": {"format": "OBJ", "linearColors": True}}})
 
     print("blender obj cases written")
 

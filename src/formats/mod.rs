@@ -259,12 +259,7 @@ fn convert<'a>(input: Input<'a>, ext: &str, assets: &'a dyn Assets, keep: Keep) 
         #[cfg(feature = "usd")]
         "usd" | "usda" | "usdc" | "usdz" => usd::load(input, assets, keep),
         #[cfg(feature = "obj")]
-        "obj" => Ok(counted(colors_and_textures(
-            obj::obj(input, assets)?,
-            input,
-            ext,
-            assets,
-        ))),
+        "obj" => obj::obj(input, assets),
         #[cfg(feature = "fbx")]
         "fbx" => fbx::load(input, assets, keep),
         #[cfg(feature = "gltf")]
@@ -283,20 +278,6 @@ fn feature_for(ext: &str) -> &str {
     }
 }
 
-/// OBJ and FBX: colors to linear unless the file wrote them so, and a guessed color texture.
-#[cfg(feature = "obj")]
-fn colors_and_textures(mut mesh: Mesh, input: Input<'_>, ext: &str, assets: &dyn Assets) -> Mesh {
-    if !linear_colors(input, ext) {
-        for m in &mut mesh.materials {
-            for c in m.color[..3].iter_mut().chain(&mut m.emissive) {
-                *c = crate::mesh::srgb_to_linear(*c);
-            }
-        }
-    }
-    guess_color_texture(&mut mesh, input.path, assets);
-    mesh
-}
-
 #[cfg(feature = "obj")]
 /// Whether the file's material colors are linear values (Blender's OBJ and FBX exporters write them so) rather
 /// than the sRGB other tools write.
@@ -312,24 +293,37 @@ fn linear_colors(input: Input<'_>, ext: &str) -> bool {
     }
 }
 
+#[cfg(feature = "3ds")]
+/// [`guess_texture`] for a mesh.
+fn guess_color_texture(mesh: &mut Mesh, path: &Path, assets: &dyn Assets) {
+    let textured: Vec<bool> = (0..mesh.materials.len())
+        .map(|n| mesh.prims.iter().any(|p| p.material == n && !p.uvs.is_empty()))
+        .collect();
+    guess_texture(&mut mesh.materials, &mut mesh.images, &textured, path, assets);
+}
+
 #[cfg(any(feature = "obj", feature = "3ds"))]
 /// A model that names no color texture takes one by name: `Barrel.png` or
-/// `Barrel_Albedo.png` for `Barrel.obj`, from anywhere in the pack. Its color then shows as painted.
-fn guess_color_texture(mesh: &mut Mesh, path: &Path, assets: &dyn Assets) {
-    let has_uvs = mesh.prims.iter().any(|p| !p.uvs.is_empty());
-    if !has_uvs || mesh.materials.iter().any(|m| m.color_image.is_some()) {
+/// `Barrel_Albedo.png` for `Barrel.obj`, from anywhere in the pack, for the `materials` that
+/// `textured` says draw triangles with texture coordinates. Their color then shows as painted.
+fn guess_texture(
+    materials: &mut [crate::mesh::Material],
+    images: &mut Vec<crate::mesh::Image>,
+    textured: &[bool],
+    path: &Path,
+    assets: &dyn Assets,
+) {
+    if !textured.contains(&true) || materials.iter().any(|m| m.color_image.is_some()) {
         return;
     }
     let Some(img) = assets.color_texture_for(path).and_then(|p| assets.load_image(&p)) else {
         return;
     };
-    mesh.images.push(img);
-    let i = mesh.images.len() - 1;
-    for (n, m) in mesh.materials.iter_mut().enumerate() {
-        if mesh.prims.iter().any(|p| p.material == n && !p.uvs.is_empty()) {
-            m.color_image = Some(i);
-            m.color[..3].copy_from_slice(&[1.0, 1.0, 1.0]);
-        }
+    images.push(img);
+    let i = images.len() - 1;
+    for (m, _) in materials.iter_mut().zip(textured).filter(|(_, t)| **t) {
+        m.color_image = Some(i);
+        m.color[..3].copy_from_slice(&[1.0, 1.0, 1.0]);
     }
 }
 

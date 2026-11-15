@@ -159,8 +159,22 @@ case(FMT, "syntax_ignored_statements", {
                   "vp 0.5 0.5\ncstype bezier\ndeg 3\nl 1 2\np 3\ns off\nf 1 2 3\nlod 1\n"
                   "shadow_obj shadow.obj\ntrace_obj trace.obj\nf 1 3 4\n"),
 }, {
-    "spec": OBJ_SPEC + ": grouping, smoothing, display and free-form statements are skipped",
+    "spec": OBJ_SPEC + ": smoothing, display and free-form statements are skipped (and counted)",
     "source": SRC, "triangles": 2, "area": 1.0,
+    "document": {"nodes": 1, "node_names": ["group1 group2"],
+                 "source": {"skipped": {"mg": 1, "vp": 1, "cstype": 1, "deg": 1, "lod": 1, "shadow_obj": 1,
+                                        "trace_obj": 1}}},
+})
+
+case(FMT, "objects_and_groups", {
+    "model.obj": ("# Two objects, the second in two groups\n# made by hand\n"
+                  "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\n"
+                  "o left\nf 1 2 3\no right\ng top\nf 1 3 4\ng bottom\nf 1 2 4\no left\ng\nf 2 3 4\n"),
+}, {
+    "spec": OBJ_SPEC + ": objects (o) and groups (g) as nodes, each drawing its faces; a name used again goes on",
+    "source": SRC, "triangles": 4,
+    "document": {"nodes": 3, "meshes": 3, "node_names": ["left", "top", "bottom"],
+                 "source": {"comments": ["Two objects, the second in two groups", "made by hand"]}},
 })
 
 case(FMT, "syntax_non_utf8", {
@@ -188,8 +202,8 @@ case(FMT, "syntax_out_of_range_reference", {
 })
 
 case(FMT, "only_points_and_lines", {"model.obj": "v 0 0 0\nv 1 0 0\nv 1 1 0\nl 1 2 3\np 1\n"}, {
-    "spec": OBJ_SPEC + ": points and lines only, nothing to draw as triangles",
-    "source": SRC, "error": "no faces",
+    "spec": OBJ_SPEC + ": points and lines only: no triangles, but a mesh of a point and a polyline",
+    "source": SRC, "no_mesh": True, "facts": {"points": 1, "lines": 2}, "document": {"meshes": 1},
 })
 
 case(FMT, "empty", {"model.obj": ""}, {
