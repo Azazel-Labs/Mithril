@@ -1,17 +1,20 @@
 //! OBJ, with its MTL materials and textures.
 //!
-//! Read as bytes: statements may continue over lines ending in a backslash, and text that isn't
+//! Read as bytes, a block at a time: statements may continue over lines ending in a backslash, and text that isn't
 //! UTF-8 (names from older tools) is read as Latin-1. Polygons are triangulated in their plane,
 //! so concave faces stay inside their outline. Beyond the original format, vertex colors
 //! (`v x y z r g b`) and the MTL PBR keys (`Pr`, `Pm`, `Ke`, `norm`) are read.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::Path;
+
+use super::stream::{self, Blocks};
 
 use crate::Result;
 use crate::assets::Assets;
 use crate::mesh::{
-    FastMap, MAX_TRIANGLES, Material, Mesh, Prim, smooth_normals, srgb_to_linear, triangulate,
+    MAX_TRIANGLES, Material, Mesh, Prim, smooth_normals, srgb_to_linear, triangulate,
 };
 
 /// Marks a corner without a texture coordinate or normal.
@@ -79,20 +82,30 @@ fn split_key(line: &[u8]) -> (&[u8], &[u8]) {
     (&line[..end], trim(&line[end..]))
 }
 
-fn words(b: &[u8]) -> impl Iterator<Item = &[u8]> {
-    b.split(u8::is_ascii_whitespace).filter(|w| !w.is_empty())
-}
-
 fn num(w: &[u8]) -> Option<f32> {
-    std::str::from_utf8(w).ok()?.parse().ok()
+    stream::f32_from(w)
 }
 
 /// Up to `N` leading numbers of `rest`, stopping at a comment; and how many there were.
+#[inline]
 fn nums<const N: usize>(rest: &[u8]) -> ([f32; N], usize) {
     let mut out = [0.0; N];
     let mut n = 0;
-    for w in words(rest) {
-        if n == N || w[0] == b'#' {
+    let mut i = 0;
+    let len = rest.len();
+    while n < N {
+        while i < len && stream::space(rest[i]) {
+            i += 1;
+        }
+        if i == len {
+            break;
+        }
+        let start = i;
+        while i < len && !stream::space(rest[i]) {
+            i += 1;
+        }
+        let w = &rest[start..i];
+        if w[0] == b'#' {
             break;
         }
         match num(w) {
@@ -165,11 +178,7 @@ fn read_mtl(data: &[u8], out: &mut HashMap<String, MtlEntry>) {
 
 /// The material libraries `mtllib` names: the whole rest of the line as one file (names may
 /// contain spaces), or failing that each word as a file.
-fn read_libraries(
-    libs: &[String],
-    dir: &Path,
-    assets: &dyn Assets,
-) -> HashMap<String, MtlEntry> {
+fn read_libraries(libs: &[String], dir: &Path, assets: &dyn Assets) -> HashMap<String, MtlEntry> {
     let mut out = HashMap::new();
     for lib in libs {
         let found = match assets.find(lib, dir) {
@@ -188,148 +197,434 @@ fn read_libraries(
     out
 }
 
-/// OBJ, with MTL colors and textures (base color and normal map). Faces may mix corners with
-/// and without texture coordinates or normals.
-pub(crate) fn obj(path: &Path, assets: &dyn Assets) -> Result<Mesh> {
-    let data = std::fs::read(path)?;
-    let dir = path.parent().unwrap_or(Path::new(""));
-    let mut v: Vec<[f32; 3]> = Vec::new();
-    // Vertex colors, one per position once any position has one.
-    let mut colors: Vec<[f32; 3]> = Vec::new();
-    let mut vt: Vec<[f32; 2]> = Vec::new();
-    let mut vn: Vec<[f32; 3]> = Vec::new();
-    let mut libs: Vec<String> = Vec::new();
-    // Triangle corners by material name, in first-use order.
-    let mut groups: Vec<(String, Vec<Corner>)> = Vec::new();
-    let mut group_of: HashMap<String, usize> = HashMap::new();
-    let mut current: Option<usize> = None;
-    let mut face: Vec<Corner> = Vec::new();
-    let mut pts: Vec<[f32; 3]> = Vec::new();
-    let mut tris: Vec<[u32; 3]> = Vec::new();
-    let mut triangles = 0usize;
-    let resolve = |w: &[u8], len: usize| -> Option<u32> {
-        let n: i64 = std::str::from_utf8(w).ok()?.parse().ok()?;
-        let i = if n < 0 { len as i64 + n } else { n - 1 };
-        (0..len as i64).contains(&i).then_some(i as u32)
+/// Text up to and including the last line break that ends a statement (not one continued by a
+/// backslash).
+fn statements(d: &[u8]) -> Option<usize> {
+    let mut end = d.len();
+    loop {
+        let i = d[..end].iter().rposition(|&b| b == b'\n')?;
+        let line = &d[..i];
+        let kept = line
+            .iter()
+            .rposition(|&b| !matches!(b, b' ' | b'\t' | b'\r' | b'\x0c'));
+        if kept.is_none_or(|k| line[k] != b'\\') {
+            return Some(i + 1);
+        }
+        end = i;
+    }
+}
+
+/// An index as written: an optional sign and up to 18 digits.
+#[inline]
+fn int(w: &[u8]) -> Option<i64> {
+    let (neg, d) = match w.first()? {
+        b'-' => (true, &w[1..]),
+        b'+' => (false, &w[1..]),
+        _ => (false, w),
     };
-    for_each_line(&data, |line| {
-        let (key, rest) = split_key(line);
+    if d.is_empty() || d.len() > 18 {
+        return None;
+    }
+    let mut n: i64 = 0;
+    for &c in d {
+        let k = c.wrapping_sub(b'0');
+        if k > 9 {
+            return None;
+        }
+        n = n * 10 + i64::from(k);
+    }
+    Some(if neg { -n } else { n })
+}
+
+/// An OBJ index (1-based, or negative counting back from the last) into `len` items.
+#[inline]
+fn resolve(w: &[u8], len: usize) -> Option<u32> {
+    let n = int(w)?;
+    let i = if n < 0 { len as i64 + n } else { n - 1 };
+    (0..len as i64).contains(&i).then_some(i as u32)
+}
+
+/// One material's triangles, built as the faces are read.
+struct Group {
+    name: String,
+    prim: Prim,
+    /// Vertex colors as the file gives them, converted once the scale is known.
+    raw_colors: Vec<[f32; 3]>,
+    /// Whether every corner so far has a normal.
+    all_normals: bool,
+}
+
+/// The statements read so far.
+struct Reader {
+    v: Vec<[f32; 3]>,
+    /// Vertex colors, one per position once any position has one.
+    colors: Vec<[f32; 3]>,
+    vt: Vec<[f32; 2]>,
+    vn: Vec<[f32; 3]>,
+    /// Output vertices, found by position: the newest output vertex at each position, and for
+    /// each output vertex the next at the same position, its group, texture coordinate and
+    /// normal, and its index in its group.
+    first: Vec<u32>,
+    next: Vec<u32>,
+    key: Vec<[u32; 3]>,
+    local: Vec<u32>,
+    /// Positions some output vertex uses.
+    used: usize,
+    libs: Vec<String>,
+    /// By material name, in first-use order.
+    groups: Vec<Group>,
+    group_of: HashMap<String, usize>,
+    current: Option<usize>,
+    face: Vec<Corner>,
+    pts: Vec<[f32; 3]>,
+    tris: Vec<[u32; 3]>,
+    triangles: usize,
+    /// Faces read, and the file offset of the first, for sizing the arrays.
+    faces: usize,
+    face_from: usize,
+}
+
+impl Reader {
+    fn new() -> Self {
+        Reader {
+            v: Vec::new(),
+            colors: Vec::new(),
+            vt: Vec::new(),
+            vn: Vec::new(),
+            first: Vec::new(),
+            next: Vec::new(),
+            key: Vec::new(),
+            local: Vec::new(),
+            used: 0,
+            libs: Vec::new(),
+            groups: Vec::new(),
+            group_of: HashMap::new(),
+            current: None,
+            face: Vec::new(),
+            pts: Vec::new(),
+            tris: Vec::new(),
+            triangles: 0,
+            faces: 0,
+            face_from: 0,
+        }
+    }
+
+    /// One statement, which starts `at` bytes into a file of `size`.
+    #[inline]
+    fn line(&mut self, line: &[u8], at: usize, size: usize) {
+        let line = line.trim_ascii_start();
+        let end = line
+            .iter()
+            .position(|&b| stream::space(b))
+            .unwrap_or(line.len());
+        let (key, rest) = (&line[..end], &line[end..]);
         match key {
             b"v" => {
                 let (f, n) = nums::<7>(rest);
                 if n < 3 {
                     return;
                 }
-                v.push([f[0], f[1], f[2]]);
+                self.v.push([f[0], f[1], f[2]]);
+                self.first.push(NONE);
                 if n >= 6 {
-                    colors.resize(v.len() - 1, [1.0; 3]);
-                    colors.push([f[3], f[4], f[5]]);
-                } else if !colors.is_empty() {
-                    colors.push([1.0; 3]);
+                    self.colors.resize(self.v.len() - 1, [1.0; 3]);
+                    self.colors.push([f[3], f[4], f[5]]);
+                } else if !self.colors.is_empty() {
+                    self.colors.push([1.0; 3]);
                 }
             }
             b"vt" => {
                 let (f, n) = nums::<2>(rest);
                 if n > 0 {
-                    vt.push([f[0], f[1]]);
+                    self.vt.push([f[0], f[1]]);
                 }
             }
             b"vn" => {
                 let (f, n) = nums::<3>(rest);
                 if n == 3 {
-                    vn.push(f);
+                    let len = (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt();
+                    self.vn.push(if len > 0.0 {
+                        f.map(|c| c / len)
+                    } else {
+                        [0.0, 1.0, 0.0]
+                    });
                 }
             }
-            b"mtllib" => libs.push(text(rest)),
+            b"mtllib" => self.libs.push(text(trim(rest))),
             b"usemtl" => {
-                let name = text(rest);
-                let next = groups.len();
-                let g = *group_of.entry(name.clone()).or_insert(next);
-                if g == next {
-                    groups.push((name, Vec::new()));
-                }
-                current = Some(g);
+                let name = text(trim(rest));
+                let g = self.group(name);
+                self.current = Some(g);
             }
-            b"f" | b"fo" => {
-                face.clear();
-                for w in words(rest) {
-                    if w[0] == b'#' {
-                        break;
-                    }
-                    let mut parts = w.split(|&c| c == b'/');
-                    let p = parts.next().and_then(|p| resolve(p, v.len()));
-                    let mut opt = |len: usize| match parts.next() {
-                        None | Some(b"") => Some(NONE),
-                        Some(s) => resolve(s, len),
-                    };
-                    let (t, n) = (opt(vt.len()), opt(vn.len()));
-                    match (p, t, n) {
-                        (Some(p), Some(t), Some(n)) => face.push([p, t, n]),
-                        // A corner naming something that isn't there: drop the face.
-                        _ => return,
-                    }
-                }
-                if face.len() < 3 {
-                    return;
-                }
-                let g = *current.get_or_insert_with(|| {
-                    let next = groups.len();
-                    *group_of.entry(String::new()).or_insert_with(|| {
-                        groups.push((String::new(), Vec::new()));
-                        next
-                    })
-                });
-                let corners = &mut groups[g].1;
-                if face.len() == 3 {
-                    corners.extend_from_slice(&face);
-                    triangles += 1;
-                } else {
-                    pts.clear();
-                    pts.extend(face.iter().map(|c| v[c[0] as usize]));
-                    tris.clear();
-                    triangulate(&pts, &mut tris);
-                    corners.extend(tris.iter().flatten().map(|&k| face[k as usize]));
-                    triangles += tris.len();
-                }
-            }
+            b"f" | b"fo" => self.face(rest, at, size),
             _ => {}
         }
-    });
-    ensure!(triangles > 0, "OBJ has no faces");
-    ensure!(triangles <= MAX_TRIANGLES, "too many triangles to convert");
-
-    for n in &mut vn {
-        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-        *n = if len > 0.0 {
-            n.map(|c| c / len)
-        } else {
-            [0.0, 1.0, 0.0]
-        };
     }
+
+    fn group(&mut self, name: String) -> usize {
+        let next = self.groups.len();
+        *self.group_of.entry(name).or_insert_with_key(|name| {
+            self.groups.push(Group {
+                name: name.clone(),
+                prim: Prim::default(),
+                raw_colors: Vec::new(),
+                all_normals: true,
+            });
+            next
+        })
+    }
+
+    fn face(&mut self, rest: &[u8], at: usize, size: usize) {
+        let mut face = std::mem::take(&mut self.face);
+        face.clear();
+        let mut ok = true;
+        let mut i = 0;
+        let n = rest.len();
+        loop {
+            while i < n && stream::space(rest[i]) {
+                i += 1;
+            }
+            if i == n {
+                break;
+            }
+            let start = i;
+            while i < n && !stream::space(rest[i]) {
+                i += 1;
+            }
+            let w = &rest[start..i];
+            if w[0] == b'#' {
+                break;
+            }
+            let mut parts = w.split(|&c| c == b'/');
+            let p = parts.next().and_then(|p| resolve(p, self.v.len()));
+            let mut opt = |len: usize| match parts.next() {
+                None | Some(b"") => Some(NONE),
+                Some(s) => resolve(s, len),
+            };
+            let (t, nm) = (opt(self.vt.len()), opt(self.vn.len()));
+            match (p, t, nm) {
+                (Some(p), Some(t), Some(nm)) => face.push([p, t, nm]),
+                // A corner naming something that isn't there: drop the face.
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok && face.len() >= 3 {
+            let g = match self.current {
+                Some(g) => g,
+                None => {
+                    let g = self.group(String::new());
+                    self.current = Some(g);
+                    g
+                }
+            };
+            if face.len() == 3 {
+                for &c in &face {
+                    let id = self.vertex(g, c);
+                    self.groups[g].prim.indices.push(id);
+                }
+                self.triangles += 1;
+            } else {
+                let mut pts = std::mem::take(&mut self.pts);
+                let mut tris = std::mem::take(&mut self.tris);
+                pts.clear();
+                pts.extend(face.iter().map(|c| self.v[c[0] as usize]));
+                tris.clear();
+                triangulate(&pts, &mut tris);
+                for &k in tris.iter().flatten() {
+                    let id = self.vertex(g, face[k as usize]);
+                    self.groups[g].prim.indices.push(id);
+                }
+                self.triangles += tris.len();
+                self.pts = pts;
+                self.tris = tris;
+            }
+            self.faces += 1;
+            if self.faces == 1 {
+                self.face_from = at;
+            } else if self.faces == 4096 {
+                self.size(g, at, size);
+            }
+        }
+        self.face = face;
+    }
+
+    /// Reserves the arrays once the faces so far say how big they'll get: bytes per face, and
+    /// output vertices per position used.
+    fn size(&mut self, g: usize, at: usize, size: usize) {
+        let per_face = (at - self.face_from) as f64 / (self.faces - 1) as f64;
+        if per_face <= 0.0 {
+            return;
+        }
+        let more_faces = size.saturating_sub(at) as f64 / per_face;
+        let tris = (more_faces * self.triangles as f64 / self.faces as f64 * 1.02) as usize + 64;
+        let tris = tris.min(MAX_TRIANGLES);
+        let prim = &mut self.groups[g].prim;
+        prim.indices.reserve_exact(tris * 3);
+        if self.groups.len() > 1 {
+            return;
+        }
+        // One material so far: its vertices are about every position, times how many output
+        // vertices each position has needed (texture seams, hard edges).
+        let per_pos = self.key.len() as f64 / self.used.max(1) as f64;
+        let total = (self.v.len() as f64 * per_pos * 1.02) as usize + 64;
+        let more = total.saturating_sub(self.key.len());
+        let grp = &mut self.groups[0];
+        let prim = &mut grp.prim;
+        prim.positions.reserve_exact(more);
+        if !prim.uvs.is_empty() {
+            prim.uvs.reserve_exact(more);
+        }
+        if grp.all_normals && !prim.normals.is_empty() {
+            prim.normals.reserve_exact(more);
+        }
+        if !grp.raw_colors.is_empty() {
+            grp.raw_colors.reserve_exact(more);
+        }
+        self.next.reserve_exact(more);
+        self.key.reserve_exact(more);
+        self.local.reserve_exact(more);
+    }
+
+    /// The group's vertex for a corner, added if it's new.
+    #[inline]
+    fn vertex(&mut self, g: usize, c: Corner) -> u32 {
+        let [p, t, n] = c;
+        let want = [g as u32, t, n];
+        let mut id = self.first[p as usize];
+        while id != NONE {
+            if self.key[id as usize] == want {
+                return self.local[id as usize];
+            }
+            id = self.next[id as usize];
+        }
+        let head = self.first[p as usize];
+        if head == NONE {
+            self.used += 1;
+        }
+        self.first[p as usize] = self.key.len() as u32;
+        self.key.push(want);
+        self.next.push(head);
+        let grp = &mut self.groups[g];
+        let prim = &mut grp.prim;
+        let k = prim.positions.len();
+        self.local.push(k as u32);
+        prim.positions.push(self.v[p as usize]);
+        if t != NONE {
+            if prim.uvs.len() < k {
+                prim.uvs.resize(k, [0.0, 1.0]);
+            }
+            // OBJ puts the texture origin bottom-left; glTF top-left.
+            let q = self.vt[t as usize];
+            prim.uvs.push([q[0], 1.0 - q[1]]);
+        } else if !prim.uvs.is_empty() {
+            prim.uvs.push([0.0, 1.0]);
+        }
+        if grp.all_normals {
+            if n == NONE {
+                grp.all_normals = false;
+                prim.normals = Vec::new();
+            } else {
+                prim.normals.push(self.vn[n as usize]);
+            }
+        }
+        if !self.colors.is_empty() {
+            // Positions before the first colored one are white.
+            grp.raw_colors.resize(k, [1.0; 3]);
+            grp.raw_colors.push(self.colors[p as usize]);
+        }
+        k as u32
+    }
+}
+
+fn trim_to_len<T>(v: &mut Vec<T>) {
+    if v.capacity() > v.len() + v.len() / 16 + 16 {
+        v.shrink_to_fit();
+    }
+}
+
+/// OBJ, with MTL colors and textures (base color and normal map). Faces may mix corners with
+/// and without texture coordinates or normals. The file is read a block at a time, and each
+/// corner becomes a vertex of its material's primitive as it's read.
+pub(crate) fn obj(path: &Path, assets: &dyn Assets) -> Result<Mesh> {
+    let mut blocks = Blocks::new(File::open(path)?);
+    let size = blocks.size_hint();
+    let dir = path.parent().unwrap_or(Path::new(""));
+    let mut r = Reader::new();
+    // A statement continued over lines ending in a backslash.
+    let mut joined: Vec<u8> = Vec::new();
+    let mut read = 0;
+    while let Some(chunk) = blocks.text(statements)? {
+        let mut at = 0;
+        while at < chunk.len() {
+            let end = chunk[at..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(chunk.len(), |i| at + i);
+            let line = &chunk[at..end];
+            let start = read + at;
+            at = end + 1;
+            if let Some(head) = line.trim_ascii_end().strip_suffix(b"\\") {
+                joined.extend_from_slice(head);
+                joined.push(b' ');
+                continue;
+            }
+            if joined.is_empty() {
+                r.line(line, start, size);
+            } else {
+                joined.extend_from_slice(line);
+                r.line(&joined, start, size);
+                joined.clear();
+            }
+        }
+        read += chunk.len();
+        ensure!(
+            r.triangles <= MAX_TRIANGLES,
+            "too many triangles to convert"
+        );
+    }
+    if !joined.is_empty() {
+        r.line(&joined, read, size);
+    }
+    ensure!(r.triangles > 0, "OBJ has no faces");
+    ensure!(
+        r.triangles <= MAX_TRIANGLES,
+        "too many triangles to convert"
+    );
+
+    let (colors, libs, groups) = (
+        std::mem::take(&mut r.colors),
+        std::mem::take(&mut r.libs),
+        std::mem::take(&mut r.groups),
+    );
+    drop(r);
     // Vertex colors: 0-1 floats, or 0-255 from some tools; sRGB either way.
+    let has_colors = !colors.is_empty();
     let scale = if colors.iter().flatten().any(|&c| c > 1.0) {
         255.0
     } else {
         1.0
     };
-    let colors: Vec<[f32; 4]> = colors
-        .iter()
-        .map(|c| {
-            let [r, g, b] = c.map(|x| srgb_to_linear((x / scale).clamp(0.0, 1.0)));
-            [r, g, b, 1.0]
-        })
-        .collect();
+    drop(colors);
 
     let mtl = read_libraries(&libs, dir, assets);
     let mut mesh = Mesh::default();
     let mut image_of: HashMap<std::path::PathBuf, Option<usize>> = HashMap::new();
-    for (name, corners) in groups {
-        if corners.is_empty() {
+    for Group {
+        name,
+        mut prim,
+        raw_colors,
+        all_normals,
+    } in groups
+    {
+        if prim.indices.is_empty() {
             continue;
         }
         let entry = mtl.get(&name);
         // Without a material, vertex colors show as they are; otherwise the usual 0.8 gray.
-        let fallback = if colors.is_empty() { [0.8; 3] } else { [1.0; 3] };
+        let fallback = if has_colors { [1.0; 3] } else { [0.8; 3] };
         let d = entry.and_then(|e| e.color).unwrap_or(fallback);
         let mut mat = Material::plain(
             if name.is_empty() { "default" } else { &name },
@@ -339,14 +634,18 @@ pub(crate) fn obj(path: &Path, assets: &dyn Assets) -> Result<Mesh> {
             mat.emissive = e.emissive.unwrap_or([0.0; 3]);
             mat.metallic = e.metallic.unwrap_or(0.0);
             // Blender's reading of the specular exponent when there's no roughness.
-            if let Some(r) = e
-                .roughness
-                .or(e.shininess.map(|ns| 1.0 - (ns.clamp(0.0, 1000.0) / 1000.0).sqrt()))
+            if let Some(r) = e.roughness.or(e
+                .shininess
+                .map(|ns| 1.0 - (ns.clamp(0.0, 1000.0) / 1000.0).sqrt()))
             {
                 mat.roughness = r;
             }
         }
-        let has_uvs = corners.iter().any(|c| c[1] != NONE);
+        let nv = prim.positions.len();
+        let has_uvs = !prim.uvs.is_empty();
+        if has_uvs {
+            prim.uvs.resize(nv, [0.0, 1.0]);
+        }
         let mut texture = |reference: Option<&String>| -> Option<usize> {
             if !has_uvs {
                 return None;
@@ -361,34 +660,25 @@ pub(crate) fn obj(path: &Path, assets: &dyn Assets) -> Result<Mesh> {
         mat.color_image = texture(entry.and_then(|e| e.color_map.as_ref()));
         mat.normal_image = texture(entry.and_then(|e| e.normal_map.as_ref()));
         mesh.materials.push(mat);
+        prim.material = mesh.materials.len() - 1;
 
-        let has_normals = corners.iter().all(|c| c[2] != NONE);
-        let has_colors = !colors.is_empty();
-        let mut prim = Prim {
-            material: mesh.materials.len() - 1,
-            ..Prim::default()
-        };
-        let mut seen: FastMap<Corner, u32> = FastMap::default();
-        prim.indices.reserve(corners.len());
-        for c in corners {
-            let id = *seen.entry(c).or_insert_with(|| {
-                prim.positions.push(v[c[0] as usize]);
-                if has_normals {
-                    prim.normals.push(vn[c[2] as usize]);
-                }
-                if has_uvs {
-                    // OBJ puts the texture origin bottom-left; glTF top-left.
-                    let t = vt.get(c[1] as usize).copied().unwrap_or([0.0; 2]);
-                    prim.uvs.push([t[0], 1.0 - t[1]]);
-                }
-                if has_colors {
-                    prim.colors.push(colors[c[0] as usize]);
-                }
-                (prim.positions.len() - 1) as u32
-            });
-            prim.indices.push(id);
+        if has_colors {
+            let mut raw = raw_colors;
+            raw.resize(nv, [1.0; 3]);
+            prim.colors = raw
+                .iter()
+                .map(|c| {
+                    let [r, g, b] = c.map(|x| srgb_to_linear((x / scale).clamp(0.0, 1.0)));
+                    [r, g, b, 1.0]
+                })
+                .collect();
         }
-        if !has_normals {
+        trim_to_len(&mut prim.positions);
+        trim_to_len(&mut prim.uvs);
+        trim_to_len(&mut prim.indices);
+        if all_normals && prim.normals.len() == nv {
+            trim_to_len(&mut prim.normals);
+        } else {
             prim.normals = smooth_normals(&prim.positions, &prim.indices);
         }
         mesh.prims.push(prim);

@@ -21,6 +21,8 @@ mod obj;
 mod ply;
 #[cfg(feature = "stl")]
 mod stl;
+#[cfg(any(feature = "stl", feature = "ply", feature = "obj"))]
+mod stream;
 #[cfg(feature = "3ds")]
 mod tds;
 #[cfg(feature = "3mf")]
@@ -59,7 +61,7 @@ pub fn load(path: &Path, ext: &str, assets: &dyn Assets) -> Result<Loaded> {
     let _ = (&counted, path, assets);
     match ext {
         #[cfg(feature = "stl")]
-        "stl" => stl::stl(&std::fs::read(path)?).map(counted),
+        "stl" => stl::stl(path).map(counted),
         #[cfg(feature = "ply")]
         "ply" => ply::ply(path, assets).map(|(mesh, facts)| Loaded { mesh, facts }),
         #[cfg(feature = "vox")]

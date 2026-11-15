@@ -1,7 +1,5 @@
 //! A model as plain triangle lists: what the format readers produce, written out as a GLB.
 
-use std::collections::HashMap;
-
 use serde_json::{Value, json};
 
 use crate::Result;
@@ -13,6 +11,7 @@ pub const MAX_TRIANGLES: usize = 4_000_000;
 #[derive(Debug, Default, Clone)]
 pub struct Prim {
     pub positions: Vec<[f32; 3]>,
+    /// Unit vertex normals; empty for a faceted model (STL), which glTF clients shade flat.
     pub normals: Vec<[f32; 3]>,
     /// Texture coordinates, glTF convention (origin top-left); empty when the model has none.
     pub uvs: Vec<[f32; 2]>,
@@ -146,13 +145,6 @@ pub(crate) fn single(p: Prim) -> Mesh {
     }
 }
 
-/// A gray triangle soup.
-// Shared by the format readers; which ones use it depends on the enabled features.
-#[allow(dead_code)]
-pub(crate) fn gray_soup(tris: &[[[f32; 3]; 3]]) -> Mesh {
-    single(soup(tris))
-}
-
 pub(crate) fn face_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
     let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
     let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
@@ -169,50 +161,121 @@ pub(crate) fn face_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
     }
 }
 
-/// A triangle soup with flat normals.
+/// Builds a primitive from triangles given as corner positions, storing each distinct point
+/// once (by bit pattern; `-0.0` counts as `0.0`) and the triangles as indices into them. No
+/// normals: glTF clients shade a primitive without normals flat, which is what a triangle soup
+/// (STL) means.
 // Shared by the format readers; which ones use it depends on the enabled features.
 #[allow(dead_code)]
-pub(crate) fn soup(tris: &[[[f32; 3]; 3]]) -> Prim {
-    let mut p = Prim::default();
-    for t in tris {
-        let n = face_normal(t[0], t[1], t[2]);
-        for v in t {
-            p.indices
-                .push(u32::try_from(p.positions.len()).unwrap_or(u32::MAX));
-            p.positions.push(*v);
-            p.normals.push(n);
-        }
-    }
-    p
+pub(crate) struct Welder {
+    positions: Vec<[f32; 3]>,
+    indices: Vec<u32>,
+    /// Open addressing, linear probing: 0 for an empty slot, otherwise a position's index + 1.
+    table: Vec<u32>,
+    /// 64 minus log2 of the table's size: a hash's top bits pick the slot.
+    shift: u32,
 }
 
-/// Facets grouped by color (gray for those without one): a primitive and plain material for each.
-// Shared by the format readers; which ones use it depends on the enabled features.
 #[allow(dead_code)]
-pub(crate) fn colored_soup(tris: &[[[f32; 3]; 3]], colors: &[Option<[u8; 3]>]) -> Mesh {
-    type Tri = [[f32; 3]; 3];
-    let mut groups: Vec<(Option<[u8; 3]>, Vec<Tri>)> = Vec::new();
-    let mut index: HashMap<Option<[u8; 3]>, usize> = HashMap::new();
-    for (t, c) in tris.iter().zip(colors) {
-        let i = *index.entry(*c).or_insert_with(|| {
-            groups.push((*c, Vec::new()));
-            groups.len() - 1
-        });
-        groups[i].1.push(*t);
+impl Welder {
+    /// Room for about `tris` triangles of a closed mesh (half as many points).
+    pub fn with_capacity(tris: usize) -> Self {
+        let size = tris.max(16).next_power_of_two();
+        Self {
+            positions: Vec::with_capacity(tris / 2 + 16),
+            indices: Vec::with_capacity(tris * 3),
+            table: vec![0; size],
+            shift: 64 - size.trailing_zeros(),
+        }
     }
-    let mut mesh = Mesh::default();
-    for (i, (c, tris)) in groups.into_iter().enumerate() {
-        let mut p = soup(&tris);
-        p.material = i;
-        mesh.prims.push(p);
-        let color = c.map_or(GRAY, |c| {
-            let [r, g, b] = c.map(|v| srgb_to_linear(f32::from(v) / 255.0));
-            [r, g, b, 1.0]
-        });
-        mesh.materials
-            .push(Material::plain(&format!("color_{i}"), color));
+
+    /// Room for `tris` triangles in all, once a reader can estimate the total better.
+    pub fn expect(&mut self, tris: usize) {
+        self.indices
+            .reserve_exact((tris * 3).saturating_sub(self.indices.len()));
+        self.positions
+            .reserve_exact((tris / 2 + 16).saturating_sub(self.positions.len()));
+        while self.table.len() < tris.next_power_of_two() {
+            self.grow();
+        }
     }
-    mesh
+
+    #[inline]
+    fn slot(&self, key: [u32; 3]) -> usize {
+        let h = (u64::from(key[0]) | u64::from(key[1]) << 32).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ u64::from(key[2]).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        (h >> self.shift) as usize
+    }
+
+    /// The index of point `p`, added if it's new.
+    #[inline]
+    pub fn index(&mut self, p: [f32; 3]) -> u32 {
+        let p = p.map(|c| c + 0.0);
+        let key = p.map(f32::to_bits);
+        let mask = self.table.len() - 1;
+        let mut i = self.slot(key);
+        loop {
+            match self.table[i] {
+                0 => break,
+                e => {
+                    if self.positions[(e - 1) as usize].map(f32::to_bits) == key {
+                        return e - 1;
+                    }
+                }
+            }
+            i = (i + 1) & mask;
+        }
+        let at = self.positions.len() as u32;
+        self.positions.push(p);
+        self.table[i] = at + 1;
+        // Keep the table at most 5/8 full.
+        if self.positions.len() * 8 > self.table.len() * 5 {
+            self.grow();
+        }
+        at
+    }
+
+    fn grow(&mut self) {
+        let size = self.table.len() * 2;
+        self.table = vec![0; size];
+        self.shift -= 1;
+        let mask = size - 1;
+        for (at, p) in self.positions.iter().enumerate() {
+            let mut i = self.slot(p.map(f32::to_bits));
+            while self.table[i] != 0 {
+                i = (i + 1) & mask;
+            }
+            self.table[i] = at as u32 + 1;
+        }
+    }
+
+    /// One triangle, by its corners.
+    #[inline]
+    pub fn push(&mut self, t: [[f32; 3]; 3]) {
+        let i = t.map(|p| self.index(p));
+        self.indices.extend_from_slice(&i);
+    }
+
+    pub fn triangles(&self) -> usize {
+        self.indices.len() / 3
+    }
+
+    /// The primitive, its buffers trimmed to size.
+    pub fn finish(mut self) -> Prim {
+        drop(std::mem::take(&mut self.table));
+        let trim = |len: usize, cap: usize| cap > len + len / 16 + 16;
+        if trim(self.positions.len(), self.positions.capacity()) {
+            self.positions.shrink_to_fit();
+        }
+        if trim(self.indices.len(), self.indices.capacity()) {
+            self.indices.shrink_to_fit();
+        }
+        Prim {
+            positions: self.positions,
+            indices: self.indices,
+            ..Prim::default()
+        }
+    }
 }
 
 /// A GLB with one mesh: a primitive per `Prim`, its materials, and the images embedded.
@@ -238,7 +301,9 @@ pub fn to_glb(mesh: &Mesh) -> Result<Vec<u8>> {
         }
         let f32s = |v: &[f32]| v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>();
         let pv = push_view(&mut bin, &f32s(p.positions.as_flattened()), Some(34962));
-        let nv = push_view(&mut bin, &f32s(p.normals.as_flattened()), Some(34962));
+        // Without normals, glTF clients shade flat.
+        let nv = (p.normals.len() == p.positions.len())
+            .then(|| push_view(&mut bin, &f32s(p.normals.as_flattened()), Some(34962)));
         let iv = push_view(
             &mut bin,
             &p.indices
@@ -256,21 +321,30 @@ pub fn to_glb(mesh: &Mesh) -> Result<Vec<u8>> {
         }
         let a = accessors.len();
         accessors.push(json!({ "bufferView": pv, "componentType": 5126, "count": p.positions.len(), "type": "VEC3", "min": min, "max": max }));
-        accessors.push(json!({ "bufferView": nv, "componentType": 5126, "count": p.normals.len(), "type": "VEC3" }));
+        let mut attributes = json!({ "POSITION": a });
+        if let Some(nv) = nv {
+            accessors.push(json!({ "bufferView": nv, "componentType": 5126, "count": p.normals.len(), "type": "VEC3" }));
+            attributes["NORMAL"] = json!(accessors.len() - 1);
+        }
+        let ia = accessors.len();
         accessors.push(json!({ "bufferView": iv, "componentType": 5125, "count": p.indices.len(), "type": "SCALAR" }));
-        let mut attributes = json!({ "POSITION": a, "NORMAL": a + 1 });
         if p.uvs.len() == p.positions.len() {
             let uv = push_view(&mut bin, &f32s(p.uvs.as_flattened()), Some(34962));
             accessors.push(json!({ "bufferView": uv, "componentType": 5126, "count": p.uvs.len(), "type": "VEC2" }));
             attributes["TEXCOORD_0"] = json!(accessors.len() - 1);
         }
         if p.colors.len() == p.positions.len() {
-            let clamped: Vec<f32> = p.colors.as_flattened().iter().map(|c| c.clamp(0.0, 1.0)).collect();
+            let clamped: Vec<f32> = p
+                .colors
+                .as_flattened()
+                .iter()
+                .map(|c| c.clamp(0.0, 1.0))
+                .collect();
             let cv = push_view(&mut bin, &f32s(&clamped), Some(34962));
             accessors.push(json!({ "bufferView": cv, "componentType": 5126, "count": p.colors.len(), "type": "VEC4" }));
             attributes["COLOR_0"] = json!(accessors.len() - 1);
         }
-        primitives.push(json!({ "attributes": attributes, "indices": a + 2, "material": p.material.min(mesh.materials.len().saturating_sub(1)) }));
+        primitives.push(json!({ "attributes": attributes, "indices": ia, "material": p.material.min(mesh.materials.len().saturating_sub(1)) }));
     }
     ensure!(!primitives.is_empty(), "nothing to draw");
     let mut images = Vec::new();
@@ -377,9 +451,8 @@ pub(crate) fn triangulate(corners: &[[f32; 3]], out: &mut Vec<[u32; 3]>) {
     let axis = (0..3)
         .max_by(|&i, &j| nrm[i].abs().total_cmp(&nrm[j].abs()))
         .unwrap_or(2);
-    let all: Vec<u32> = (0..n as u32).collect();
     if nrm[axis] == 0.0 || n > 4096 {
-        fan(out, &all);
+        out.extend((1..n as u32 - 1).map(|k| [0, k, k + 1]));
         return;
     }
     // Project so the polygon winds counter-clockwise in 2D.
@@ -389,16 +462,46 @@ pub(crate) fn triangulate(corners: &[[f32; 3]], out: &mut Vec<[u32; 3]>) {
         _ => (0, 1),
     };
     let flip = nrm[axis] < 0.0;
-    let p: Vec<[f64; 2]> = corners
-        .iter()
-        .map(|c| {
-            let (x, y) = (f64::from(c[u]), f64::from(c[v]));
-            if flip { [y, x] } else { [x, y] }
-        })
-        .collect();
+    let to2 = |c: &[f32; 3]| {
+        let (x, y) = (f64::from(c[u]), f64::from(c[v]));
+        if flip { [y, x] } else { [x, y] }
+    };
     let cross = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
         (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
     };
+    if n == 4 {
+        // Quads, most faces that aren't triangles: no allocation. A convex one is fanned; one
+        // with a single reflex corner is cut along the diagonal from that corner.
+        let q = [
+            to2(&corners[0]),
+            to2(&corners[1]),
+            to2(&corners[2]),
+            to2(&corners[3]),
+        ];
+        let turn = |k: usize| cross(q[(k + 3) % 4], q[k], q[(k + 1) % 4]);
+        let mut r = None;
+        let mut count = 0;
+        for k in 0..4 {
+            if turn(k) < 0.0 {
+                r = Some(k as u32);
+                count += 1;
+            }
+        }
+        match (count, r) {
+            (0, _) => {
+                out.extend([[0, 1, 2], [0, 2, 3]]);
+                return;
+            }
+            (1, Some(r)) => {
+                let c = |k: u32| (r + k) % 4;
+                out.extend([[r, c(1), c(2)], [r, c(2), c(3)]]);
+                return;
+            }
+            _ => {}
+        }
+    }
+    let all: Vec<u32> = (0..n as u32).collect();
+    let p: Vec<[f64; 2]> = corners.iter().map(to2).collect();
     if (0..n).all(|i| cross(p[i], p[(i + 1) % n], p[(i + 2) % n]) >= 0.0) {
         fan(out, &all);
         return;
@@ -446,7 +549,14 @@ mod triangulate_tests {
 
     #[test]
     fn concave_and_convex() {
-        let ell = [[2., 1., 0.], [1., 1., 0.], [1., 2., 0.], [0., 2., 0.], [0., 0., 0.], [2., 0., 0.]];
+        let ell = [
+            [2., 1., 0.],
+            [1., 1., 0.],
+            [1., 2., 0.],
+            [0., 2., 0.],
+            [0., 0., 0.],
+            [2., 0., 0.],
+        ];
         let mut t = Vec::new();
         triangulate(&ell, &mut t);
         assert_eq!(t.len(), 4);

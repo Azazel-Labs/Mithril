@@ -216,7 +216,26 @@ fn run(case: &Case) -> Result<(), String> {
     // Every normal is one of these (a faceted model's face directions).
     if let Some(dirs) = e.get("normals_in").and_then(Value::as_array) {
         let dirs: Vec<Vec<f32>> = dirs.iter().map(floats).collect();
-        for n in g.prims.iter().flat_map(|p| &p.normals) {
+        // A primitive without normals is shaded flat, as the glTF spec tells clients to.
+        let flat = |p: &glb::Prim| -> Vec<[f32; 3]> {
+            p.indices
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|t| {
+                    let [a, b, c] = t.map(|i| p.positions[i as usize]);
+                    let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                    let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+                    let f = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+                    let len = (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt();
+                    f.map(|x| x / len)
+                })
+                .filter(|n| n.iter().all(|x| x.is_finite()))
+                .collect()
+        };
+        let normals: Vec<[f32; 3]> =
+            g.prims.iter().flat_map(|p| if p.normals.is_empty() { flat(p) } else { p.normals.clone() }).collect();
+        for n in &normals {
             if !dirs.iter().any(|d| close(n, d, 1e-3)) {
                 return Err(format!("normal {n:?} is none of {dirs:?}"));
             }
@@ -224,7 +243,9 @@ fn run(case: &Case) -> Result<(), String> {
     }
     // Every triangle's winding agrees with its vertex normals (counter-clockwise front faces).
     if e.get("winding_matches_normals").and_then(Value::as_bool) == Some(true) {
-        for p in &g.prims {
+        // Flat-shaded primitives (no normals) take their normals from the winding: nothing to
+        // compare.
+        for p in g.prims.iter().filter(|p| !p.normals.is_empty()) {
             for t in p.indices.as_chunks::<3>().0 {
                 let [a, b, c] = t.map(|i| p.positions[i as usize]);
                 let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
