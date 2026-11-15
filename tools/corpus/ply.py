@@ -74,7 +74,8 @@ for fmt, name in (("ascii", "ascii"), ("binary_little_endian", "binary_le"), ("b
 
 case(FMT, "header_crlf_comments",
      {"cube.ply": ply("ascii", [CUBE_VERTS, CUBE_FACES], ["comment made by hand", "obj_info a note"], nl="\r\n")},
-     {"spec": SPEC + ": CRLF line ends, comment and obj_info lines", "source": SRC, **CUBE})
+     {"spec": SPEC + ": CRLF line ends, comment and obj_info lines", "source": SRC, **CUBE,
+      "document": {"source": {"comments": ["made by hand"], "objInfo": ["a note"], "encoding": "ascii"}}})
 
 # Every scalar type, under both its old and its sized name.
 types_v = [("double", "x"), ("float64", "y"), ("float32", "z"), ("short", "i16"), ("uint16", "u16"),
@@ -101,7 +102,9 @@ case(FMT, "unknown_elements",
          ("material", [("list", "uchar", "float", "params"), ("int", "id")], [[[1.0, 2.0, 3.0], 7]]),
          ("face", FACE + [("int", "flags")], [[list(q), 9] for q, _ in CUBE_QUADS]),
          ("edge", [("int", "vertex1"), ("int", "vertex2")], [[0, 1], [1, 3]])])},
-     {"spec": SPEC + ": extra elements and properties, read past and ignored", "source": SRC, **CUBE})
+     {"spec": SPEC + ": extra vertex properties kept as custom attributes, edges as lines, other elements read past",
+      "source": SRC, **CUBE, "facts": {"lines": 2},
+      "document": {"attributes": ["_CONFIDENCE", "_FLAGS"], "source": {"skipped": ["material"]}}})
 
 # --- vertex attributes ------------------------------------------------------------------------
 
@@ -198,7 +201,8 @@ case(FMT, "index_out_of_range",
 # --- point clouds and errors ------------------------------------------------------------------
 
 case(FMT, "point_cloud", {"points.ply": ply("binary_little_endian", [("vertex", XYZ + RGB_U8, [v + [1, 2, 3] for v in QUAD_V])])},
-     {"spec": SPEC + ": vertices only", "source": SRC, "no_mesh": True, "facts": {"points": 4}})
+     {"spec": SPEC + ": vertices only, drawn as points", "source": SRC, "no_mesh": True, "facts": {"points": 4},
+      "document": {"nodes": 1, "attributes": ["POSITION", "COLOR_0"]}})
 
 case(FMT, "point_cloud_empty_faces",
      {"points.ply": ply("ascii", [("vertex", XYZ, QUAD_V), ("face", FACE, [])])},
@@ -208,7 +212,8 @@ splat = [("float", n) for n in ["x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc
                                 "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"]]
 case(FMT, "gaussian_splats", {"splats.ply": ply("binary_little_endian", [("vertex", splat, [v + [0] * 14 for v in QUAD_V])])},
      {"spec": "PLY as 3D Gaussian splatting writes it: a vertex element of splat parameters", "source": SRC,
-      "no_mesh": True, "facts": {"points": 4}})
+      "no_mesh": True, "facts": {"points": 4},
+      "document": {"attributes": ["NORMAL", "_F_DC_0", "_OPACITY", "_SCALE_2", "_ROT_3"]}})
 
 cut = ply("binary_little_endian", [CUBE_VERTS, CUBE_FACES])
 case(FMT, "truncated", {"cut.ply": cut[:-10]},

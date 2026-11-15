@@ -245,7 +245,7 @@ fn convert<'a>(input: Input<'a>, ext: &str, assets: &'a dyn Assets, keep: Keep) 
         #[cfg(feature = "stl")]
         "stl" => stl::stl(input),
         #[cfg(feature = "ply")]
-        "ply" => ply::ply(input, assets).map(|(mesh, facts)| of_mesh(mesh, facts)),
+        "ply" => ply::ply(input, assets),
         #[cfg(feature = "vox")]
         "vox" => vox::vox(&input.read()?).map(|(mesh, facts)| of_mesh(mesh, facts)),
         #[cfg(feature = "3mf")]

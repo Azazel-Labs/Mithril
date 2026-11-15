@@ -3,8 +3,13 @@
 //! Read: positions, normals, vertex colors (sRGB, as integers or floats), texture coordinates
 //! under any of their usual names, polygons (triangulated in their plane) and triangle strips;
 //! `MeshLab`'s per-face texture coordinates and `comment TextureFile`; per-face colors. Elements
-//! the reader doesn't use are skipped. A file without faces is a point cloud: no mesh, but its
-//! point count.
+//! the reader doesn't use are skipped.
+//!
+//! Nothing the vertices carry is lost: properties beyond those are custom attributes, named as
+//! the file names them in capitals after an underscore (`_CONFIDENCE`, `_F_DC_0`). A file without
+//! faces is a point cloud, drawn as points; an `edge` element's `vertex1` and `vertex2` are
+//! lines. The header's comments, `obj_info` lines, encoding and the elements skipped go in the
+//! asset's `extras.source`.
 
 use std::path::Path;
 
@@ -13,6 +18,7 @@ use serde_json::{Map, Value, json};
 use super::Input;
 use super::stream::{self, Blocks};
 use crate::assets::Assets;
+use crate::document::{Builder, Document, Part};
 use crate::mesh::{FastMap, MAX_TRIANGLES, Material, Mesh, Prim, smooth_normals, srgb_to_linear, triangulate};
 use crate::num::{f32_of, u32_of};
 use crate::{Context as _, Result};
@@ -254,11 +260,24 @@ fn at(b: &[u8], ty: Ty, be: bool) -> f64 {
     }
 }
 
-/// The header: format, elements, the texture file `MeshLab` names, and where the data starts.
-fn header(data: &[u8]) -> Result<(Format, Vec<Element>, Option<String>, usize)> {
+/// What the header says besides its elements.
+struct Header {
+    format: Format,
+    version: String,
+    /// The texture file `MeshLab` names.
+    texture: Option<String>,
+    comments: Vec<String>,
+    obj_info: Vec<String>,
+}
+
+/// The header, its elements, and where the data starts.
+fn header(data: &[u8]) -> Result<(Header, Vec<Element>, usize)> {
     let mut format = None;
+    let mut version = String::new();
     let mut elements: Vec<Element> = Vec::new();
     let mut texture = None;
+    let (mut comments, mut obj_info) = (Vec::new(), Vec::new());
+    let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
     let mut at = 0;
     let mut first = true;
     loop {
@@ -277,7 +296,8 @@ fn header(data: &[u8]) -> Result<(Format, Vec<Element>, Option<String>, usize)> 
         let w: Vec<&[u8]> = line.split(u8::is_ascii_whitespace).filter(|w| !w.is_empty()).collect();
         match w.as_slice() {
             [b"end_header", ..] => break,
-            [b"format", f, ..] => {
+            [b"format", f, rest @ ..] => {
+                version = rest.first().map(|v| text(v)).unwrap_or_default();
                 format = Some(match *f {
                     b"ascii" => Format::Ascii,
                     b"binary_little_endian" => Format::Le,
@@ -287,8 +307,11 @@ fn header(data: &[u8]) -> Result<(Format, Vec<Element>, Option<String>, usize)> 
             }
             [b"comment", kind, ..] if kind.eq_ignore_ascii_case(b"texturefile") => {
                 let name = line[b"comment".len()..].trim_ascii_start()[kind.len()..].trim_ascii();
-                texture = Some(String::from_utf8_lossy(name).into_owned());
+                texture = Some(text(name));
+                comments.push(text(line[b"comment".len()..].trim_ascii()));
             }
+            [b"comment", ..] => comments.push(text(line[b"comment".len()..].trim_ascii())),
+            [b"obj_info", ..] => obj_info.push(text(line[b"obj_info".len()..].trim_ascii())),
             [b"element", name, count] => elements.push(Element {
                 name: String::from_utf8_lossy(name).into_owned(),
                 count: std::str::from_utf8(count)
@@ -318,7 +341,14 @@ fn header(data: &[u8]) -> Result<(Format, Vec<Element>, Option<String>, usize)> 
             _ => {}
         }
     }
-    Ok((format.context("PLY header names no format")?, elements, texture, at))
+    let header = Header {
+        format: format.context("PLY header names no format")?,
+        version,
+        texture,
+        comments,
+        obj_info,
+    };
+    Ok((header, elements, at))
 }
 
 /// Vertex data, by vertex. Normals are unit length and texture coordinates flipped to glTF's
@@ -329,6 +359,8 @@ struct Vertices {
     nrm: Vec<[f32; 3]>,
     col: Vec<[f32; 4]>,
     uv: Vec<[f32; 2]>,
+    /// The other scalar properties, a column each, in the order of `Plan::extra`.
+    extra: Vec<Vec<f32>>,
 }
 
 /// Faces kept as the file gives them, for when they can't become triangles as they're read:
@@ -382,6 +414,10 @@ struct Plan {
     uv: Option<(usize, usize)>,
     index_list: Option<usize>,
     uv_list: Option<usize>,
+    /// An edge's two vertices.
+    edge: Option<[usize; 2]>,
+    /// A vertex's scalar properties beyond those above, kept as custom attributes.
+    extra: Vec<usize>,
     /// The scalar properties read; the rest are stepped over.
     wanted: Vec<bool>,
     /// Binary records of fixed size (no lists): the size and each property's offset.
@@ -389,7 +425,7 @@ struct Plan {
 }
 
 impl Plan {
-    fn new(el: &Element) -> Plan {
+    fn new(el: &Element, kind: Kind) -> Plan {
         let tri = |a: Option<usize>, b: Option<usize>, c: Option<usize>| Some([a?, b?, c?]);
         let xyz = [el.slot(X), el.slot(Y), el.slot(Z)];
         let mut plan = Plan {
@@ -400,6 +436,10 @@ impl Plan {
             uv: el.slot(U).zip(el.slot(V)),
             index_list: el.list(&["vertex_indices", "vertex_index"]),
             uv_list: el.list(&["texcoord"]),
+            edge: (kind == Kind::Edge)
+                .then(|| Some([el.slot(&["vertex1"])?, el.slot(&["vertex2"])?]))
+                .flatten(),
+            extra: Vec::new(),
             wanted: vec![false; el.props.len()],
             fixed: None,
         };
@@ -410,9 +450,18 @@ impl Plan {
             .chain(plan.rgb.into_iter().flatten())
             .chain(plan.alpha)
             .chain(plan.uv.into_iter().flat_map(|(u, v)| [u, v]))
+            .chain(plan.edge.into_iter().flatten())
             .collect();
-        for s in used {
+        for &s in &used {
             plan.wanted[s] = true;
+        }
+        if kind == Kind::Vertex {
+            plan.extra = (0..el.props.len())
+                .filter(|&k| !used.contains(&k) && el.props[k].count.is_none())
+                .collect();
+            for &k in &plan.extra {
+                plan.wanted[k] = true;
+            }
         }
         if el.props.iter().all(|p| p.count.is_none()) {
             let mut offsets = Vec::with_capacity(el.props.len());
@@ -439,7 +488,13 @@ struct Body {
     faces: Faces,
     /// Triangle strips' triangles, checked against the vertex count at the end.
     strip_tris: Vec<[u32; 3]>,
+    /// Edges, as vertex indices, checked against the vertex count at the end.
+    edges: Vec<u32>,
     points: usize,
+    /// The vertex element's other scalar properties' names, for `Vertices::extra`.
+    extra_names: Vec<String>,
+    /// Elements read past.
+    skipped: Vec<String>,
     // Scratch, reused from record to record.
     vals: Vec<f64>,
     idx: Vec<u32>,
@@ -448,12 +503,12 @@ struct Body {
     local: Vec<[u32; 3]>,
 }
 
-pub(crate) fn ply(input: Input<'_>, assets: &dyn Assets) -> Result<(Option<Mesh>, Map<String, Value>)> {
+pub(crate) fn ply(input: Input<'_>, assets: &dyn Assets) -> Result<Document<'static>> {
     let path = input.path;
     let mut blocks = input.blocks()?;
     // The header, whole.
     let mut want = 4096;
-    let (format, elements, texture, start) = loop {
+    let (head, elements, start) = loop {
         blocks.need(want)?;
         let d = blocks.data();
         let ended = d
@@ -478,20 +533,162 @@ pub(crate) fn ply(input: Input<'_>, assets: &dyn Assets) -> Result<(Option<Mesh>
             "PLY element {} counts more items than the file holds",
             el.name
         );
-        read_element(&mut blocks, format, el, has_faces, &mut body)?;
+        read_element(&mut blocks, head.format, el, &mut body)?;
+    }
+    let mut source = json!({
+        "format": "PLY",
+        "encoding": match head.format {
+            Format::Ascii => "ascii",
+            Format::Le => "binary_little_endian",
+            Format::Be => "binary_big_endian",
+        },
+        "version": head.version,
+    });
+    for (key, list) in [
+        ("comments", &head.comments),
+        ("objInfo", &head.obj_info),
+        ("skipped", &body.skipped),
+    ] {
+        if !list.is_empty() {
+            source[key] = json!(list);
+        }
     }
     let mut facts = Map::new();
-    if !has_faces {
+    let mut b = Builder::default();
+    let mut json = Map::new();
+    json.insert("asset".into(), json!({ "extras": { "source": source } }));
+    let names = std::mem::take(&mut body.extra_names);
+    let nv = body.verts.pos.len();
+    let edges: Vec<u32> = body
+        .edges
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .filter(|e| e.iter().all(|&i| (i as usize) < nv))
+        .flatten()
+        .copied()
+        .collect();
+    let mut primitives = Vec::new();
+    // The attributes the edges share: the triangles' when their vertices are the file's.
+    let mut shared = None;
+    if has_faces {
+        let (mesh, src) = build(&mut body, head.texture, path, assets)?;
+        facts.insert("triangles".into(), json!(mesh.triangles()));
+        facts.insert(
+            "vertices".into(),
+            json!(mesh.prims.iter().map(|p| p.positions.len()).sum::<usize>()),
+        );
+        let Mesh {
+            prims,
+            materials,
+            images,
+        } = mesh;
+        for p in prims {
+            let n = p.positions.len();
+            if let Some(mut prim) = b.primitive(p) {
+                let columns = gather(&mut body.verts.extra, src.as_deref(), n);
+                custom(&mut b, &mut prim["attributes"], &names, columns);
+                prim["material"] = json!(0);
+                if src.is_none() {
+                    shared = Some(prim["attributes"].clone());
+                }
+                primitives.push(prim);
+            }
+        }
+        b.materials(&materials, images, &mut json);
+    } else {
         facts.insert("points".into(), json!(body.points));
-        return Ok((None, facts));
+        if nv > 0 {
+            let attributes = vertex_attributes(&mut b, &mut body.verts, &names);
+            primitives.push(json!({ "attributes": attributes, "mode": 0 }));
+            shared = Some(attributes);
+        }
     }
-    let mesh = build(body, texture, path, assets)?;
-    facts.insert("triangles".into(), json!(mesh.triangles()));
-    facts.insert(
-        "vertices".into(),
-        json!(mesh.prims.iter().map(|p| p.positions.len()).sum::<usize>()),
-    );
-    Ok((Some(mesh), facts))
+    if !edges.is_empty() {
+        let attributes = match shared {
+            Some(a) => a,
+            None => json!({ "POSITION": b.positions(std::mem::take(&mut body.verts.pos)) }),
+        };
+        let count = edges.len();
+        let indices = b.accessor(Part::u32(edges), 5125, count, "SCALAR", Some(34963));
+        facts.insert("lines".into(), json!(count / 2));
+        primitives.push(json!({ "attributes": attributes, "indices": indices, "mode": 1 }));
+    }
+    if primitives.is_empty() {
+        return Ok(Document::empty(facts));
+    }
+    json.insert("scene".into(), json!(0));
+    json.insert("scenes".into(), json!([{ "nodes": [0] }]));
+    json.insert("nodes".into(), json!([{ "mesh": 0 }]));
+    json.insert("meshes".into(), json!([{ "primitives": primitives }]));
+    Ok(b.finish(json, facts))
+}
+
+/// The extra columns for `n` drawn vertices: the file's own when `src` is `None`, otherwise
+/// gathered by source vertex.
+fn gather(extra: &mut [Vec<f32>], src: Option<&[u32]>, n: usize) -> Vec<Vec<f32>> {
+    extra
+        .iter_mut()
+        .map(|col| match src {
+            None if col.len() == n => std::mem::take(col),
+            None => Vec::new(),
+            Some(src) => src
+                .iter()
+                .map(|&v| col.get(v as usize).copied().unwrap_or(0.0))
+                .collect(),
+        })
+        .collect()
+}
+
+/// Adds each column as a float custom attribute, `_` and the property's name in capitals.
+fn custom(b: &mut Builder, attributes: &mut Value, names: &[String], columns: Vec<Vec<f32>>) {
+    for (name, col) in names.iter().zip(columns) {
+        if col.is_empty() {
+            continue;
+        }
+        let key = format!("_{}", name.to_ascii_uppercase());
+        if attributes.get(&key).is_some() {
+            continue;
+        }
+        let n = col.len();
+        attributes[key] = json!(b.accessor(Part::f32(col), 5126, n, "SCALAR", Some(34962)));
+    }
+}
+
+/// A point cloud's attributes: everything its vertices carry.
+fn vertex_attributes(b: &mut Builder, v: &mut Vertices, names: &[String]) -> Value {
+    let n = v.pos.len();
+    let mut attributes = json!({ "POSITION": b.positions(std::mem::take(&mut v.pos)) });
+    if v.nrm.len() == n {
+        let a = b.accessor(
+            Part::f32(std::mem::take(&mut v.nrm).into_flattened()),
+            5126,
+            n,
+            "VEC3",
+            Some(34962),
+        );
+        attributes["NORMAL"] = json!(a);
+    }
+    if v.uv.len() == n {
+        let a = b.accessor(
+            Part::f32(std::mem::take(&mut v.uv).into_flattened()),
+            5126,
+            n,
+            "VEC2",
+            Some(34962),
+        );
+        attributes["TEXCOORD_0"] = json!(a);
+    }
+    if v.col.len() == n {
+        let mut colors = std::mem::take(&mut v.col).into_flattened();
+        for c in &mut colors {
+            *c = c.clamp(0.0, 1.0);
+        }
+        attributes["COLOR_0"] = json!(b.accessor(Part::f32(colors), 5126, n, "VEC4", Some(34962)));
+    }
+    let columns = gather(&mut v.extra, None, n);
+    custom(b, &mut attributes, names, columns);
+    attributes
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -499,36 +696,41 @@ enum Kind {
     Vertex,
     Face,
     Strip,
+    Edge,
     Other,
 }
 
 /// Reads one element's items, a block of the file at a time.
-fn read_element(blocks: &mut Blocks<'_>, format: Format, el: &Element, has_faces: bool, body: &mut Body) -> Result<()> {
+fn read_element(blocks: &mut Blocks<'_>, format: Format, el: &Element, body: &mut Body) -> Result<()> {
     let kind = match el.name.as_str() {
         "vertex" => Kind::Vertex,
         "face" => Kind::Face,
         "tristrips" => Kind::Strip,
+        "edge" => Kind::Edge,
         _ => Kind::Other,
     };
-    let plan = Plan::new(el);
+    let plan = Plan::new(el, kind);
+    if kind == Kind::Other || kind == Kind::Edge && plan.edge.is_none() {
+        body.skipped.push(el.name.clone());
+    }
     if kind == Kind::Vertex {
         ensure!(
             plan.xyz.iter().all(|&s| s != usize::MAX),
             "PLY vertices have no x, y and z"
         );
-        if has_faces {
-            let v = &mut body.verts;
-            v.pos.reserve_exact(el.count);
-            if plan.n.is_some() {
-                v.nrm.reserve_exact(el.count);
-            }
-            if plan.rgb.is_some() {
-                v.col.reserve_exact(el.count);
-            }
-            if plan.uv.is_some() {
-                v.uv.reserve_exact(el.count);
-            }
+        let v = &mut body.verts;
+        v.pos.reserve_exact(el.count);
+        if plan.n.is_some() {
+            v.nrm.reserve_exact(el.count);
         }
+        if plan.rgb.is_some() {
+            v.col.reserve_exact(el.count);
+        }
+        if plan.uv.is_some() {
+            v.uv.reserve_exact(el.count);
+        }
+        body.extra_names = plan.extra.iter().map(|&k| el.props[k].name.clone()).collect();
+        v.extra = plan.extra.iter().map(|_| Vec::with_capacity(el.count)).collect();
     }
     // Faces become triangles as they're read when their vertices are known and their corners
     // share the vertices' data.
@@ -554,10 +756,11 @@ fn read_element(blocks: &mut Blocks<'_>, format: Format, el: &Element, has_faces
         let before = done;
         while done < el.count {
             let r = match kind {
-                Kind::Vertex => vertex(&mut cur, el, &plan, has_faces, body),
+                Kind::Vertex => vertex(&mut cur, el, &plan, body),
                 Kind::Face => face(&mut cur, el, &plan, direct, body),
                 Kind::Strip => strip(&mut cur, el, &plan, body),
-                Kind::Other => other(&mut cur, el, &plan),
+                Kind::Edge if plan.edge.is_some() => edge(&mut cur, el, &plan, body),
+                Kind::Edge | Kind::Other => other(&mut cur, el, &plan),
             };
             match r {
                 Ok(()) => {
@@ -642,12 +845,9 @@ fn record(
     Ok(())
 }
 
-fn vertex(cur: &mut Cursor, el: &Element, plan: &Plan, keep: bool, body: &mut Body) -> Got<()> {
+fn vertex(cur: &mut Cursor, el: &Element, plan: &Plan, body: &mut Body) -> Got<()> {
     record(cur, el, plan, &mut body.vals, &mut body.idx, &mut body.tc)?;
     body.points += 1;
-    if !keep {
-        return Ok(());
-    }
     let vals = &body.vals;
     let v = &mut body.verts;
     let g = |s: usize| f32_of(vals[s]);
@@ -660,6 +860,29 @@ fn vertex(cur: &mut Cursor, el: &Element, plan: &Plan, keep: bool, body: &mut Bo
     }
     if let Some((a, b)) = plan.uv {
         v.uv.push([g(a), 1.0 - g(b)]);
+    }
+    for (col, &k) in v.extra.iter_mut().zip(&plan.extra) {
+        col.push(g(k));
+    }
+    Ok(())
+}
+
+/// An edge's two vertices; one that isn't a vertex index is dropped.
+fn edge(cur: &mut Cursor, el: &Element, plan: &Plan, body: &mut Body) -> Got<()> {
+    record(cur, el, plan, &mut body.vals, &mut body.idx, &mut body.tc)?;
+    if let Some(ends) = plan.edge {
+        let ends = ends.map(|k| body.vals[k]);
+        if ends
+            .iter()
+            .all(|&e| e >= 0.0 && e < f64::from(u32::MAX) && e.fract() == 0.0)
+        {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "checked just above"
+            )]
+            body.edges.extend(ends.map(|e| e as u32));
+        }
     }
     Ok(())
 }
@@ -740,14 +963,18 @@ fn other(cur: &mut Cursor, el: &Element, plan: &Plan) -> Got<()> {
 
 /// The primitive: shared vertices as the file has them, or split where faces give their corners
 /// their own texture coordinates or colors.
-fn build(body: Body, texture: Option<String>, path: &Path, assets: &dyn Assets) -> Result<Mesh> {
-    let Body {
-        verts,
-        mut tris,
-        faces,
-        strip_tris,
-        ..
-    } = body;
+/// Also the source vertex of each drawn vertex when they were split, `None` when they are the
+/// file's own. The vertices' positions, normals, texture coordinates and colors are taken.
+fn build(
+    body: &mut Body,
+    texture: Option<String>,
+    path: &Path,
+    assets: &dyn Assets,
+) -> Result<(Mesh, Option<Vec<u32>>)> {
+    let verts = &mut body.verts;
+    let mut tris = std::mem::take(&mut body.tris);
+    let faces = std::mem::take(&mut body.faces);
+    let strip_tris = std::mem::take(&mut body.strip_tris);
     let nv = verts.pos.len();
     // Faces kept for later become triangles, as corner numbers (into faces.corners) so
     // per-corner data follows.
@@ -784,6 +1011,7 @@ fn build(body: Body, texture: Option<String>, path: &Path, assets: &dyn Assets) 
     let has_col = !faces.corner_col.is_empty() || verts.col.len() == nv && nv > 0;
     let has_nrm = verts.nrm.len() == nv;
     let mut p = Prim::default();
+    let mut src = Vec::new();
     if per_corner {
         // One output vertex per distinct (vertex, corner data).
         let mut seen: FastMap<(u32, [u32; 2], [u32; 4]), u32> = FastMap::default();
@@ -794,6 +1022,7 @@ fn build(body: Body, texture: Option<String>, path: &Path, assets: &dyn Assets) 
                 col.unwrap_or_default().map(f32::to_bits),
             );
             *seen.entry(key).or_insert_with(|| {
+                src.push(v);
                 p.positions.push(verts.pos[v as usize]);
                 if has_nrm {
                     p.normals.push(verts.nrm[v as usize]);
@@ -838,15 +1067,15 @@ fn build(body: Body, texture: Option<String>, path: &Path, assets: &dyn Assets) 
             tris.shrink_to_fit();
         }
         p.indices = tris;
-        p.positions = verts.pos;
+        p.positions = std::mem::take(&mut verts.pos);
         if has_nrm {
-            p.normals = verts.nrm;
+            p.normals = std::mem::take(&mut verts.nrm);
         }
         if has_uv {
-            p.uvs = verts.uv;
+            p.uvs = std::mem::take(&mut verts.uv);
         }
         if has_col {
-            p.colors = verts.col;
+            p.colors = std::mem::take(&mut verts.col);
         }
     }
     if !has_nrm {
@@ -870,5 +1099,32 @@ fn build(body: Body, texture: Option<String>, path: &Path, assets: &dyn Assets) 
     }
     mesh.materials.push(mat);
     mesh.prims.push(p);
-    Ok(mesh)
+    Ok((mesh, per_corner.then_some(src)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read(text: &str) -> Document<'static> {
+        ply(Input::memory(text.as_bytes(), "t.ply"), &crate::assets::Memory::new()).unwrap()
+    }
+
+    #[test]
+    fn extra_properties_follow_vertices_split_by_face_texcoords() {
+        let doc = read(
+            "ply\nformat ascii 1.0\nelement vertex 4\nproperty float x\nproperty float y\nproperty float z\n\
+             property float quality\nelement face 2\nproperty list uchar int vertex_indices\n\
+             property list uchar float texcoord\nend_header\n\
+             0 0 0 1\n1 0 0 2\n1 1 0 3\n0 1 0 4\n\
+             3 0 1 2 6 0 0 1 0 1 1\n3 0 2 3 6 0.5 0.5 1 1 0 1\n",
+        );
+        let prim = &doc.json["meshes"][0]["primitives"][0];
+        let count = |a: &Value| doc.json["accessors"][usize::try_from(a.as_u64().unwrap()).unwrap()]["count"].clone();
+        let positions = count(&prim["attributes"]["POSITION"]);
+        assert_eq!(positions, 5, "vertices 0 and 2 split by their two texture coordinates");
+        assert_eq!(count(&prim["attributes"]["_QUALITY"]), positions);
+        let mesh = doc.flatten(crate::document::Pose::Rest).unwrap().unwrap();
+        assert_eq!(mesh.triangles(), 2);
+    }
 }

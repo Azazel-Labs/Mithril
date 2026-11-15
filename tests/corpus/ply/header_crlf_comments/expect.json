@@ -15,5 +15,16 @@
     ]
   },
   "area": 6.0,
-  "winding_matches_normals": true
+  "winding_matches_normals": true,
+  "document": {
+    "source": {
+      "comments": [
+        "made by hand"
+      ],
+      "objInfo": [
+        "a note"
+      ],
+      "encoding": "ascii"
+    }
+  }
 }

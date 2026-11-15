@@ -4,5 +4,14 @@
   "no_mesh": true,
   "facts": {
     "points": 4
+  },
+  "document": {
+    "attributes": [
+      "NORMAL",
+      "_F_DC_0",
+      "_OPACITY",
+      "_SCALE_2",
+      "_ROT_3"
+    ]
   }
 }

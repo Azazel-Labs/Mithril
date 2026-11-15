@@ -168,7 +168,8 @@ fn flattened(doc: Document<'_>) -> polysmelt::Result<Loaded<'_>> {
 
 /// `document`: how many of each thing the glTF JSON holds (`nodes`, `skins`, `animations`, `cameras`, `lights`,
 /// `joints` across skins, `morph_targets` across meshes' first primitives, `channels` across animations), and
-/// `node_names` that must be there.
+/// `node_names` and primitive `attributes` that must be there, and `source`, fields the asset's
+/// `extras.source` must hold.
 fn document(e: &Map<String, Value>, doc: &Document<'_>) -> Result<(), String> {
     let Some(want) = e.get("document") else { return Ok(()) };
     let j = &doc.json;
@@ -191,6 +192,36 @@ fn document(e: &Map<String, Value>, doc: &Document<'_>) -> Result<(), String> {
             for name in v.as_array().into_iter().flatten() {
                 if !list("nodes").iter().any(|n| n.get("name") == Some(name)) {
                     return Err(format!("no node is named {name}"));
+                }
+            }
+            continue;
+        }
+        if key == "attributes" {
+            let prims: Vec<Value> = list("meshes")
+                .iter()
+                .flat_map(|m| {
+                    m.get("primitives")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .collect();
+            for name in v.as_array().into_iter().flatten().filter_map(Value::as_str) {
+                if !prims
+                    .iter()
+                    .any(|p| p.pointer(&format!("/attributes/{name}")).is_some())
+                {
+                    return Err(format!("no primitive has attribute {name}"));
+                }
+            }
+            continue;
+        }
+        if key == "source" {
+            let source = j.get("asset").and_then(|a| a.pointer("/extras/source"));
+            for (k, want) in v.as_object().into_iter().flatten() {
+                let got = source.and_then(|s| s.get(k));
+                if got != Some(want) {
+                    return Err(format!("asset source {k} is {got:?}, expected {want}"));
                 }
             }
             continue;
