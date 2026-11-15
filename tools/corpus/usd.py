@@ -16,6 +16,7 @@ Run from the repository root with a Python that has usd-core installed:
 import math
 import os
 import shutil
+import struct
 import zipfile
 
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdUtils
@@ -197,6 +198,26 @@ def case_dir(name):
     return d
 
 
+def pin_zip_times(path):
+    """Sets every entry's DOS time and date to 1980-01-01 00:00 in place, so regenerating a usdz gives the same
+    bytes. Rewriting with zipfile would lose the 64-byte data alignment usdz requires."""
+    data = bytearray(open(path, "rb").read())
+    with zipfile.ZipFile(path) as z:
+        infos = z.infolist()
+    eocd = data.rfind(b"PK\x05\x06")
+    central = struct.unpack_from("<I", data, eocd + 16)[0]
+    for info in infos:
+        assert data[info.header_offset:info.header_offset + 4] == b"PK\x03\x04"
+        struct.pack_into("<HH", data, info.header_offset + 10, 0, 0x21)
+    pos = central
+    for _ in infos:
+        assert data[pos:pos + 4] == b"PK\x01\x02"
+        struct.pack_into("<HH", data, pos + 12, 0, 0x21)
+        n, m, k = struct.unpack_from("<HHH", data, pos + 28)
+        pos += 46 + n + m + k
+    open(path, "wb").write(bytes(data))
+
+
 def write(name, text, spec, expect, files=None, enc="usda", corners=False, measured=True, time=None):
     """Writes `text` as `name`.<enc>: usda as is; usdc and usd-crate exported by pxr; usdz packaged by pxr."""
     d = case_dir(name)
@@ -237,6 +258,7 @@ def write(name, text, spec, expect, files=None, enc="usda", corners=False, measu
             root = os.path.join(d, name + "_root.usdc")
             Sdf.Layer.FindOrOpen(src).Export(root)
         assert UsdUtils.CreateNewUsdzPackage(Sdf.AssetPath(root), os.path.join(d, name + ".usdz"))
+        pin_zip_times(os.path.join(d, name + ".usdz"))
         for f in os.listdir(d):
             if f != name + ".usdz":
                 p = os.path.join(d, f)
@@ -295,6 +317,44 @@ write("left_handed", layer(prim("Xform", "Root", mesh("Cube", cube_points(), CUB
                                                       [i for q, _ in CUBE_QUADS for i in reversed(q)],
                                                       'uniform token orientation = "leftHanded"'))),
       "orientation leftHanded: faces wound clockwise", {"faces_outward": True, "normals_in": AXES})
+
+# Authored normals on a leftHanded mesh are used as written: they already point outward, and only the winding
+# is clockwise.
+LH_INDICES = [i for q, _ in CUBE_QUADS for i in reversed(q)]
+LH_NORMALS_FV = [n for q, n in CUBE_QUADS for _ in q]
+LH = 'uniform token orientation = "leftHanded"'
+DIAG_LH = [[r((2 * p[k] - 1) / math.sqrt(3)) for k in range(3)] for p in CUBE_V]
+
+
+def left_handed(name, spec, *extra, expect, ops=(), sub="none"):
+    shape = mesh("Cube", cube_points(), CUBE_COUNTS, LH_INDICES, LH, *extra, sub=sub)
+    body = xform("Mirror", shape, ops=ops) if ops else shape
+    write(name, layer(prim("Xform", "Root", body)), spec, {"faces_outward": True, **expect}, corners=bool(ops))
+
+
+left_handed("left_handed_normals_face_varying", "orientation leftHanded with faceVarying normals, used as authored",
+            f"normal3f[] normals = {v(LH_NORMALS_FV)} (\n    interpolation = \"faceVarying\"\n)",
+            expect={"normals_in": AXES, "winding_matches_normals": True, "vertices": 24})
+left_handed("left_handed_normals_vertex", "orientation leftHanded with vertex normals, used as authored",
+            f"normal3f[] normals = {v(DIAG_LH)} (\n    interpolation = \"vertex\"\n)",
+            expect={"normals_in": DIAG_LH, "winding_matches_normals": True})
+left_handed("left_handed_normals_uniform", "orientation leftHanded with uniform normals, used as authored",
+            f"normal3f[] normals = {v([n for _, n in CUBE_QUADS])} (\n    interpolation = \"uniform\"\n)",
+            expect={"normals_in": AXES, "winding_matches_normals": True})
+left_handed("left_handed_normals_primvar_indexed", "orientation leftHanded with indexed primvars:normals",
+            f"normal3f[] primvars:normals = {v([n for _, n in CUBE_QUADS])} (\n    interpolation = \"faceVarying\"\n)",
+            f"int[] primvars:normals:indices = {ints([i for i in range(6) for _ in range(4)])}",
+            expect={"normals_in": AXES, "winding_matches_normals": True})
+left_handed("left_handed_smooth_computed", "orientation leftHanded, catmullClark, no normals: computed smooth, outward",
+            expect={"normals_in": DIAG_LH, "winding_matches_normals": True}, sub=None)
+left_handed("left_handed_mirrored_normals", "orientation leftHanded under a negative scale: the flips cancel, "
+            "and the authored normals mirror with the points",
+            f"normal3f[] normals = {v(LH_NORMALS_FV)} (\n    interpolation = \"faceVarying\"\n)",
+            expect={"normals_in": AXES, "winding_matches_normals": True},
+            ops=[("xformOp:scale", "float3", "(-1, 1, 1)")])
+left_handed("left_handed_mirrored_computed", "orientation leftHanded under a negative scale, no normals: "
+            "computed flat normals face outward", expect={"normals_in": AXES, "winding_matches_normals": True},
+            ops=[("xformOp:scale", "float3", "(-1, 1, 1)")])
 
 # --- normals --------------------------------------------------------------------------------
 

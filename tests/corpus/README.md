@@ -36,7 +36,7 @@ cases.
 | 3DS | 34 | 34 | none |
 | 3MF | 38 | 38 | none |
 | FBX | 99 | 85 | 14 |
-| USD | 118 | 98 | 20 |
+| USD | 125 | 105 | 20 |
 
 - **Generated** cases are written byte by byte by `tools/corpus/<format>.py` (3DS is
   `tds.py`, 3MF is `threemf.py`). Each one targets one clause of the format's specification,
@@ -84,7 +84,8 @@ python tools/corpus/obj.py
   Also every normal, UV and color mapping, materials, textures (embedded, external and
   missing), and instancing.
 - **USD**: `.usda`, `.usdc`, `.usd` in either encoding, and `.usdz`. Covers up axis and
-  `metersPerUnit`, every xformOp and rotation order, holes and invalid faces, and
+  `metersPerUnit`, every xformOp and rotation order, holes and invalid faces,
+  `leftHanded` orientation with authored and computed normals (mirrored too), and
   `primvars:normals` versus `normals`. Also UV primvar names, display color and opacity, and
   composition: references, payloads, sublayers, variants, instancing, classes and overs.
   Also visibility and purpose, UsdPreviewSurface, textures (beside the file, in a subfolder,

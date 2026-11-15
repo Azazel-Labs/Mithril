@@ -1,0 +1,49 @@
+name: Benchmarks
+
+# Load speed and peak memory of Mithril's readers against tobj, stl_io and ply-rs, on a fresh
+# GitHub-hosted runner. Run it from the Actions tab or `gh workflow run bench.yml`. The tables
+# land in the run summary and the raw numbers in the bench-results artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sizes:
+        description: "Input sizes, comma separated: small (10k triangles), medium (200k), large (2M)"
+        default: "small,medium,large"
+      budget:
+        description: "Seconds of timed rounds per input"
+        default: "3"
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install || rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bench
+      - name: Build
+        run: cargo build --release --manifest-path bench/Cargo.toml
+      - name: Machine
+        run: |
+          {
+            echo "Runner: \`$(nproc)\` cores, $(lscpu | sed -n 's/^Model name: *//p'), $(free -g | awk '/Mem:/ {print $2}') GB"
+            echo "Commit: \`${GITHUB_SHA::7}\`, $(rustc --version)"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Run
+        run: |
+          bench/target/release/mithril-bench \
+            --sizes "${{ inputs.sizes }}" --budget "${{ inputs.budget }}" \
+            --json bench-results.json --markdown bench-results.md
+          cat bench-results.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-results.*
