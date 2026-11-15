@@ -30,7 +30,7 @@ Early. What exists today:
   attributes turned into floats, the scene graph, animation and materials untouched. A
   `Keep` passed to the load says what to keep: everything by default, or for instance
   `Keep { animations: false, ..Keep::ALL }` for static meshes that still carry their skins.
-- **Conformance corpus**: 489 cases under `tests/corpus`, each a file and the GLB it must
+- **Conformance corpus**: 492 cases under `tests/corpus`, each a file and the GLB it must
   become. They cover every format above and the variants exporters really write: OBJ's face
   forms and MTL dialects, both PLY byte orders, every FBX version and axis system, and USD's
   three encodings and its composition, and glTF's accessor types, node hierarchy, skins and
@@ -94,10 +94,10 @@ Rust 1.88, with any features but `usd`. The `usd` feature, and so the default bu
 
 ## Planned scope
 
-- **Lossless conversion**: 3DS converted into the document with
-  its hierarchy, animations and full materials (glTF, FBX, USD, STL, PLY, VOX, 3MF and
-  OBJ already are),
-  units and axes recorded in extras, and readers that skip what `Keep` drops. glTF 1.0.
+- **Lossless conversion**: every format is converted into the document with its hierarchy,
+  animations, cameras and lights, and its source's units, axes and raw values in extras.
+  Still to come: full materials (`KHR_materials_*`, `KHR_texture_transform`) from the
+  values kept in extras, readers that skip more of what `Keep` drops, and glTF 1.0.
 - **Typed views** over the document's meshes, accessors, nodes, skins and animations.
 - **Accessors**: typed access through the document (the mesh reader already reads every
   component type, normalized and sparse).

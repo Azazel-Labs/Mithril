@@ -33,7 +33,7 @@ cases.
 | PLY | 36 | 32 | 4 |
 | VOX | 24 | 24 | none |
 | OBJ | 45 | 36 | 9 |
-| 3DS | 34 | 34 | none |
+| 3DS | 37 | 37 | none |
 | 3MF | 38 | 38 | none |
 | FBX | 99 | 85 | 14 |
 | USD | 125 | 105 | 20 |
@@ -75,7 +75,9 @@ python tools/corpus/obj.py
   vertex colors and syntax variants: line continuation, `w` components, number forms and
   non-UTF-8 text.
 - **3DS**: smoothing groups, materials (24-bit and float colors, transparency, shininess,
-  self-illumination), textures and two-sided faces. Also truncated and malformed chunks.
+  self-illumination), textures and two-sided faces. Also cameras, point and spot lights, and
+  the keyframer: its hierarchy, pivots, dummies, instances and tracks. Also truncated and
+  malformed chunks.
 - **3MF**: units, build items and components with transforms (including mirrored ones), the
   production extension, and colors from base materials, color groups and gradients.
   Textures, plus the files Bambu and Prusa write. Also packaging variants and broken

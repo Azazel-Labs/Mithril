@@ -1,6 +1,11 @@
 //! Affine transforms as 4x4 matrices (`m[row][col]`, column vectors, as glTF composes), and turning them into a
 //! node's translation, rotation and scale.
 
+#![cfg_attr(
+    not(any(feature = "fbx", feature = "usd")),
+    allow(dead_code, reason = "3DS uses only some of these")
+)]
+
 use serde_json::{Value, json};
 
 pub(super) type M4 = [[f64; 4]; 4];

@@ -2,11 +2,11 @@
 (documented by Jeff Lewis' and Martin van Velsen's 3DS file format notes and by lib3ds): the
 main and editor chunks, objects holding triangle meshes, materials with their color chunks,
 transparency, two-sidedness, self-illumination, shininess and texture maps, smoothing groups as
-bit masks, and the departures real files make (chunk lengths running past the end, cameras and
-lights among the objects, faces naming vertices that don't exist).
+bit masks, cameras and lights, the keyframer's hierarchy and tracks, and the departures real files
+make (chunk lengths running past the end, faces naming vertices that don't exist).
 
-3DS is Z up; the expectations are in glTF's Y up: (x, y, z) becomes (x, z, -y). UVs have their V
-flipped to glTF's top-left origin.
+3DS is Z up; the document keeps it so under a root node that turns it, and the expectations are in
+glTF's Y up: (x, y, z) becomes (x, z, -y). UVs have their V flipped to glTF's top-left origin.
 """
 
 import math
@@ -28,7 +28,10 @@ MAT_SHININESS, MAT_SHIN_STRENGTH, MAT_TRANSPARENCY = 0xA040, 0xA041, 0xA050
 MAT_TWO_SIDE, MAT_SELF_ILPCT, MAT_TEXMAP, MAP_FILE = 0xA081, 0xA084, 0xA200, 0xA300
 COLOR_F, COLOR_24, LIN_COLOR_24, LIN_COLOR_F = 0x0010, 0x0011, 0x0012, 0x0013
 PERCENT_I, PERCENT_F = 0x0030, 0x0031
-KEYFRAMER = 0xB000
+KEYFRAMER, KFHDR, KFSEG, OBJECT_NODE_TAG = 0xB000, 0xB00A, 0xB008, 0xB002
+NODE_HDR, INSTANCE_NAME, PIVOT, NODE_ID = 0xB010, 0xB011, 0xB013, 0xB030
+POS_TRACK, ROT_TRACK, SCL_TRACK = 0xB020, 0xB021, 0xB022
+DL_SPOTLIGHT = 0x4610
 
 
 def chunk(cid, *parts, length=None):
@@ -99,6 +102,32 @@ def model(*editor, before=b"", after=b""):
                        chunk(MASTER_SCALE, f32s([1.0])), *editor), after)
 
 
+def track(cid, keys):
+    """A keyframer track of `keys`, (frame, [values]), with no spline parameters."""
+    body = struct.pack("<HIII", 0, 0, 0, len(keys))
+    for frame, values in keys:
+        body += struct.pack("<IH", frame, 0) + f32s(values)
+    return chunk(cid, body)
+
+
+def node(nid, name, parent=-1, pivot=(0, 0, 0), pos=None, rot=None, scl=None, instance=None):
+    """An object node: `name` is the object it places (or $$$DUMMY), `parent` a node id."""
+    parts = [chunk(NODE_ID, struct.pack("<H", nid)),
+             chunk(NODE_HDR, cstr(name), struct.pack("<HHH", 0, 0, parent & 0xFFFF))]
+    if instance is not None:
+        parts.append(chunk(INSTANCE_NAME, cstr(instance)))
+    parts.append(chunk(PIVOT, f32s(pivot)))
+    for cid, keys in ((POS_TRACK, pos), (ROT_TRACK, rot), (SCL_TRACK, scl)):
+        if keys is not None:
+            parts.append(track(cid, keys))
+    return chunk(OBJECT_NODE_TAG, *parts)
+
+
+def keyframer(*nodes, frames=(0, 30)):
+    return chunk(KEYFRAMER, chunk(KFHDR, struct.pack("<H", 5), cstr("MAXSCENE"), struct.pack("<I", frames[1])),
+                 chunk(KFSEG, struct.pack("<II", *frames)), *nodes)
+
+
 def y_up(p):
     return [p[0], p[2], -p[1]]
 
@@ -135,7 +164,10 @@ FLAT = {**CUBE, "normals_in": AXES, "vertices": 24}
 
 case(FMT, "cube_no_smoothing", {"cube.3ds": model(obj("Cube", trimesh(CUBE_V, CUBE_FACES)))},
      {"spec": SPEC + ": a mesh without smoothing groups shows faceted", "source": SRC, **FLAT,
-      "material_count": 1, "uvs": False})
+      "material_count": 1, "uvs": False,
+      "document": {"nodes": 2, "meshes": 1, "node_names": ["Cube", "RootNode"],
+                   "source": {"format": "3DS", "upAxis": "Z", "version": 3, "meshVersion": 3,
+                              "masterScale": 1.0}}})
 
 case(FMT, "cube_smoothing_zero",
      {"cube.3ds": model(obj("Cube", trimesh(CUBE_V, CUBE_FACES, smoothing=[0] * 12)))},
@@ -178,9 +210,10 @@ case(FMT, "smoothing_chunk_short",
 case(FMT, "two_objects",
      {"two.3ds": model(obj("A", trimesh(CUBE_V, CUBE_FACES)),
                        obj("B", trimesh(moved(CUBE_V, (3, 0, 0)), CUBE_FACES)))},
-     {"spec": SPEC + ": two objects, both kept", "source": SRC, "triangles": 24, "area": 12.0,
+     {"spec": SPEC + ": two objects, a node and mesh each", "source": SRC, "triangles": 24, "area": 12.0,
       "bounds": bounds(CUBE_V + moved(CUBE_V, (3, 0, 0))), "normals_in": AXES,
-      "winding_matches_normals": True})
+      "winding_matches_normals": True,
+      "document": {"nodes": 3, "meshes": 2, "node_names": ["A", "B", "RootNode"]}})
 
 # The vertices are stored already placed in the world; the mesh matrix only records how they
 # got there, so applying it would move them twice.
@@ -194,15 +227,21 @@ case(FMT, "mesh_matrix_not_applied",
 case(FMT, "cameras_and_lights",
      {"scene.3ds": model(obj("Camera01", chunk(CAMERA, f32s([0, -10, 5, 0, 0, 0, 0, 45]))),
                          obj("Light01", chunk(LIGHT, f32s([5, 5, 10]), color24((255, 255, 255)))),
+                         obj("Spot01", chunk(LIGHT, f32s([0, 0, 10]), color24((255, 200, 100)),
+                                             chunk(DL_SPOTLIGHT, f32s([0, 0, 0, 30, 45])))),
                          obj("Cube", trimesh(CUBE_V, CUBE_FACES)))},
-     {"spec": SPEC + ": camera and light objects beside a mesh", "source": SRC, **FLAT})
+     {"spec": SPEC + ": a camera, a point light and a spotlight beside a mesh, as glTF cameras and lights",
+      "source": SRC, **FLAT,
+      "document": {"nodes": 5, "meshes": 1, "cameras": 1, "lights": 2,
+                   "node_names": ["Camera01", "Light01", "Spot01", "Cube"]}})
 
 case(FMT, "unknown_chunks",
      {"cube.3ds": model(chunk(0x1234, b"junk"), obj("Cube", chunk(0x4010), trimesh(CUBE_V, CUBE_FACES)),
                         chunk(0x7777, b"\0" * 9),
                         after=chunk(KEYFRAMER, chunk(0xB00A, struct.pack("<H", 5), cstr("MAXSCENE"))))},
-     {"spec": SPEC + ": chunks this reader doesn't know (keyframer, hidden flag, made-up ids) are skipped",
-      "source": SRC, **FLAT})
+     {"spec": SPEC + ": chunks this reader doesn't know (made-up ids) are skipped; a keyframer of only its header",
+      "source": SRC, **FLAT,
+      "document": {"nodes": 2, "animations": 0, "source": {"keyframer": {"name": "MAXSCENE", "revision": 5}}}})
 
 case(FMT, "face_index_out_of_range",
      {"cube.3ds": model(obj("Cube", trimesh(CUBE_V, CUBE_FACES + [(0, 1, 99)])))},
@@ -222,8 +261,8 @@ case(FMT, "material_shared_by_objects",
      {"two.3ds": model(material("Red", color24(RED)),
                        obj("A", trimesh(CUBE_V, CUBE_FACES, mats=[("Red", list(range(12)))])),
                        obj("B", trimesh(moved(CUBE_V, (2, 0, 0)), CUBE_FACES, mats=[("Red", list(range(12)))])))},
-     {"spec": SPEC + ": two objects in one material make one primitive", "source": SRC, "triangles": 24,
-      "primitives": 1, "material_count": 1, "materials": [{"name": "Red", "color": lin(RED)}]})
+     {"spec": SPEC + ": two objects in one material: a mesh each, sharing the material", "source": SRC,
+      "triangles": 24, "primitives": 2, "document": {"nodes": 3, "meshes": 2}, "material_count": 1, "materials": [{"name": "Red", "color": lin(RED)}]})
 
 case(FMT, "faces_without_material",
      {"cube.3ds": model(material("Red", color24(RED)),
@@ -319,6 +358,47 @@ case(FMT, "uvs_fewer_than_vertices",
      {"quad.3ds": model(obj("Quad", trimesh(QUAD, QUAD_FACES, uvs=QUAD_UV[:2])))},
      {"spec": SPEC + ": a UV list shorter than the vertex list is not used", "source": SRC, "triangles": 2,
       "uvs": False})
+
+# --- the keyframer ---------------------------------------------------------------------------
+
+# Base is placed at (5, 0, 0) and rises 2 over a second; Arm hangs from it, turning a quarter
+# about its pivot (its middle, so the turn doesn't move its bounds) in that time.
+base_v, arm_v = moved(CUBE_V, (5, 0, 0)), moved(CUBE_V, (5, 3, 0))
+case(FMT, "keyframer_hierarchy",
+     {"arm.3ds": model(obj("Base", trimesh(base_v, CUBE_FACES, matrix=[1, 0, 0, 0, 1, 0, 0, 0, 1, 5, 0, 0])),
+                       obj("Arm", trimesh(arm_v, CUBE_FACES, matrix=[1, 0, 0, 0, 1, 0, 0, 0, 1, 5, 3, 0])),
+                       after=keyframer(node(0, "Base", pos=[(0, [5, 0, 0]), (30, [5, 0, 2])]),
+                                       node(1, "Arm", parent=0, pivot=(0.5, 0.5, 0), pos=[(0, [0.5, 3.5, 0])],
+                                            rot=[(0, [0, 0, 0, 1]), (30, [math.pi / 2, 0, 0, 1])])))},
+     {"spec": SPEC + ": the keyframer's object nodes as the hierarchy, their first keys the rest pose and "
+                     "their tracks an animation; meshes moved into their nodes back through mesh matrix and pivot",
+      "source": SRC, "triangles": 24, "area": 12.0, "bounds": bounds(base_v + arm_v),
+      "document": {"nodes": 3, "meshes": 2, "animations": 1, "channels": 2,
+                   "node_names": ["Base", "Arm", "RootNode"],
+                   "source": {"keyframer": {"name": "MAXSCENE", "revision": 5, "length": 30,
+                                            "segment": [0, 30]}}},
+      "poses": [{"animation": 0, "time": 1.0,
+                 "bounds": bounds(moved(base_v, (0, 0, 2)) + moved(arm_v, (0, 0, 2)))}]})
+
+# A dummy groups the cube and an instance of it, one mesh drawn twice.
+case(FMT, "keyframer_instances",
+     {"cubes.3ds": model(obj("Cube", trimesh(CUBE_V, CUBE_FACES)),
+                         after=keyframer(node(0, "$$$DUMMY", instance="Group", pos=[(0, [0, 0, 1])]),
+                                         node(1, "Cube", parent=0, pos=[(0, [0, 0, -1])]),
+                                         node(2, "Cube", parent=0, instance="Cube02", pos=[(0, [3, 0, -1])])))},
+     {"spec": SPEC + ": a dummy node (named by its instance name) and a second node placing the same object",
+      "source": SRC, "triangles": 24, "area": 12.0, "bounds": bounds(CUBE_V + moved(CUBE_V, (3, 0, 0))),
+      "document": {"nodes": 4, "meshes": 1, "animations": 0,
+                   "node_names": ["Group", "Cube", "Cube02", "RootNode"]}})
+
+# A node with no keys sits at the origin, which would move the mesh twice back through its matrix:
+# the editor's placement wins.
+far_v = moved(CUBE_V, (10, 0, 0))
+case(FMT, "keyframer_without_keys",
+     {"cube.3ds": model(obj("Cube", trimesh(far_v, CUBE_FACES, matrix=[1, 0, 0, 0, 1, 0, 0, 0, 1, 10, 0, 0])),
+                        after=keyframer(node(0, "Cube")))},
+     {"spec": SPEC + ": an object node with no keys leaves its mesh where the editor has it",
+      "source": SRC, **CUBE, "bounds": bounds(far_v), "document": {"nodes": 2, "meshes": 1}})
 
 # --- damaged and invalid files ----------------------------------------------------------------
 

@@ -13,12 +13,11 @@ use std::borrow::Cow;
 use std::io;
 use std::path::Path;
 
-use serde_json::{Map, Value, json};
+use serde_json::json;
 
 use crate::Result;
 use crate::assets::Assets;
 use crate::document::{Document, Keep};
-use crate::mesh::Mesh;
 
 #[cfg(feature = "fbx")]
 mod fbx;
@@ -46,7 +45,7 @@ mod threemf;
 mod usd;
 #[cfg(feature = "vox")]
 mod vox;
-#[cfg(any(feature = "fbx", feature = "usd"))]
+#[cfg(any(feature = "fbx", feature = "usd", feature = "3ds"))]
 mod xform;
 
 /// The extensions [`load`] handles, whether or not this build has their feature.
@@ -211,7 +210,7 @@ impl<'a> Input<'a> {
 fn read<'a>(input: Input<'a>, ext: &str, assets: &'a dyn Assets, keep: Keep) -> Result<Document<'a>> {
     let mut doc = convert(input, ext, assets, keep)?;
     doc.prune(keep);
-    if matches!(ext, "gltf" | "glb" | "fbx" | "usd" | "usda" | "usdc" | "usdz") {
+    if matches!(ext, "gltf" | "glb" | "fbx" | "3ds" | "usd" | "usda" | "usdc" | "usdz") {
         let c = doc.counts();
         for (key, n) in [("triangles", c.triangles), ("points", c.points), ("lines", c.lines)] {
             if n > 0 || key == "triangles" {
@@ -220,23 +219,6 @@ fn read<'a>(input: Input<'a>, ext: &str, assets: &'a dyn Assets, keep: Keep) -> 
         }
     }
     Ok(doc)
-}
-
-/// The document for a reader's mesh and facts.
-#[allow(dead_code, reason = "used by the readers this build has")]
-fn of_mesh(mesh: Option<Mesh>, facts: Map<String, Value>) -> Document<'static> {
-    match mesh {
-        Some(m) => Document::from_mesh(m, facts),
-        None => Document::empty(facts),
-    }
-}
-
-/// `mesh` with its triangles counted.
-#[allow(dead_code, reason = "used by the readers this build has")]
-fn counted(mesh: Mesh) -> Document<'static> {
-    let mut facts = Map::new();
-    facts.insert("triangles".into(), json!(mesh.triangles()));
-    Document::from_mesh(mesh, facts)
 }
 
 fn convert<'a>(input: Input<'a>, ext: &str, assets: &'a dyn Assets, keep: Keep) -> Result<Document<'a>> {
@@ -251,11 +233,7 @@ fn convert<'a>(input: Input<'a>, ext: &str, assets: &'a dyn Assets, keep: Keep) 
         #[cfg(feature = "3mf")]
         "3mf" => threemf::load(input),
         #[cfg(feature = "3ds")]
-        "3ds" => {
-            let mut mesh = tds::load(input, assets)?;
-            guess_color_texture(&mut mesh, input.path, assets);
-            Ok(counted(mesh))
-        }
+        "3ds" => tds::load(input, assets, keep),
         #[cfg(feature = "usd")]
         "usd" | "usda" | "usdc" | "usdz" => usd::load(input, assets, keep),
         #[cfg(feature = "obj")]
@@ -293,15 +271,6 @@ fn linear_colors(input: Input<'_>, ext: &str) -> bool {
     }
 }
 
-#[cfg(feature = "3ds")]
-/// [`guess_texture`] for a mesh.
-fn guess_color_texture(mesh: &mut Mesh, path: &Path, assets: &dyn Assets) {
-    let textured: Vec<bool> = (0..mesh.materials.len())
-        .map(|n| mesh.prims.iter().any(|p| p.material == n && !p.uvs.is_empty()))
-        .collect();
-    guess_texture(&mut mesh.materials, &mut mesh.images, &textured, path, assets);
-}
-
 #[cfg(any(feature = "obj", feature = "3ds"))]
 /// A model that names no color texture takes one by name: `Barrel.png` or
 /// `Barrel_Albedo.png` for `Barrel.obj`, from anywhere in the pack, for the `materials` that
@@ -331,8 +300,10 @@ fn guess_texture(
 mod tests {
     use super::*;
     use crate::assets::{Folder, Memory};
+    use crate::mesh::Mesh;
     #[allow(unused_imports)]
     use crate::mesh::{GRAY, to_glb};
+    use serde_json::{Map, Value};
 
     /// Reads `path` with assets found under `root`, as (mesh, facts); and reads it again from
     /// memory, with every file under `root` as a [`Memory`], to check the two agree.

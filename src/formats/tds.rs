@@ -1,43 +1,108 @@
 //! Autodesk 3DS, read here rather than by Blender, whose 3DS importer has been an extension (not shipped) since 4.2.
-//! A 3DS file is nested chunks (`u16` id, `u32` length counting its 6-byte header). The meshes are under the editor
-//! chunk, their vertices already in world space (the mesh matrix only records how they got there); materials have a
-//! diffuse color, a transparency and maybe a texture named by file. Smoothing groups are bit masks: faces sharing a bit
-//! share normals at their common corners. 3DS is Z up; glTF is Y up.
+//! A 3DS file is nested chunks (`u16` id, `u32` length counting its 6-byte header). The editor chunk holds the
+//! objects (triangle meshes, cameras, lights) and the materials; the keyframer chunk beside it holds the hierarchy and
+//! the animation.
+//!
+//! Each object becomes a node and its mesh, with a primitive per material. Mesh vertices are stored in world space
+//! (the mesh matrix only records how they got there), so an object the keyframer doesn't place keeps them as they
+//! are. The keyframer's object nodes become the hierarchy: their first keys are the rest pose and their tracks the
+//! animation, its TCB splines as glTF cubic splines (rotations as linear, between the turns the keys add up to). A
+//! placed mesh is moved into its node's space as lib3ds does (back through the mesh matrix and the pivot), unless that
+//! wouldn't put it back where the editor has it at rest; then the rest pose decides. Materials have a diffuse color, a
+//! transparency and maybe a texture named by file; every value they hold, maps included, is kept in `extras`.
+//! Smoothing groups are bit masks: faces sharing a bit share normals at their common corners. 3DS is Z up; the data
+//! stays so under a root node that turns it to glTF's Y up.
 
 use std::collections::HashMap;
 
-use crate::Result;
+use serde_json::{Map, Value, json};
 
+use super::xform::{self, IDENTITY, M4};
+use crate::Result;
 use crate::assets::Assets;
-use crate::mesh::{FastMap, GRAY, Image, MAX_TRIANGLES, Material, Mesh, Prim, face_normal};
+use crate::document::{Builder, Document, Keep};
+use crate::mesh::{FastMap, GRAY, Image, MAX_TRIANGLES, Material, Prim, face_normal, srgb_to_linear};
 use crate::num::u32_of;
 
 const MAIN: u16 = 0x4D4D;
 /// A 3D Studio project file, which holds the same editor chunk.
 const PROJECT: u16 = 0xC23D;
+const VERSION: u16 = 0x0002;
+const MASTER_SCALE: u16 = 0x0100;
+const AMBIENT_LIGHT: u16 = 0x2100;
 const EDITOR: u16 = 0x3D3D;
+const MESH_VERSION: u16 = 0x3D3E;
 const OBJECT: u16 = 0x4000;
+const OBJ_HIDDEN: u16 = 0x4010;
 const TRIMESH: u16 = 0x4100;
 const VERTICES: u16 = 0x4110;
 const FACES: u16 = 0x4120;
 const FACE_MATERIAL: u16 = 0x4130;
 const UVS: u16 = 0x4140;
 const SMOOTHING: u16 = 0x4150;
+const MESH_MATRIX: u16 = 0x4160;
+const LIGHT: u16 = 0x4600;
+const DL_SPOTLIGHT: u16 = 0x4610;
+const DL_OFF: u16 = 0x4620;
+const DL_ATTENUATE: u16 = 0x4625;
+const DL_INNER_RANGE: u16 = 0x4659;
+const DL_OUTER_RANGE: u16 = 0x465A;
+const DL_MULTIPLIER: u16 = 0x465B;
+const CAMERA: u16 = 0x4700;
+const CAM_RANGES: u16 = 0x4720;
 const MATERIAL: u16 = 0xAFFF;
 const MAT_NAME: u16 = 0xA000;
+const MAT_AMBIENT: u16 = 0xA010;
 const MAT_DIFFUSE: u16 = 0xA020;
+const MAT_SPECULAR: u16 = 0xA030;
 const MAT_SHININESS: u16 = 0xA040;
+const MAT_SHIN_STRENGTH: u16 = 0xA041;
 const MAT_TRANSPARENCY: u16 = 0xA050;
+const MAT_XPFALL: u16 = 0xA052;
+const MAT_REFBLUR: u16 = 0xA053;
 const MAT_TWO_SIDE: u16 = 0xA081;
+const MAT_ADDITIVE: u16 = 0xA083;
 const MAT_SELF_ILPCT: u16 = 0xA084;
+const MAT_WIRE: u16 = 0xA085;
+const MAT_WIRESIZE: u16 = 0xA087;
+const MAT_SHADING: u16 = 0xA100;
 const MAT_TEXTURE: u16 = 0xA200;
+const MAT_SPECMAP: u16 = 0xA204;
+const MAT_OPACMAP: u16 = 0xA210;
+const MAT_REFLMAP: u16 = 0xA220;
+const MAT_BUMPMAP: u16 = 0xA230;
+const MAT_TEXTURE2: u16 = 0xA33A;
+const MAT_SHINMAP: u16 = 0xA33C;
+const MAT_SELFIMAP: u16 = 0xA33D;
 const MAP_FILE: u16 = 0xA300;
+const MAP_TILING: u16 = 0xA351;
+const MAP_BLUR: u16 = 0xA353;
+const MAP_USCALE: u16 = 0xA354;
+const MAP_VSCALE: u16 = 0xA356;
+const MAP_UOFFSET: u16 = 0xA358;
+const MAP_VOFFSET: u16 = 0xA35A;
+const MAP_ANGLE: u16 = 0xA35C;
 const COLOR_F32: u16 = 0x0010;
 const COLOR_U8: u16 = 0x0011;
 const COLOR_U8_GAMMA: u16 = 0x0012;
 const COLOR_F32_GAMMA: u16 = 0x0013;
 const PERCENT_U16: u16 = 0x0030;
 const PERCENT_F32: u16 = 0x0031;
+const KEYFRAMER: u16 = 0xB000;
+const OBJECT_NODE_TAG: u16 = 0xB002;
+const KF_SEGMENT: u16 = 0xB008;
+const KF_HEADER: u16 = 0xB00A;
+const NODE_HDR: u16 = 0xB010;
+const INSTANCE_NAME: u16 = 0xB011;
+const PIVOT: u16 = 0xB013;
+const POS_TRACK: u16 = 0xB020;
+const ROT_TRACK: u16 = 0xB021;
+const SCL_TRACK: u16 = 0xB022;
+const NODE_ID: u16 = 0xB030;
+
+/// The keyframer counts frames; 3D Studio and 3ds Max play them at 30 a second unless told otherwise, which the file
+/// doesn't record.
+const FRAMES_PER_SECOND: f32 = 30.0;
 
 /// The chunks in `data`, as (id, body). A chunk claiming more than is left (a wrong length, a cut-off file) gets
 /// what is left; the readers below take only whole records from it.
@@ -59,8 +124,16 @@ fn u16_at(d: &[u8], i: usize) -> Option<u16> {
     Some(u16::from_le_bytes(d.get(i..i + 2)?.try_into().ok()?))
 }
 
+fn u32_at(d: &[u8], i: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(d.get(i..i + 4)?.try_into().ok()?))
+}
+
 fn f32_at(d: &[u8], i: usize) -> Option<f32> {
     Some(f32::from_le_bytes(d.get(i..i + 4)?.try_into().ok()?))
+}
+
+fn vec3_at(d: &[u8], i: usize) -> Option<[f32; 3]> {
+    Some([f32_at(d, i)?, f32_at(d, i + 4)?, f32_at(d, i + 8)?])
 }
 
 /// A zero-terminated name and what follows it.
@@ -72,36 +145,73 @@ fn cstr(d: &[u8]) -> (String, &[u8]) {
     )
 }
 
-/// A color chunk's value as linear RGB. Every form holds the color picker's values, which are sRGB. 3D Studio R3
-/// added "linear" twins (0x0012, 0x0013) that 3ds Max writes beside the plain ones, normally equal; the plain one is
-/// the color shown, so it wins.
-fn color(d: &[u8]) -> Option<[f32; 3]> {
-    let mut best: Option<(u8, [f32; 3])> = None;
-    for (id, b) in chunks(d) {
-        let (rank, c) = match id {
-            COLOR_U8 | COLOR_U8_GAMMA if b.len() >= 3 => (
-                u8::from(id != COLOR_U8) * 2,
-                [b[0], b[1], b[2]].map(|v| f32::from(v) / 255.0),
-            ),
-            COLOR_F32 | COLOR_F32_GAMMA => (
-                1 + u8::from(id != COLOR_F32) * 2,
-                [f32_at(b, 0)?, f32_at(b, 4)?, f32_at(b, 8)?],
-            ),
-            _ => continue,
-        };
-        if best.is_none_or(|(r, _)| rank < r) {
-            best = Some((rank, c));
-        }
+/// An `f32` as the decimal it was written as (0.1, not 0.10000000149011612); null when it isn't a number.
+fn clean(x: f32) -> Value {
+    if x.is_finite() {
+        json!(x.to_string().parse::<f64>().unwrap_or(0.0))
+    } else {
+        Value::Null
     }
-    best.map(|(_, c)| c.map(|v| crate::mesh::srgb_to_linear(v.clamp(0.0, 1.0))))
+}
+
+fn cleans(xs: &[f32]) -> Value {
+    Value::Array(xs.iter().map(|&x| clean(x)).collect())
+}
+
+/// The color chunk shown, of those in `d`. Every form holds the color picker's values, which are sRGB. 3D Studio R3
+/// added "linear" twins (0x0012, 0x0013) that 3ds Max writes beside the plain ones, normally equal; the plain one is
+/// the color shown, so it wins, and 8-bit wins over float.
+fn color_chunk(d: &[u8]) -> Option<(u16, &[u8])> {
+    let rank = |id| match id {
+        COLOR_U8 => 0,
+        COLOR_F32 => 1,
+        COLOR_U8_GAMMA => 2,
+        _ => 3,
+    };
+    chunks(d)
+        .filter(|&(id, b)| match id {
+            COLOR_U8 | COLOR_U8_GAMMA => b.len() >= 3,
+            COLOR_F32 | COLOR_F32_GAMMA => b.len() >= 12,
+            _ => false,
+        })
+        .min_by_key(|&(id, _)| rank(id))
+}
+
+fn rgb(id: u16, b: &[u8]) -> [f32; 3] {
+    match id {
+        COLOR_U8 | COLOR_U8_GAMMA => [b[0], b[1], b[2]].map(|v| f32::from(v) / 255.0),
+        _ => vec3_at(b, 0).unwrap_or_default(),
+    }
+}
+
+/// The color shown, as linear RGB.
+fn color(d: &[u8]) -> Option<[f32; 3]> {
+    color_chunk(d).map(|(id, b)| rgb(id, b).map(|v| srgb_to_linear(v.clamp(0.0, 1.0))))
+}
+
+/// The color shown, as written: 0 to 255, or 0 to 1 for a float chunk.
+fn color_raw(d: &[u8]) -> Option<Value> {
+    color_chunk(d).map(|(id, b)| match id {
+        COLOR_U8 | COLOR_U8_GAMMA => json!([b[0], b[1], b[2]]),
+        _ => cleans(&rgb(id, b)),
+    })
+}
+
+/// A percent chunk among `d`, as written (0 to 100).
+fn percent_raw(d: &[u8]) -> Option<f32> {
+    chunks(d).find_map(|(id, b)| percent_of(id, b))
+}
+
+fn percent_of(id: u16, b: &[u8]) -> Option<f32> {
+    match id {
+        PERCENT_U16 => u16_at(b, 0).map(f32::from),
+        PERCENT_F32 => f32_at(b, 0).filter(|v| v.is_finite()),
+        _ => None,
+    }
 }
 
 fn percent(d: &[u8]) -> Option<f32> {
-    chunks(d).find_map(|(id, b)| match id {
-        PERCENT_U16 => u16_at(b, 0).map(|v| f32::from(v) / 100.0),
-        PERCENT_F32 => f32_at(b, 0).map(|v| v / 100.0),
-        _ => None,
-    })
+    percent_raw(d).map(|p| p / 100.0)
 }
 
 struct Mat {
@@ -112,6 +222,8 @@ struct Mat {
     glossiness: Option<f32>,
     self_illum: f32,
     two_sided: bool,
+    /// Every value the material chunk holds, by name, as written.
+    raw: Map<String, Value>,
 }
 
 fn material(d: &[u8]) -> Mat {
@@ -123,25 +235,113 @@ fn material(d: &[u8]) -> Mat {
         glossiness: None,
         self_illum: 0.0,
         two_sided: false,
+        raw: Map::new(),
     };
+    let mut maps = Map::new();
     for (id, b) in chunks(d) {
-        match id {
-            MAT_NAME => m.name = cstr(b).0,
-            MAT_DIFFUSE => m.color = color(b).unwrap_or(m.color),
-            MAT_TRANSPARENCY => m.alpha = 1.0 - percent(b).unwrap_or(0.0).clamp(0.0, 1.0),
-            MAT_SHININESS => m.glossiness = percent(b).map(|p| p.clamp(0.0, 1.0)),
-            MAT_SELF_ILPCT => m.self_illum = percent(b).unwrap_or(0.0).clamp(0.0, 1.0),
-            MAT_TWO_SIDE => m.two_sided = true,
-            MAT_TEXTURE => {
-                m.texture = chunks(b)
-                    .find(|&(id, _)| id == MAP_FILE)
-                    .map(|(_, f)| cstr(f).0)
-                    .filter(|f| !f.is_empty());
+        let (key, value) = match id {
+            MAT_NAME => {
+                m.name = cstr(b).0;
+                continue;
             }
-            _ => {}
+            MAT_AMBIENT | MAT_DIFFUSE | MAT_SPECULAR => {
+                if id == MAT_DIFFUSE {
+                    m.color = color(b).unwrap_or(m.color);
+                }
+                let key = match id {
+                    MAT_AMBIENT => "ambient",
+                    MAT_DIFFUSE => "diffuse",
+                    _ => "specular",
+                };
+                (key, color_raw(b))
+            }
+            MAT_SHININESS | MAT_SHIN_STRENGTH | MAT_TRANSPARENCY | MAT_XPFALL | MAT_REFBLUR | MAT_SELF_ILPCT => {
+                let p = percent(b).map(|p| p.clamp(0.0, 1.0));
+                let key = match id {
+                    MAT_SHININESS => {
+                        m.glossiness = p;
+                        "shininess"
+                    }
+                    MAT_TRANSPARENCY => {
+                        m.alpha = 1.0 - p.unwrap_or(0.0);
+                        "transparency"
+                    }
+                    MAT_SELF_ILPCT => {
+                        m.self_illum = p.unwrap_or(0.0);
+                        "selfIllumination"
+                    }
+                    MAT_SHIN_STRENGTH => "shininessStrength",
+                    MAT_XPFALL => "transparencyFalloff",
+                    _ => "reflectionBlur",
+                };
+                (key, percent_raw(b).map(clean))
+            }
+            MAT_TWO_SIDE => {
+                m.two_sided = true;
+                ("twoSided", Some(json!(true)))
+            }
+            MAT_ADDITIVE => ("additive", Some(json!(true))),
+            MAT_WIRE => ("wire", Some(json!(true))),
+            MAT_WIRESIZE => ("wireSize", f32_at(b, 0).map(clean)),
+            MAT_SHADING => ("shading", u16_at(b, 0).map(|s| json!(s))),
+            MAT_TEXTURE | MAT_TEXTURE2 | MAT_SPECMAP | MAT_OPACMAP | MAT_REFLMAP | MAT_BUMPMAP | MAT_SHINMAP
+            | MAT_SELFIMAP => {
+                let (file, map) = texture_map(b);
+                if id == MAT_TEXTURE {
+                    m.texture = file;
+                }
+                let key = match id {
+                    MAT_TEXTURE => "texture",
+                    MAT_TEXTURE2 => "texture2",
+                    MAT_SPECMAP => "specular",
+                    MAT_OPACMAP => "opacity",
+                    MAT_REFLMAP => "reflection",
+                    MAT_BUMPMAP => "bump",
+                    MAT_SHINMAP => "shininess",
+                    _ => "selfIllumination",
+                };
+                maps.insert(key.into(), Value::Object(map));
+                continue;
+            }
+            _ => continue,
+        };
+        if let Some(v) = value {
+            m.raw.insert(key.into(), v);
         }
     }
+    if !maps.is_empty() {
+        m.raw.insert("maps".into(), Value::Object(maps));
+    }
     m
+}
+
+/// A texture map's file and every value it holds.
+fn texture_map(d: &[u8]) -> (Option<String>, Map<String, Value>) {
+    let mut file = None;
+    let mut out = Map::new();
+    for (id, b) in chunks(d) {
+        let (key, value) = match id {
+            MAP_FILE => {
+                let f = cstr(b).0;
+                let v = json!(f);
+                file = Some(f).filter(|f| !f.is_empty());
+                ("file", Some(v))
+            }
+            PERCENT_U16 | PERCENT_F32 => ("percent", percent_of(id, b).map(clean)),
+            MAP_TILING => ("tiling", u16_at(b, 0).map(|t| json!(t))),
+            MAP_BLUR => ("blur", f32_at(b, 0).map(clean)),
+            MAP_USCALE => ("uScale", f32_at(b, 0).map(clean)),
+            MAP_VSCALE => ("vScale", f32_at(b, 0).map(clean)),
+            MAP_UOFFSET => ("uOffset", f32_at(b, 0).map(clean)),
+            MAP_VOFFSET => ("vOffset", f32_at(b, 0).map(clean)),
+            MAP_ANGLE => ("rotation", f32_at(b, 0).map(clean)),
+            _ => continue,
+        };
+        if let Some(v) = value {
+            out.insert(key.into(), v);
+        }
+    }
+    (file, out)
 }
 
 #[derive(Default)]
@@ -152,6 +352,8 @@ struct Trimesh {
     smoothing: Vec<u32>,
     /// Material name → its faces.
     materials: Vec<(String, Vec<u16>)>,
+    /// The mesh matrix as written: the X, Y and Z axes, then the origin.
+    matrix: Option<[f32; 12]>,
 }
 
 fn trimesh(d: &[u8]) -> Trimesh {
@@ -160,15 +362,17 @@ fn trimesh(d: &[u8]) -> Trimesh {
         match id {
             VERTICES => {
                 let n = u16_at(b, 0).unwrap_or(0) as usize;
-                t.vertices = (0..n)
-                    .map_while(|i| Some([f32_at(b, 2 + i * 12)?, f32_at(b, 6 + i * 12)?, f32_at(b, 10 + i * 12)?]))
-                    .collect();
+                t.vertices = (0..n).map_while(|i| vec3_at(b, 2 + i * 12)).collect();
             }
             UVS => {
                 let n = u16_at(b, 0).unwrap_or(0) as usize;
                 t.uvs = (0..n)
                     .map_while(|i| Some([f32_at(b, 2 + i * 8)?, f32_at(b, 6 + i * 8)?]))
                     .collect();
+            }
+            MESH_MATRIX => {
+                let m: Option<Vec<f32>> = (0..12).map(|i| f32_at(b, i * 4)).collect();
+                t.matrix = m.and_then(|m| m.try_into().ok());
             }
             FACES => {
                 let n = u16_at(b, 0).unwrap_or(0) as usize;
@@ -205,53 +409,646 @@ fn trimesh(d: &[u8]) -> Trimesh {
     t
 }
 
-/// Z up to Y up.
-fn y_up(p: [f32; 3]) -> [f32; 3] {
-    [p[0], p[2], -p[1]]
+/// A mesh matrix as a transform.
+fn mesh_matrix(m: &[f32; 12]) -> M4 {
+    let mut r = IDENTITY;
+    for (col, axis) in m.chunks_exact(3).enumerate() {
+        for (row, &v) in axis.iter().enumerate() {
+            r[row][col] = f64::from(v);
+        }
+    }
+    r
 }
 
-pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets) -> Result<Mesh> {
+struct Camera {
+    position: [f32; 3],
+    target: [f32; 3],
+    /// Degrees about the line of sight.
+    roll: f32,
+    /// The focal length in millimetres, on 35 mm film.
+    lens: f32,
+    /// Near and far.
+    range: Option<[f32; 2]>,
+}
+
+fn camera(d: &[u8]) -> Option<Camera> {
+    let mut c = Camera {
+        position: vec3_at(d, 0)?,
+        target: vec3_at(d, 12)?,
+        roll: f32_at(d, 24)?,
+        lens: f32_at(d, 28)?,
+        range: None,
+    };
+    for (id, b) in chunks(d.get(32..).unwrap_or_default()) {
+        if id == CAM_RANGES {
+            c.range = Some([f32_at(b, 0)?, f32_at(b, 4)?]);
+        }
+    }
+    Some(c)
+}
+
+struct Spot {
+    target: [f32; 3],
+    /// The full cone angles in degrees: full brightness inside the hotspot, none past the falloff.
+    hotspot: f32,
+    falloff: f32,
+}
+
+struct Light {
+    position: [f32; 3],
+    color: Option<([f32; 3], Value)>,
+    spot: Option<Spot>,
+    off: bool,
+    multiplier: Option<f32>,
+    attenuate: bool,
+    inner: Option<f32>,
+    outer: Option<f32>,
+}
+
+fn light(d: &[u8]) -> Option<Light> {
+    let rest = d.get(12..).unwrap_or_default();
+    let mut l = Light {
+        position: vec3_at(d, 0)?,
+        color: color(rest).zip(color_raw(rest)),
+        spot: None,
+        off: false,
+        multiplier: None,
+        attenuate: false,
+        inner: None,
+        outer: None,
+    };
+    for (id, b) in chunks(rest) {
+        match id {
+            DL_SPOTLIGHT => {
+                l.spot = Some(Spot {
+                    target: vec3_at(b, 0)?,
+                    hotspot: f32_at(b, 12)?,
+                    falloff: f32_at(b, 16)?,
+                });
+            }
+            DL_OFF => l.off = true,
+            DL_ATTENUATE => l.attenuate = true,
+            DL_MULTIPLIER => l.multiplier = f32_at(b, 0),
+            DL_INNER_RANGE => l.inner = f32_at(b, 0),
+            DL_OUTER_RANGE => l.outer = f32_at(b, 0),
+            _ => {}
+        }
+    }
+    Some(l)
+}
+
+enum Body {
+    Mesh(Vec<Trimesh>),
+    Camera(Camera),
+    Light(Light),
+    Empty,
+}
+
+struct Object {
+    name: String,
+    hidden: bool,
+    body: Body,
+}
+
+fn object(d: &[u8]) -> Object {
+    let (name, rest) = cstr(d);
+    let (mut trimeshes, mut cam, mut lamp, mut hidden) = (Vec::new(), None, None, false);
+    for (id, b) in chunks(rest) {
+        match id {
+            TRIMESH => trimeshes.push(trimesh(b)),
+            CAMERA => cam = cam.or_else(|| camera(b)),
+            LIGHT => lamp = lamp.or_else(|| light(b)),
+            OBJ_HIDDEN => hidden = true,
+            _ => {}
+        }
+    }
+    let body = if !trimeshes.is_empty() {
+        Body::Mesh(trimeshes)
+    } else if let Some(c) = cam {
+        Body::Camera(c)
+    } else if let Some(l) = lamp {
+        Body::Light(l)
+    } else {
+        Body::Empty
+    };
+    Object { name, hidden, body }
+}
+
+/// A key: its frame, its tension, continuity, bias, ease to and ease from, and its value.
+struct Key<const N: usize> {
+    frame: i32,
+    tcb: [f32; 5],
+    value: [f32; N],
+}
+
+/// A track's keys: after the flags and two unused words, the key count, then each key's frame, the flags saying
+/// which spline parameters follow, those parameters, and its value.
+fn track<const N: usize>(b: &[u8]) -> Vec<Key<N>> {
+    let n = u32_at(b, 10).unwrap_or(0);
+    let mut keys = Vec::new();
+    let mut o = 14;
+    for _ in 0..n {
+        let (Some(frame), Some(flags)) = (u32_at(b, o), u16_at(b, o + 4)) else {
+            break;
+        };
+        o += 6;
+        let mut tcb = [0.0; 5];
+        for (bit, t) in tcb.iter_mut().enumerate() {
+            if flags & (1 << bit) != 0 {
+                let Some(v) = f32_at(b, o) else { return keys };
+                *t = v;
+                o += 4;
+            }
+        }
+        let mut value = [0.0; N];
+        for v in &mut value {
+            let Some(x) = f32_at(b, o) else { return keys };
+            *v = x;
+            o += 4;
+        }
+        #[allow(clippy::cast_possible_wrap, reason = "frames are signed in the file")]
+        let frame = frame as i32;
+        keys.push(Key { frame, tcb, value });
+    }
+    keys
+}
+
+/// An object node of the keyframer: the hierarchy's piece of an object, or of a dummy (`$$$DUMMY`).
+struct KfNode {
+    id: u16,
+    name: String,
+    instance: String,
+    parent: Option<u16>,
+    pivot: [f32; 3],
+    pos: Vec<Key<3>>,
+    /// Angle (radians) and axis.
+    rot: Vec<Key<4>>,
+    scl: Vec<Key<3>>,
+}
+
+#[derive(Default)]
+struct Keyframer {
+    name: String,
+    revision: Option<u16>,
+    length: Option<u32>,
+    segment: Option<[u32; 2]>,
+    nodes: Vec<KfNode>,
+}
+
+fn keyframer(d: &[u8]) -> Keyframer {
+    let mut k = Keyframer::default();
+    for (id, b) in chunks(d) {
+        match id {
+            KF_HEADER => {
+                k.revision = u16_at(b, 0);
+                let (name, rest) = cstr(b.get(2..).unwrap_or_default());
+                k.name = name;
+                k.length = u32_at(rest, 0);
+            }
+            KF_SEGMENT => k.segment = u32_at(b, 0).zip(u32_at(b, 4)).map(|(s, e)| [s, e]),
+            OBJECT_NODE_TAG => {
+                let index = u16::try_from(k.nodes.len()).unwrap_or(u16::MAX);
+                k.nodes.push(kf_node(b, index));
+            }
+            _ => {}
+        }
+    }
+    k
+}
+
+/// A node, its id the order it came in when it has no id chunk (as early files have).
+fn kf_node(d: &[u8], index: u16) -> KfNode {
+    let mut n = KfNode {
+        id: index,
+        name: String::new(),
+        instance: String::new(),
+        parent: None,
+        pivot: [0.0; 3],
+        pos: Vec::new(),
+        rot: Vec::new(),
+        scl: Vec::new(),
+    };
+    for (id, b) in chunks(d) {
+        match id {
+            NODE_ID => n.id = u16_at(b, 0).unwrap_or(index),
+            NODE_HDR => {
+                let (name, rest) = cstr(b);
+                n.name = name;
+                n.parent = u16_at(rest, 4).filter(|&p| p != u16::MAX);
+            }
+            INSTANCE_NAME => n.instance = cstr(b).0,
+            PIVOT => n.pivot = vec3_at(b, 0).unwrap_or_default(),
+            POS_TRACK => n.pos = track(b),
+            ROT_TRACK => n.rot = track(b),
+            SCL_TRACK => n.scl = track(b),
+            _ => {}
+        }
+    }
+    n
+}
+
+fn qmul(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
+    [
+        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+    ]
+}
+
+/// A rotation key's turn. 3DS turns clockwise about the axis, as lib3ds reads it.
+fn axis_angle(k: &Key<4>) -> [f64; 4] {
+    let [angle, x, y, z] = k.value.map(f64::from);
+    let l = (x * x + y * y + z * z).sqrt();
+    if !angle.is_finite() || l.is_nan() || l < 1e-12 {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    let half = -0.5 * angle;
+    let s = half.sin() / l;
+    [x * s, y * s, z * s, half.cos()]
+}
+
+/// The rotation at each key: each key turns further from the one before.
+fn rotations(keys: &[Key<4>]) -> Vec<[f64; 4]> {
+    let mut q = [0.0, 0.0, 0.0, 1.0];
+    keys.iter()
+        .map(|k| {
+            q = qmul(axis_angle(k), q);
+            let n = q.iter().map(|c| c * c).sum::<f64>().sqrt();
+            q = q.map(|c| c / n);
+            q
+        })
+        .collect()
+}
+
+fn trs(t: [f64; 3], q: [f64; 4], s: [f64; 3]) -> M4 {
+    let [x, y, z, w] = q;
+    let r = [
+        [
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - w * z),
+            2.0 * (x * z + w * y),
+        ],
+        [
+            2.0 * (x * y + w * z),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - w * x),
+        ],
+        [
+            2.0 * (x * z - w * y),
+            2.0 * (y * z + w * x),
+            1.0 - 2.0 * (x * x + y * y),
+        ],
+    ];
+    let mut m = IDENTITY;
+    for i in 0..3 {
+        for j in 0..3 {
+            m[i][j] = r[i][j] * s[j];
+        }
+        m[i][3] = t[i];
+    }
+    m
+}
+
+/// A node's rest pose, from its first keys: translation, rotation, scale.
+fn rest(n: &KfNode) -> ([f64; 3], [f64; 4], [f64; 3]) {
+    let t = n.pos.first().map_or([0.0; 3], |k| k.value.map(f64::from));
+    let q = rotations(&n.rot[..n.rot.len().min(1)])
+        .first()
+        .copied()
+        .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+    let s = n.scl.first().map_or([1.0; 3], |k| k.value.map(f64::from));
+    (t, q, s)
+}
+
+fn near_identity(m: &M4, scale: f64) -> bool {
+    (0..3).all(|i| (0..3).all(|j| (m[i][j] - IDENTITY[i][j]).abs() < 1e-3) && m[i][3].abs() < 1e-3 * scale.max(1.0))
+}
+
+/// `prims` moved by `m`, their normals turned with them.
+fn placed(mut prims: Vec<Prim>, m: &M4) -> Vec<Prim> {
+    #[allow(clippy::float_cmp, reason = "only the exact identity moves nothing")]
+    if *m == IDENTITY {
+        return prims;
+    }
+    // The cofactor matrix turns normals (the inverse transpose, up to scale).
+    let c: [[f64; 3]; 3] = std::array::from_fn(|i| {
+        std::array::from_fn(|j| {
+            let (i1, i2, j1, j2) = ((i + 1) % 3, (i + 2) % 3, (j + 1) % 3, (j + 2) % 3);
+            m[i1][j1] * m[i2][j2] - m[i1][j2] * m[i2][j1]
+        })
+    });
+    #[allow(clippy::cast_possible_truncation, reason = "back to the f32 the file had")]
+    for p in &mut prims {
+        for v in &mut p.positions {
+            let x = v.map(f64::from);
+            *v = std::array::from_fn(|i| (m[i][0] * x[0] + m[i][1] * x[1] + m[i][2] * x[2] + m[i][3]) as f32);
+        }
+        for n in &mut p.normals {
+            let x = n.map(f64::from);
+            let r: [f64; 3] = std::array::from_fn(|i| c[i][0] * x[0] + c[i][1] * x[1] + c[i][2] * x[2]);
+            let len = r.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if len > 0.0 {
+                *n = r.map(|v| (v / len) as f32);
+            }
+        }
+    }
+    prims
+}
+
+/// The rotation that points a camera or spotlight (which look down their -Z, Y up) from `from` at `to`, Z up,
+/// turned `roll` degrees about that line.
+fn look_at(from: [f32; 3], to: [f32; 3], roll: f32) -> Option<[f64; 4]> {
+    let norm = |v: [f64; 3]| {
+        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        (l > 1e-12).then(|| v.map(|c| c / l))
+    };
+    let cross = |a: [f64; 3], b: [f64; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let f = norm(std::array::from_fn(|i| f64::from(to[i]) - f64::from(from[i])))?;
+    let up = if f[2].abs() > 0.999 {
+        [0.0, 1.0, 0.0]
+    } else {
+        [0.0, 0.0, 1.0]
+    };
+    let r = norm(cross(f, up))?;
+    let u = cross(r, f);
+    let (s, c) = f64::from(roll).to_radians().sin_cos();
+    let (r, u): ([f64; 3], [f64; 3]) = (
+        std::array::from_fn(|i| r[i] * c + u[i] * s),
+        std::array::from_fn(|i| u[i] * c - r[i] * s),
+    );
+    Some(xform::quaternion(&std::array::from_fn(|i| [r[i], u[i], -f[i]])))
+}
+
+fn camera_json(c: &Camera, name: &str, extras: bool) -> Value {
+    // 3D Studio's lens is on 35 mm film, 36 mm wide; at its 4:3 frame that is 27 mm high.
+    let lens = if c.lens.is_finite() && c.lens > 0.0 {
+        f64::from(c.lens)
+    } else {
+        43.456
+    };
+    let yfov = 2.0 * (13.5 / lens).atan();
+    let mut p = json!({ "yfov": yfov, "aspectRatio": 4.0 / 3.0, "znear": 0.01 });
+    if let Some([near, far]) = c.range {
+        if near.is_finite() && near > 0.0 {
+            p["znear"] = clean(near);
+        }
+        if far.is_finite() && far > near.max(0.0) {
+            p["zfar"] = clean(far);
+        }
+    }
+    let mut out = json!({ "name": name, "type": "perspective", "perspective": p });
+    if extras {
+        out["extras"] = json!({ "lens": clean(c.lens), "roll": clean(c.roll), "target": cleans(&c.target) });
+    }
+    out
+}
+
+fn light_json(l: &Light, name: &str, extras: bool) -> Value {
+    let rgb = l.color.as_ref().map_or([1.0; 3], |(c, _)| *c);
+    let mut out = json!({ "name": name, "type": "point", "color": rgb, "intensity": l.multiplier.map_or(1.0, |m| f64::from(m.max(0.0))) });
+    if l.attenuate
+        && let Some(r) = l.outer.filter(|r| r.is_finite() && *r > 0.0)
+    {
+        out["range"] = clean(r);
+    }
+    if let Some(s) = &l.spot {
+        let half = std::f64::consts::FRAC_PI_2;
+        let outer = (f64::from(s.falloff).to_radians() / 2.0).clamp(1e-4, half);
+        let inner = (f64::from(s.hotspot).to_radians() / 2.0).clamp(0.0, outer * 0.999);
+        out["type"] = json!("spot");
+        out["spot"] = json!({ "innerConeAngle": inner, "outerConeAngle": outer });
+    }
+    if extras {
+        let mut e = Map::new();
+        if let Some((_, raw)) = &l.color {
+            e.insert("color".into(), raw.clone());
+        }
+        if l.off {
+            e.insert("off".into(), json!(true));
+        }
+        if l.attenuate {
+            e.insert("attenuate".into(), json!(true));
+        }
+        for (k, v) in [("innerRange", l.inner), ("outerRange", l.outer)] {
+            if let Some(v) = v {
+                e.insert(k.into(), clean(v));
+            }
+        }
+        if let Some(s) = &l.spot {
+            e.insert(
+                "spot".into(),
+                json!({ "target": cleans(&s.target), "hotspot": clean(s.hotspot), "falloff": clean(s.falloff) }),
+            );
+        }
+        if !e.is_empty() {
+            out["extras"] = Value::Object(e);
+        }
+    }
+    out
+}
+
+/// A Kochanek–Bartels track's tangents at each key as lib3ds works them out (spacing and continuity adjusted): the
+/// one arriving and the one leaving, per segment.
+fn tcb_tangents<const N: usize>(keys: &[&Key<N>]) -> Vec<([f32; N], [f32; N])> {
+    #[allow(clippy::cast_precision_loss, reason = "frame numbers are small")]
+    let frame = |k: &Key<N>| k.frame as f32;
+    (0..keys.len())
+        .map(|i| {
+            let c = keys[i];
+            let prev = i.checked_sub(1).map(|p| keys[p]);
+            let next = keys.get(i + 1).copied();
+            let [tens, cont, bias, ..] = c.tcb;
+            let (mut fp, mut fnx) = (1.0, 1.0);
+            if let (Some(p), Some(n)) = (prev, next) {
+                let dt = 0.5 * (frame(n) - frame(p));
+                fp = (frame(c) - frame(p)) / dt;
+                fnx = (frame(n) - frame(c)) / dt;
+                let a = cont.abs();
+                fp = fp + a - a * fp;
+                fnx = fnx + a - a * fnx;
+            }
+            let (cm, tm, bm) = (1.0 - cont, 0.5 * (1.0 - tens), 1.0 - bias);
+            let (cp, bp) = (2.0 - cm, 2.0 - bm);
+            let (ksm, ksp, kdm, kdp) = (
+                tm * cm * bp * fp,
+                tm * cp * bm * fp,
+                tm * cp * bp * fnx,
+                tm * cm * bm * fnx,
+            );
+            let delta = |a: &Key<N>, b: &Key<N>| -> [f32; N] { std::array::from_fn(|k| b.value[k] - a.value[k]) };
+            let dm = prev.map(|p| delta(p, c));
+            let dp = next.map(|n| delta(c, n));
+            let (dm, dp) = match (dm, dp) {
+                (Some(m), Some(p)) => (m, p),
+                (Some(m), None) => (m, m),
+                (None, Some(p)) => (p, p),
+                (None, None) => ([0.0; N], [0.0; N]),
+            };
+            (
+                std::array::from_fn(|k| ksm * dm[k] + ksp * dp[k]),
+                std::array::from_fn(|k| kdm * dm[k] + kdp * dp[k]),
+            )
+        })
+        .collect()
+}
+
+/// The keys of a track whose frames go up, in order (glTF needs times that only increase).
+fn rising<T>(frames: impl Iterator<Item = (i32, T)>) -> Vec<T> {
+    let mut last = None;
+    frames
+        .filter(|&(f, _)| {
+            let up = last.is_none_or(|l| f > l);
+            if up {
+                last = Some(f);
+            }
+            up
+        })
+        .map(|(_, t)| t)
+        .collect()
+}
+
+#[allow(clippy::cast_precision_loss, reason = "frame numbers are small")]
+fn seconds(frame: i32) -> f32 {
+    frame as f32 / FRAMES_PER_SECOND
+}
+
+/// A vector track as a cubic spline channel: each key's arriving tangent, value and leaving tangent, per second.
+fn spline(b: &mut Builder, keys: &[Key<3>]) -> (usize, usize) {
+    let keys: Vec<&Key<3>> = rising(keys.iter().map(|k| (k.frame, k)));
+    let tangents = tcb_tangents(&keys);
+    let times: Vec<f32> = keys.iter().map(|k| seconds(k.frame)).collect();
+    let mut out = Vec::with_capacity(keys.len() * 9);
+    for (i, (k, (arrive, leave))) in keys.iter().zip(&tangents).enumerate() {
+        let before = i.checked_sub(1).map_or(0.0, |p| times[i] - times[p]);
+        let after = times.get(i + 1).map_or(0.0, |n| n - times[i]);
+        out.extend(arrive.map(|v| if before > 0.0 { v / before } else { 0.0 }));
+        out.extend(k.value);
+        out.extend(leave.map(|v| if after > 0.0 { v / after } else { 0.0 }));
+    }
+    (b.floats(times, "SCALAR", true), b.floats(out, "VEC3", false))
+}
+
+/// Each object's mesh, by the placement its vertices are moved by.
+struct Meshes {
+    prims: Vec<Option<Vec<Prim>>>,
+    /// Uses left of each object's primitives, so the last takes them rather than a copy.
+    left: Vec<usize>,
+    of: HashMap<(usize, [u64; 16]), Option<usize>>,
+    list: Vec<Value>,
+}
+
+impl Meshes {
+    fn get(&mut self, b: &mut Builder, obj: usize, m: &M4) -> Option<usize> {
+        let key = (obj, std::array::from_fn(|k| m[k / 4][k % 4].to_bits()));
+        if let Some(&i) = self.of.get(&key) {
+            return i;
+        }
+        self.left[obj] = self.left[obj].saturating_sub(1);
+        let prims = if self.left[obj] == 0 {
+            self.prims[obj].take()
+        } else {
+            self.prims[obj].clone()
+        }?;
+        let mesh = b.mesh(placed(prims, m), usize::MAX).map(|mesh| {
+            self.list.push(mesh);
+            self.list.len() - 1
+        });
+        self.of.insert(key, mesh);
+        mesh
+    }
+}
+
+#[allow(clippy::too_many_lines, reason = "one pass over the file's parts, in order")]
+pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets, keep: Keep) -> Result<Document<'static>> {
     let data = input.read()?;
     let main = chunks(&data)
         .next()
         .filter(|&(id, _)| id == MAIN || id == PROJECT)
         .map(|(_, b)| b);
     let Some(main) = main else { bail!("not a 3DS file") };
-    let editor = chunks(main).find(|&(id, _)| id == EDITOR).map_or(&[][..], |(_, b)| b);
-
-    let mut mesh = Mesh::default();
-    let mut by_name: HashMap<String, usize> = HashMap::new();
-    let dir = input.dir();
-    let mut images: HashMap<String, Option<usize>> = HashMap::new();
-    for (_, b) in chunks(editor).filter(|&(id, _)| id == MATERIAL) {
-        let m = material(b);
-        let image = m.texture.as_ref().and_then(|f| {
-            *images.entry(f.to_lowercase()).or_insert_with(|| {
-                let img: Image = assets.find(f, dir).and_then(|p| assets.load_image(&p))?;
-                mesh.images.push(img);
-                Some(mesh.images.len() - 1)
-            })
-        });
-        // A texture shows as painted, not tinted by the color under it.
-        let rgb = if image.is_some() { [1.0; 3] } else { m.color };
-        let plain = Material::plain(&m.name, [rgb[0], rgb[1], rgb[2], m.alpha]);
-        by_name.insert(m.name.clone(), mesh.materials.len());
-        mesh.materials.push(Material {
-            color_image: image,
-            emissive: m.color.map(|c| c * m.self_illum),
-            roughness: m.glossiness.map_or(plain.roughness, |g| 1.0 - g),
-            double_sided: m.two_sided,
-            ..plain
-        });
+    let mut source = json!({ "format": "3DS", "upAxis": "Z" });
+    let (mut editor, mut kf) = (&[][..], Keyframer::default());
+    for (id, b) in chunks(main) {
+        match id {
+            VERSION => {
+                if let Some(v) = u32_at(b, 0) {
+                    source["version"] = json!(v);
+                }
+            }
+            EDITOR if editor.is_empty() => editor = b,
+            KEYFRAMER => kf = keyframer(b),
+            _ => {}
+        }
     }
 
-    // One prim per material, across every object.
-    let mut prims: HashMap<usize, Prim> = HashMap::new();
+    let mut materials: Vec<Material> = Vec::new();
+    let mut raws: Vec<Map<String, Value>> = Vec::new();
+    let mut images: Vec<Image> = Vec::new();
+    let mut by_name: HashMap<String, usize> = HashMap::new();
+    let dir = input.dir();
+    let mut image_of: HashMap<String, Option<usize>> = HashMap::new();
+    let mut objects = Vec::new();
+    for (id, b) in chunks(editor) {
+        match id {
+            MESH_VERSION => {
+                if let Some(v) = u32_at(b, 0) {
+                    source["meshVersion"] = json!(v);
+                }
+            }
+            MASTER_SCALE => {
+                if let Some(s) = f32_at(b, 0) {
+                    source["masterScale"] = clean(s);
+                }
+            }
+            AMBIENT_LIGHT => {
+                if let Some(c) = color_raw(b) {
+                    source["ambient"] = c;
+                }
+            }
+            MATERIAL => {
+                let m = material(b);
+                let image = m.texture.as_ref().and_then(|f| {
+                    *image_of.entry(f.to_lowercase()).or_insert_with(|| {
+                        let img: Image = assets.find(f, dir).and_then(|p| assets.load_image(&p))?;
+                        images.push(img);
+                        Some(images.len() - 1)
+                    })
+                });
+                // A texture shows as painted, not tinted by the color under it.
+                let rgb = if image.is_some() { [1.0; 3] } else { m.color };
+                let plain = Material::plain(&m.name, [rgb[0], rgb[1], rgb[2], m.alpha]);
+                by_name.insert(m.name.clone(), materials.len());
+                materials.push(Material {
+                    color_image: image,
+                    emissive: m.color.map(|c| c * m.self_illum),
+                    roughness: m.glossiness.map_or(plain.roughness, |g| 1.0 - g),
+                    double_sided: m.two_sided,
+                    ..plain
+                });
+                raws.push(m.raw);
+            }
+            OBJECT => objects.push(object(b)),
+            _ => {}
+        }
+    }
+
+    // Each mesh object's primitives, one per material.
     let mut triangles = 0usize;
-    for (_, obj) in chunks(editor).filter(|&(id, _)| id == OBJECT) {
-        let rest = cstr(obj).1;
-        for (_, tri) in chunks(rest).filter(|&(id, _)| id == TRIMESH) {
-            let t = trimesh(tri);
+    let mut prims_of = Vec::with_capacity(objects.len());
+    for o in &objects {
+        let Body::Mesh(ts) = &o.body else {
+            prims_of.push(None);
+            continue;
+        };
+        let mut prims: HashMap<usize, Prim> = HashMap::new();
+        for t in ts {
             triangles += t.faces.len();
             ensure!(triangles <= MAX_TRIANGLES, "more than {MAX_TRIANGLES} triangles");
             let mut face_mat = vec![None; t.faces.len()];
@@ -263,21 +1060,294 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets) -> Result<Mesh>
                     }
                 }
             }
-            add_faces(&t, &face_mat, &mut prims, &mut mesh.materials);
+            add_faces(t, &face_mat, &mut prims, &mut materials);
         }
+        let mut prims: Vec<Prim> = prims.into_values().filter(|p| !p.indices.is_empty()).collect();
+        prims.sort_by_key(|p| p.material);
+        prims_of.push(Some(prims).filter(|p| !p.is_empty()));
     }
     ensure!(triangles > 0, "this 3DS file has no meshes");
-    let mut prims: Vec<Prim> = prims.into_values().filter(|p| !p.indices.is_empty()).collect();
-    prims.sort_by_key(|p| p.material);
-    mesh.prims = prims;
-    Ok(mesh)
+    let mut textured = vec![false; materials.len()];
+    for p in prims_of.iter().flatten().flatten().filter(|p| !p.uvs.is_empty()) {
+        textured[p.material] = true;
+    }
+    super::guess_texture(&mut materials, &mut images, &textured, input.path, assets);
+
+    let mut b = Builder::default();
+    let mut nodes: Vec<Value> = Vec::new();
+    let (mut cameras, mut lights) = (Vec::new(), Vec::new());
+    let mut roots = Vec::new();
+    let mut meshes = Meshes {
+        left: vec![0; objects.len()],
+        prims: prims_of,
+        of: HashMap::new(),
+        list: Vec::new(),
+    };
+    let object_of: HashMap<&str, usize> = objects
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(i, o)| (o.name.as_str(), i))
+        .collect();
+    let placed_by_kf: Vec<Option<usize>> = kf
+        .nodes
+        .iter()
+        .map(|n| object_of.get(n.name.as_str()).copied())
+        .collect();
+    for &o in placed_by_kf.iter().flatten() {
+        meshes.left[o] += 1;
+    }
+    let object_extras = |o: &Object, e: &mut Map<String, Value>| {
+        if o.hidden {
+            e.insert("hidden".into(), json!(true));
+        }
+        if let Body::Mesh(ts) = &o.body
+            && let Some(m) = ts.iter().find_map(|t| t.matrix)
+        {
+            e.insert("meshMatrix".into(), cleans(&m));
+        }
+    };
+
+    // The objects the keyframer doesn't place, where the editor has them.
+    for (i, o) in objects.iter().enumerate() {
+        if placed_by_kf.contains(&Some(i)) {
+            continue;
+        }
+        let mut node = json!({ "name": o.name });
+        match &o.body {
+            Body::Mesh(_) => {
+                meshes.left[i] += 1;
+                if let Some(m) = meshes.get(&mut b, i, &IDENTITY) {
+                    node["mesh"] = json!(m);
+                }
+            }
+            Body::Camera(c) if keep.cameras => {
+                node["translation"] = cleans(&c.position);
+                if let Some(q) = look_at(c.position, c.target, c.roll) {
+                    node["rotation"] = json!(q);
+                }
+                cameras.push(camera_json(c, &o.name, keep.extras));
+                node["camera"] = json!(cameras.len() - 1);
+            }
+            Body::Light(l) if keep.lights => {
+                node["translation"] = cleans(&l.position);
+                if let Some(q) = l.spot.as_ref().and_then(|s| look_at(l.position, s.target, 0.0)) {
+                    node["rotation"] = json!(q);
+                }
+                lights.push(light_json(l, &o.name, keep.extras));
+                node["extensions"] = json!({ "KHR_lights_punctual": { "light": lights.len() - 1 } });
+            }
+            Body::Camera(_) | Body::Light(_) => continue,
+            Body::Empty => {}
+        }
+        if keep.extras {
+            let mut e = Map::new();
+            object_extras(o, &mut e);
+            if !e.is_empty() {
+                node["extras"] = Value::Object(e);
+            }
+        }
+        roots.push(nodes.len());
+        nodes.push(node);
+    }
+
+    // The keyframer's hierarchy: its nodes' rest poses, and where each is in the world at rest.
+    let first = nodes.len();
+    let index_of: HashMap<u16, usize> = kf.nodes.iter().enumerate().rev().map(|(i, n)| (n.id, i)).collect();
+    let parent_of: Vec<Option<usize>> = kf
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| n.parent.and_then(|p| index_of.get(&p).copied()).filter(|&p| p != i))
+        .collect();
+    let rests: Vec<_> = kf.nodes.iter().map(rest).collect();
+    let local: Vec<M4> = rests.iter().map(|&(t, q, s)| trs(t, q, s)).collect();
+    let mut world: Vec<Option<M4>> = vec![None; kf.nodes.len()];
+    let mut parent_ok = vec![true; kf.nodes.len()];
+    for i in 0..kf.nodes.len() {
+        // Up to the first node placed already, or a root; a loop makes the node a root.
+        let mut chain = vec![i];
+        while let Some(p) = parent_of[*chain.last().unwrap_or(&i)] {
+            if world[p].is_some() {
+                break;
+            }
+            if chain.contains(&p) {
+                parent_ok[*chain.last().unwrap_or(&i)] = false;
+                break;
+            }
+            chain.push(p);
+        }
+        for &n in chain.iter().rev() {
+            let above = parent_of[n].filter(|_| parent_ok[n]).and_then(|p| world[p]);
+            world[n] = Some(above.map_or(local[n], |w| xform::mul(&w, &local[n])));
+        }
+    }
+    let mut placed_once = vec![false; objects.len()];
+    for (i, n) in kf.nodes.iter().enumerate() {
+        let obj = placed_by_kf[i];
+        let name = if n.instance.is_empty() { &n.name } else { &n.instance };
+        let mut node = json!({ "name": name });
+        let (t, q, s) = rests[i];
+        if t.iter().any(|&c| c != 0.0) {
+            node["translation"] = cleans(&n.pos[0].value);
+        }
+        if (q[3] - 1.0).abs() > 1e-12 {
+            node["rotation"] = json!(q);
+        }
+        #[allow(clippy::float_cmp, reason = "exactly one is no scale")]
+        if s.iter().any(|&c| c != 1.0) {
+            node["scale"] = cleans(&n.scl[0].value);
+        }
+        let w = world[i].unwrap_or(IDENTITY);
+        if let Some(o) = obj
+            && matches!(objects[o].body, Body::Mesh(_))
+        {
+            // Back through the mesh matrix and the pivot, as lib3ds does, unless the object's first node isn't then
+            // where the editor has it: then its rest pose decides.
+            let m = match &objects[o].body {
+                Body::Mesh(ts) => ts.iter().find_map(|t| t.matrix).map_or(IDENTITY, |m| mesh_matrix(&m)),
+                _ => IDENTITY,
+            };
+            let pivot = xform::translate(n.pivot.map(|c| -f64::from(c)));
+            let lib = (xform::det3(&m).abs() > 1e-12).then(|| xform::mul(&pivot, &xform::inverse(&m)));
+            let by_rest = xform::inverse(&w);
+            let size = m[0][3].abs().max(m[1][3].abs()).max(m[2][3].abs());
+            let into = match lib {
+                Some(l) if placed_once[o] || near_identity(&xform::mul(&w, &l), size) => l,
+                _ => by_rest,
+            };
+            placed_once[o] = true;
+            if let Some(mesh) = meshes.get(&mut b, o, &into) {
+                node["mesh"] = json!(mesh);
+            }
+        }
+        if keep.extras {
+            let mut e = Map::new();
+            e.insert("nodeId".into(), json!(n.id));
+            if !n.instance.is_empty() {
+                e.insert("object".into(), json!(n.name));
+            }
+            if n.pivot.iter().any(|&c| c != 0.0) {
+                e.insert("pivot".into(), cleans(&n.pivot));
+            }
+            if let Some(o) = obj {
+                object_extras(&objects[o], &mut e);
+            }
+            node["extras"] = Value::Object(e);
+        }
+        nodes.push(node);
+    }
+    for i in 0..kf.nodes.len() {
+        match parent_of[i].filter(|_| parent_ok[i]) {
+            Some(p) => {
+                let children = nodes[first + p]
+                    .as_object_mut()
+                    .map(|o| o.entry("children").or_insert_with(|| json!([])));
+                if let Some(Value::Array(c)) = children {
+                    c.push(json!(first + i));
+                }
+            }
+            None => roots.push(first + i),
+        }
+    }
+
+    let mut animations = Vec::new();
+    if keep.animations {
+        let (mut channels, mut samplers) = (Vec::new(), Vec::new());
+        for (i, n) in kf.nodes.iter().enumerate() {
+            let node = first + i;
+            let mut add = |path: &str, (input, output): (usize, usize), interpolation: &str| {
+                channels.push(json!({ "sampler": samplers.len(), "target": { "node": node, "path": path } }));
+                samplers.push(json!({ "input": input, "output": output, "interpolation": interpolation }));
+            };
+            if n.pos.len() > 1 {
+                add("translation", spline(&mut b, &n.pos), "CUBICSPLINE");
+            }
+            if n.rot.len() > 1 {
+                let turns = rotations(&n.rot);
+                let keys: Vec<(f32, [f64; 4])> =
+                    rising(n.rot.iter().zip(turns).map(|(k, q)| (k.frame, (seconds(k.frame), q))));
+                // Each quaternion on the same side as the last, so slerp takes the short way.
+                let mut last = [0.0, 0.0, 0.0, 1.0];
+                let mut values = Vec::with_capacity(keys.len() * 4);
+                for &(_, mut q) in &keys {
+                    if (0..4).map(|k| q[k] * last[k]).sum::<f64>() < 0.0 {
+                        q = q.map(|c| -c);
+                    }
+                    last = q;
+                    #[allow(clippy::cast_possible_truncation, reason = "accessor floats")]
+                    values.extend(q.map(|c| c as f32));
+                }
+                let times = keys.iter().map(|&(t, _)| t).collect();
+                let io = (b.floats(times, "SCALAR", true), b.floats(values, "VEC4", false));
+                add("rotation", io, "LINEAR");
+            }
+            if n.scl.len() > 1 {
+                add("scale", spline(&mut b, &n.scl), "CUBICSPLINE");
+            }
+        }
+        if !channels.is_empty() {
+            animations.push(json!({ "name": "keyframer", "channels": channels, "samplers": samplers }));
+        }
+    }
+    if !kf.nodes.is_empty() || kf.revision.is_some() {
+        let mut k = Map::new();
+        if !kf.name.is_empty() {
+            k.insert("name".into(), json!(kf.name));
+        }
+        if let Some(r) = kf.revision {
+            k.insert("revision".into(), json!(r));
+        }
+        if let Some(l) = kf.length {
+            k.insert("length".into(), json!(l));
+        }
+        if let Some(s) = kf.segment {
+            k.insert("segment".into(), json!(s));
+        }
+        source["keyframer"] = Value::Object(k);
+    }
+
+    // Z-up to Y-up: a quarter turn about X.
+    let h = std::f32::consts::FRAC_1_SQRT_2;
+    nodes.push(json!({ "name": "RootNode", "children": roots, "rotation": [-h, 0.0, 0.0, h] }));
+    let mut json = Map::new();
+    json.insert("asset".into(), json!({ "extras": { "source": source } }));
+    json.insert("scene".into(), json!(0));
+    json.insert("scenes".into(), json!([{ "nodes": [nodes.len() - 1] }]));
+    json.insert("nodes".into(), Value::Array(nodes));
+    json.insert("meshes".into(), Value::Array(meshes.list));
+    if !animations.is_empty() {
+        json.insert("animations".into(), Value::Array(animations));
+    }
+    if !cameras.is_empty() {
+        json.insert("cameras".into(), Value::Array(cameras));
+    }
+    if !lights.is_empty() {
+        json.insert("extensionsUsed".into(), json!(["KHR_lights_punctual"]));
+        json.insert(
+            "extensions".into(),
+            json!({ "KHR_lights_punctual": { "lights": lights } }),
+        );
+    }
+    b.materials(&materials, images, &mut json);
+    if keep.extras
+        && let Some(Value::Array(list)) = json.get_mut("materials")
+    {
+        for (mat, raw) in list.iter_mut().zip(raws) {
+            if !raw.is_empty() {
+                mat["extras"] = json!({ "3ds": raw });
+            }
+        }
+    }
+    // `read` counts the triangles drawn, from the document.
+    Ok(b.finish(json, Map::new()))
 }
 
 /// A trimesh's faces, into the prims of their materials. A corner's normal averages the faces around its vertex that
 /// share a smoothing bit with its own face, each weighed by its angle there (so the triangulation doesn't matter); a
 /// face in no group is flat. Corners share a vertex when material, position and normal agree.
 fn add_faces(t: &Trimesh, face_mat: &[Option<usize>], prims: &mut HashMap<usize, Prim>, materials: &mut Vec<Material>) {
-    let pos: Vec<[f32; 3]> = t.vertices.iter().map(|&p| y_up(p)).collect();
+    let pos = &t.vertices;
     let has_uvs = !t.uvs.is_empty() && t.uvs.len() >= t.vertices.len();
     let n = pos.len();
     let whole = |f: &[u16; 3]| f.iter().all(|&i| usize::from(i) < n);
@@ -371,7 +1441,7 @@ fn add_faces(t: &Trimesh, face_mat: &[Option<usize>], prims: &mut HashMap<usize,
             }
             #[allow(clippy::float_cmp, reason = "exactly zero: no face in the group gave a normal")]
             if nrm == [0.0; 3] {
-                nrm = [0.0, 1.0, 0.0];
+                nrm = [0.0, 0.0, 1.0];
             }
             // -0.0 + 0.0 is 0.0: one key for both zeros.
             let nrm = nrm.map(|c| c + 0.0);
@@ -392,6 +1462,7 @@ fn add_faces(t: &Trimesh, face_mat: &[Option<usize>], prims: &mut HashMap<usize,
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
+    use crate::document::Pose;
 
     fn chunk(id: u16, body: &[u8]) -> Vec<u8> {
         let mut out = id.to_le_bytes().to_vec();
@@ -404,12 +1475,45 @@ mod tests {
         xs.iter().flat_map(|x| x.to_le_bytes()).collect()
     }
 
+    fn u16s(xs: &[u16]) -> Vec<u8> {
+        xs.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    /// A trimesh of `verts` and `faces`, with a mesh matrix moving it to `origin` when there is one.
+    fn trimesh(verts: &[[f32; 3]], faces: &[[u16; 3]], origin: Option<[f32; 3]>) -> Vec<u8> {
+        let mut v = u16::try_from(verts.len()).unwrap().to_le_bytes().to_vec();
+        v.extend(f32s(verts.as_flattened()));
+        let mut f = u16::try_from(faces.len()).unwrap().to_le_bytes().to_vec();
+        for face in faces {
+            f.extend(u16s(&[face[0], face[1], face[2], 0]));
+        }
+        let mut t = chunk(VERTICES, &v);
+        if let Some(o) = origin {
+            t.extend(chunk(
+                MESH_MATRIX,
+                &f32s(&[1., 0., 0., 0., 1., 0., 0., 0., 1., o[0], o[1], o[2]]),
+            ));
+        }
+        t.extend(chunk(FACES, &f));
+        t
+    }
+
+    fn object(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut o = name.as_bytes().to_vec();
+        o.push(0);
+        o.extend(body);
+        chunk(OBJECT, &o)
+    }
+
     /// A square on the ground (Z up) of two triangles in one smoothing group, red, and a lone triangle standing up
     /// in no material.
     fn square() -> Vec<u8> {
         let mut mat = chunk(MAT_NAME, b"Red\0");
         mat.extend(chunk(MAT_DIFFUSE, &chunk(COLOR_U8, &[255, 0, 0])));
         mat.extend(chunk(MAT_TRANSPARENCY, &chunk(PERCENT_U16, &25u16.to_le_bytes())));
+        let mut map = chunk(MAP_FILE, b"red.png\0");
+        map.extend(chunk(MAP_USCALE, &f32s(&[2.0])));
+        mat.extend(chunk(MAT_BUMPMAP, &map));
 
         let mut verts = 4u16.to_le_bytes().to_vec();
         verts.extend(f32s(&[0., 0., 0., 2., 0., 0., 2., 2., 0., 0., 2., 0.]));
@@ -417,11 +1521,11 @@ mod tests {
         uvs.extend(f32s(&[0., 0., 1., 0., 1., 1., 0., 1.]));
         let mut faces = 2u16.to_le_bytes().to_vec();
         for f in [[0u16, 1, 2, 7], [0, 2, 3, 7]] {
-            faces.extend(f.iter().flat_map(|x| x.to_le_bytes()));
+            faces.extend(u16s(&f));
         }
         let mut fm = b"Red\0".to_vec();
         fm.extend(2u16.to_le_bytes());
-        fm.extend([0u16, 1].iter().flat_map(|x| x.to_le_bytes()));
+        fm.extend(u16s(&[0, 1]));
         faces.extend(chunk(FACE_MATERIAL, &fm));
         faces.extend(chunk(
             SMOOTHING,
@@ -430,30 +1534,51 @@ mod tests {
         let mut tri = chunk(VERTICES, &verts);
         tri.extend(chunk(UVS, &uvs));
         tri.extend(chunk(FACES, &faces));
-        let mut obj = b"Floor\0".to_vec();
-        obj.extend(chunk(TRIMESH, &tri));
-
-        let mut verts = 3u16.to_le_bytes().to_vec();
-        verts.extend(f32s(&[0., 0., 0., 1., 0., 0., 0., 0., 1.]));
-        let mut faces = 1u16.to_le_bytes().to_vec();
-        faces.extend([0u16, 1, 2, 0].iter().flat_map(|x| x.to_le_bytes()));
-        let mut tri = chunk(VERTICES, &verts);
-        tri.extend(chunk(FACES, &faces));
-        let mut wall = b"Wall\0".to_vec();
-        wall.extend(chunk(TRIMESH, &tri));
 
         let mut editor = chunk(MATERIAL, &mat);
-        editor.extend(chunk(OBJECT, &obj));
-        editor.extend(chunk(OBJECT, &wall));
+        editor.extend(object("Floor", &chunk(TRIMESH, &tri)));
+        editor.extend(object(
+            "Wall",
+            &chunk(
+                TRIMESH,
+                &trimesh(&[[0., 0., 0.], [1., 0., 0.], [0., 0., 1.]], &[[0, 1, 2]], None),
+            ),
+        ));
         chunk(MAIN, &chunk(EDITOR, &editor))
+    }
+
+    fn read(name: &str, data: &[u8]) -> Result<Document<'static>> {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(name);
+        std::fs::write(&p, data).unwrap();
+        load(
+            crate::formats::Input::file(&p),
+            &crate::assets::Folder::new(dir.path()),
+            Keep::ALL,
+        )
+    }
+
+    fn close(a: [f32; 3], b: [f32; 3]) -> bool {
+        (0..3).all(|k| (a[k] - b[k]).abs() < 1e-4)
     }
 
     #[test]
     fn meshes_materials_and_smoothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("floor.3ds");
-        std::fs::write(&p, square()).unwrap();
-        let mesh = load(crate::formats::Input::file(&p), &crate::assets::Folder::new(dir.path())).unwrap();
+        let doc = read("floor.3ds", &square()).unwrap();
+        let names: Vec<&str> = doc.json["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["Floor", "Wall", "RootNode"]);
+        assert_eq!(doc.json["asset"]["extras"]["source"]["upAxis"], "Z");
+        let red = &doc.json["materials"][0]["extras"]["3ds"];
+        assert_eq!(red["diffuse"], json!([255, 0, 0]));
+        assert_eq!(red["transparency"], json!(25.0));
+        assert_eq!(red["maps"]["bump"], json!({ "file": "red.png", "uScale": 2.0 }));
+
+        let mesh = doc.flatten(Pose::Rest).unwrap().unwrap();
         assert_eq!(mesh.triangles(), 3);
         assert_eq!(mesh.prims.len(), 2);
         let floor = &mesh.prims[0];
@@ -463,29 +1588,132 @@ mod tests {
         // One smoothing group: the shared corners are shared vertices.
         assert_eq!(floor.positions.len(), 4);
         assert!(
-            floor.positions.iter().all(|p| p[1] == 0.0),
+            floor.positions.iter().all(|p| p[1].abs() < 1e-6),
             "Z up became Y up: {:?}",
             floor.positions
         );
-        assert!(floor.positions.contains(&[2.0, 0.0, -2.0]));
+        assert!(floor.positions.iter().any(|&p| close(p, [2.0, 0.0, -2.0])));
         assert!(floor.normals.iter().all(|n| n[1] > 0.99), "{:?}", floor.normals);
         assert!(floor.uvs.contains(&[0.0, 1.0]), "V flipped to glTF's origin");
         let wall = &mesh.prims[1];
         assert_eq!(mesh.materials[wall.material].name, "default");
         assert_eq!(wall.positions.len(), 3);
-        assert!(
-            wall.normals.iter().all(|n| n[2] < -0.99 || n[2] > 0.99),
-            "{:?}",
-            wall.normals
-        );
+        assert!(wall.normals.iter().all(|n| n[2].abs() > 0.99), "{:?}", wall.normals);
         assert!(crate::mesh::to_glb(&mesh).unwrap().starts_with(b"glTF"));
+    }
+
+    fn track(id: u16, keys: &[(u32, &[f32])]) -> Vec<u8> {
+        let mut t = u16s(&[0, 0, 0, 0, 0]);
+        t.extend(u32::try_from(keys.len()).unwrap().to_le_bytes());
+        for (frame, v) in keys {
+            t.extend(frame.to_le_bytes());
+            t.extend(0u16.to_le_bytes());
+            t.extend(f32s(v));
+        }
+        chunk(id, &t)
+    }
+
+    fn node(id: u16, name: &str, parent: u16, pivot: [f32; 3], tracks: &[Vec<u8>]) -> Vec<u8> {
+        let mut hdr = name.as_bytes().to_vec();
+        hdr.push(0);
+        hdr.extend(u16s(&[0, 0, parent]));
+        let mut n = chunk(NODE_ID, &id.to_le_bytes());
+        n.extend(chunk(NODE_HDR, &hdr));
+        n.extend(chunk(PIVOT, &f32s(&pivot)));
+        for t in tracks {
+            n.extend(t);
+        }
+        chunk(OBJECT_NODE_TAG, &n)
+    }
+
+    /// A unit triangle moved to `p`.
+    fn at(p: [f32; 3]) -> Vec<[f32; 3]> {
+        [[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]]
+            .iter()
+            .map(|v| [v[0] + p[0], v[1] + p[1], v[2] + p[2]])
+            .collect()
+    }
+
+    #[test]
+    fn the_keyframer_places_and_animates() {
+        let base = trimesh(&at([5., 0., 0.]), &[[0, 1, 2]], Some([5., 0., 0.]));
+        let arm = trimesh(&at([5., 3., 0.]), &[[0, 1, 2]], Some([5., 3., 0.]));
+        let mut editor = object("Base", &chunk(TRIMESH, &base));
+        editor.extend(object("Arm", &chunk(TRIMESH, &arm)));
+        let quarter = std::f32::consts::FRAC_PI_2;
+        let mut kf = node(
+            0,
+            "Base",
+            u16::MAX,
+            [0.; 3],
+            &[track(POS_TRACK, &[(0, &[5., 0., 0.]), (30, &[5., 0., 2.])])],
+        );
+        kf.extend(node(
+            1,
+            "Arm",
+            0,
+            [0.5, 0.5, 0.],
+            &[
+                track(POS_TRACK, &[(0, &[0.5, 3.5, 0.])]),
+                track(ROT_TRACK, &[(0, &[0., 0., 0., 1.]), (30, &[quarter, 0., 0., 1.])]),
+            ],
+        ));
+        let mut main = chunk(EDITOR, &editor);
+        main.extend(chunk(KEYFRAMER, &kf));
+        let doc = read("arm.3ds", &chunk(MAIN, &main)).unwrap();
+        assert_eq!(doc.json["nodes"][1]["name"], "Arm");
+        assert_eq!(doc.json["nodes"][0]["children"], json!([1]));
+        assert_eq!(doc.json["animations"][0]["channels"].as_array().unwrap().len(), 2);
+
+        // At rest, everything is where the editor has it (turned Y up).
+        let mesh = doc.flatten(Pose::Rest).unwrap().unwrap();
+        let mut got: Vec<[f32; 3]> = mesh.prims.iter().flat_map(|p| p.positions.clone()).collect();
+        let mut want: Vec<[f32; 3]> = at([5., 0., 0.])
+            .into_iter()
+            .chain(at([5., 3., 0.]))
+            .map(|[x, y, z]| [x, z, -y])
+            .collect();
+        #[allow(clippy::cast_possible_truncation, reason = "small test values")]
+        let key = |p: &[f32; 3]| p.map(|c| (c * 1000.0).round() as i64);
+        got.sort_by_key(key);
+        want.sort_by_key(key);
+        assert!(got.iter().zip(&want).all(|(a, b)| close(*a, *b)), "{got:?} != {want:?}");
+    }
+
+    #[test]
+    fn cameras_and_lights() {
+        let mut cam = f32s(&[0., -10., 0., 0., 0., 0., 0., 50.]);
+        cam.extend(chunk(CAM_RANGES, &f32s(&[1., 100.])));
+        let mut spot = f32s(&[0., 0., 10.]);
+        spot.extend(chunk(COLOR_U8, &[255, 255, 255]));
+        spot.extend(chunk(DL_SPOTLIGHT, &f32s(&[0., 0., 0., 30., 60.])));
+        let mut editor = object("Tri", &chunk(TRIMESH, &trimesh(&at([0.; 3]), &[[0, 1, 2]], None)));
+        editor.extend(object("Cam", &chunk(CAMERA, &cam)));
+        editor.extend(object("Spot", &chunk(LIGHT, &spot)));
+        let doc = read("lit.3ds", &chunk(MAIN, &chunk(EDITOR, &editor))).unwrap();
+        let p = &doc.json["cameras"][0]["perspective"];
+        assert_eq!(p["znear"], json!(1.0));
+        assert_eq!(p["zfar"], json!(100.0));
+        let light = &doc.json["extensions"]["KHR_lights_punctual"]["lights"][0];
+        assert_eq!(light["type"], "spot");
+        let outer = light["spot"]["outerConeAngle"].as_f64().unwrap();
+        assert!((outer - 30f64.to_radians()).abs() < 1e-9);
+        // The camera looks along +Y: its -Z turned onto +Y is a quarter turn about +X.
+        let q: Vec<f64> = doc.json["nodes"][1]["rotation"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_f64().unwrap())
+            .collect();
+        let h = std::f64::consts::FRAC_1_SQRT_2;
+        assert!((q[0] - h).abs() < 1e-6 && (q[3] - h).abs() < 1e-6, "{q:?}");
+        // The spot looks straight down: -Z already.
+        let q = doc.json["nodes"][2]["rotation"].as_array().unwrap();
+        assert!((q[3].as_f64().unwrap().abs() - 1.0).abs() < 1e-6, "{q:?}");
     }
 
     #[test]
     fn not_3ds_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("x.3ds");
-        std::fs::write(&p, b"hello").unwrap();
-        assert!(load(crate::formats::Input::file(&p), &crate::assets::Folder::new(dir.path())).is_err());
+        assert!(read("x.3ds", b"hello").is_err());
     }
 }
