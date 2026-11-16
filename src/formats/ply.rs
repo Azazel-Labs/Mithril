@@ -19,6 +19,7 @@ use super::Input;
 use super::stream::{self, Blocks};
 use crate::assets::Assets;
 use crate::document::{Builder, Document, Keep, Part};
+use crate::images::Images;
 use crate::mesh::{FastMap, MAX_TRIANGLES, Material, Mesh, Prim, smooth_normals, srgb_to_linear, triangulate};
 use crate::num::{f32_of, u32_of};
 use crate::{Context as _, Result};
@@ -574,17 +575,15 @@ pub(crate) fn ply(input: Input<'_>, assets: &dyn Assets, keep: Keep) -> Result<D
     if has_faces {
         // A texture that would only be dropped isn't read.
         let texture = head.texture.filter(|_| keep.materials && keep.textures);
-        let (mesh, src) = build(&mut body, texture, path, assets)?;
+        let dir = path.parent().unwrap_or(Path::new(""));
+        let mut images = Images::new(!keep.image_bytes, dir);
+        let (mesh, src) = build(&mut body, texture, path, assets, &mut images)?;
         facts.insert("triangles".into(), json!(mesh.triangles()));
         facts.insert(
             "vertices".into(),
             json!(mesh.prims.iter().map(|p| p.positions.len()).sum::<usize>()),
         );
-        let Mesh {
-            prims,
-            materials,
-            images,
-        } = mesh;
+        let Mesh { prims, materials, .. } = mesh;
         for p in prims {
             let n = p.positions.len();
             if let Some(mut prim) = b.primitive(p) {
@@ -597,7 +596,7 @@ pub(crate) fn ply(input: Input<'_>, assets: &dyn Assets, keep: Keep) -> Result<D
                 primitives.push(prim);
             }
         }
-        b.materials(&materials, images, &mut json);
+        b.materials(&materials, images.list, &mut json);
     } else {
         facts.insert("points".into(), json!(body.points));
         if nv > 0 {
@@ -972,6 +971,7 @@ fn build(
     texture: Option<String>,
     path: &Path,
     assets: &dyn Assets,
+    images: &mut Images,
 ) -> Result<(Mesh, Option<Vec<u32>>)> {
     let verts = &mut body.verts;
     let mut tris = std::mem::take(&mut body.tris);
@@ -1090,12 +1090,8 @@ fn build(
     let mut mat = Material::plain("default", base);
     if has_uv {
         let dir = path.parent().unwrap_or(Path::new(""));
-        if let Some(img) = texture
-            .and_then(|t| assets.find(&t, dir))
-            .and_then(|f| assets.load_image(&f))
-        {
-            mesh.images.push(img);
-            mat.color_image = Some(0);
+        if let Some(i) = texture.and_then(|t| images.file(assets, assets.find(&t, dir)?, &t)) {
+            mat.color_image = Some(i);
             mat.color = [1.0; 4];
         }
     }

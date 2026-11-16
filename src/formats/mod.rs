@@ -273,13 +273,25 @@ fn linear_colors(input: Input<'_>, ext: &str) -> bool {
     }
 }
 
+/// The color texture by naming convention for a model at `path` that names none, added to
+/// `images`.
+#[cfg(any(feature = "obj", feature = "3ds", feature = "fbx"))]
+fn color_texture(path: &Path, assets: &dyn Assets, images: &mut crate::images::Images) -> Option<usize> {
+    let p = assets.color_texture_for(path)?;
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    images.file(assets, p, &name)
+}
+
 #[cfg(any(feature = "obj", feature = "3ds"))]
 /// A model that names no color texture takes one by name: `Barrel.png` or
 /// `Barrel_Albedo.png` for `Barrel.obj`, from anywhere in the pack, for the `materials` that
 /// `textured` says draw triangles with texture coordinates. Their color then shows as painted.
 fn guess_texture(
     materials: &mut [crate::mesh::Material],
-    images: &mut Vec<crate::mesh::Image>,
+    images: &mut crate::images::Images,
     textured: &[bool],
     path: &Path,
     assets: &dyn Assets,
@@ -287,11 +299,9 @@ fn guess_texture(
     if !textured.contains(&true) || materials.iter().any(|m| m.color_image.is_some()) {
         return;
     }
-    let Some(img) = assets.color_texture_for(path).and_then(|p| assets.load_image(&p)) else {
+    let Some(i) = color_texture(path, assets, images) else {
         return;
     };
-    images.push(img);
-    let i = images.len() - 1;
     for (m, _) in materials.iter_mut().zip(textured).filter(|(_, t)| **t) {
         m.color_image = Some(i);
         m.color[..3].copy_from_slice(&[1.0, 1.0, 1.0]);

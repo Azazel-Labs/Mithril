@@ -26,6 +26,7 @@ use crate::assets::Assets;
 use crate::document::FileSpan;
 use crate::document::{Blob, Document, Keep};
 use crate::gltf as container;
+use crate::images::{Location, Reference};
 use crate::num::usize_of;
 use crate::{Context as _, Result};
 
@@ -75,6 +76,7 @@ pub(crate) fn load<'a>(input: Input<'a>, assets: &'a dyn Assets, keep: Keep) -> 
         json,
         buffers: Vec::new(),
         facts: Map::new(),
+        refs: crate::images::Refs::new(),
     };
     let n = doc.json.get("buffers").and_then(Value::as_array).map_or(0, Vec::len);
     for i in 0..n {
@@ -111,7 +113,11 @@ pub(crate) fn load<'a>(input: Input<'a>, assets: &'a dyn Assets, keep: Keep) -> 
     }
     // Images that would only be dropped aren't read.
     if keep.materials && keep.textures {
-        embed_images(&mut doc, input, assets);
+        if keep.image_bytes {
+            embed_images(&mut doc, input, assets);
+        } else {
+            reference_images(&mut doc, input, assets);
+        }
     }
     Ok(doc)
 }
@@ -149,6 +155,37 @@ fn embed_images(doc: &mut Document<'_>, input: Input<'_>, assets: &dyn Assets) {
         img.remove("uri");
         img.insert("bufferView".into(), json!(view));
         img.insert("mimeType".into(), json!(mime));
+    }
+}
+
+/// Notes where each image named by URI (other than a `data:` one) is, without reading it.
+fn reference_images(doc: &mut Document<'_>, input: Input<'_>, assets: &dyn Assets) {
+    let images = doc.json.get("images").and_then(Value::as_array);
+    for (i, img) in images.into_iter().flatten().enumerate() {
+        let Some(uri) = img
+            .get("uri")
+            .and_then(Value::as_str)
+            .filter(|u| !u.starts_with("data:"))
+        else {
+            continue;
+        };
+        let name = container::percent_decode(uri);
+        let path = checked(&name).ok().map(|rel| input.dir().join(rel));
+        let found = path.filter(|p| {
+            #[cfg(feature = "fs")]
+            if input.bytes().is_none() {
+                return p.is_file();
+            }
+            assets.read(p).is_some()
+        });
+        let location = found.map_or(Location::Missing, Location::File);
+        let r = Reference {
+            name,
+            location,
+            bytes: None,
+            raw: true,
+        };
+        doc.refs.insert(i, r);
     }
 }
 

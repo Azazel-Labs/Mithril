@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Read};
 
 use crate::document::{Builder, Document, Keep};
+use crate::images::{Images, Location};
 use crate::{Context as _, Result};
 use quick_xml::events::{BytesStart, Event};
 use serde_json::{Map, Value, json};
@@ -291,7 +292,7 @@ pub(crate) fn load(input: super::Input<'_>, keep: Keep) -> Result<Document<'stat
         facts.insert("application".into(), json!(app));
     }
 
-    let mut images = Vec::new();
+    let mut images = Images::new(!keep.image_bytes, std::path::Path::new(""));
     let mut image_of: HashMap<usize, Option<usize>> = HashMap::new();
     let lin = |c: [u8; 4]| {
         let [r, g, b] = [c[0], c[1], c[2]].map(|v| srgb_to_linear(f32::from(v) / 255.0));
@@ -319,8 +320,8 @@ pub(crate) fn load(input: super::Input<'_>, keep: Keep) -> Result<Document<'stat
                     let real = names.get(&out.textures[t].0)?;
                     let mut bytes = Vec::new();
                     zip.by_name(real).ok()?.take(MAX_PART).read_to_end(&mut bytes).ok()?;
-                    images.push(Image::png_or_jpeg(&bytes)?);
-                    Some(images.len() - 1)
+                    let location = Location::Archive(real.clone());
+                    images.bytes(bytes.into(), &out.textures[t].0, location, Image::png_or_jpeg)
                 });
                 match image {
                     Some(i) => Full {
@@ -367,7 +368,7 @@ pub(crate) fn load(input: super::Input<'_>, keep: Keep) -> Result<Document<'stat
     json.insert("scenes".into(), json!([{ "nodes": [nodes.len() - 1] }]));
     json.insert("nodes".into(), Value::Array(nodes));
     json.insert("meshes".into(), Value::Array(meshes));
-    b.materials(&materials, images, &mut json);
+    b.materials(&materials, images.list, &mut json);
     Ok(b.finish(json, facts))
 }
 

@@ -45,8 +45,9 @@ use super::Input;
 use super::xform::{IDENTITY, M4, Trs, decompose, inverse, mul, scale, set_transform, translate};
 use crate::assets::{Assets, memory_key};
 use crate::document::{Builder, Document, Keep, Part};
+use crate::images::{Images, Location};
 use crate::material::{self, Alpha, Clearcoat, Factor, Full, Specular, Tex, UvTransform};
-use crate::mesh::{GRAY, Image, MAX_TRIANGLES, Material, Prim, triangulate};
+use crate::mesh::{GRAY, MAX_TRIANGLES, Material, Prim, triangulate};
 use crate::num::f32_of;
 
 /// Prim types that are no node: shading networks, and what the prims using them read (subsets, blend shapes,
@@ -117,7 +118,7 @@ pub(crate) fn load(input: Input<'_>, assets: &dyn Assets, keep: Keep) -> Result<
         mesh_of: HashMap::new(),
         materials: Vec::new(),
         material_of: HashMap::new(),
-        images: Vec::new(),
+        images: Images::new(!keep.image_bytes, input.dir()),
         image_of: HashMap::new(),
         skins: Vec::new(),
         cameras: Vec::new(),
@@ -196,7 +197,7 @@ pub(crate) fn load(input: Input<'_>, assets: &dyn Assets, keep: Keep) -> Result<
     }
     let (materials, images) = (std::mem::take(&mut r.materials), std::mem::take(&mut r.images));
     let mut b = r.b;
-    b.materials(&materials, images, &mut json);
+    b.materials(&materials, images.list, &mut json);
     Ok(b.finish(json, Map::new()))
 }
 
@@ -351,7 +352,7 @@ struct Reader<'a> {
     materials: Vec<Full>,
     /// Material prim path (or `display:<rgba>` for a display color) to its index in `materials`.
     material_of: HashMap<String, usize>,
-    images: Vec<Image>,
+    images: Images,
     /// Texture asset path to its index in `images`, or `None` when it couldn't be found.
     image_of: HashMap<String, Option<usize>>,
     skins: Vec<Value>,
@@ -2201,21 +2202,20 @@ impl Reader<'_> {
         }
         let reference = asset.replace("<UDIM>", "1001").replace("<udim>", "1001");
         let reference = reference.trim_start_matches("./");
-        let image = self
+        let assets = self.assets;
+        let i = self
             .usdz
             .as_mut()
             .and_then(|z| z.read(reference))
-            .and_then(|bytes| self.assets.image(&bytes, Path::new(reference)))
+            .and_then(|(entry, bytes)| {
+                let convert = |b: &[u8]| assets.image(b, Path::new(reference));
+                self.images
+                    .bytes(bytes.into(), reference, Location::Archive(entry), convert)
+            })
             .or_else(|| {
                 let dir = self.file.parent().unwrap_or(Path::new(""));
-                self.assets
-                    .find(reference, dir)
-                    .and_then(|p| self.assets.load_image(&p))
+                self.images.file(assets, assets.find(reference, dir)?, reference)
             });
-        let i = image.map(|img: Image| {
-            self.images.push(img);
-            self.images.len() - 1
-        });
         self.image_of.insert(asset.to_owned(), i);
         i
     }
@@ -2232,7 +2232,7 @@ impl<'a> Usdz<'a> {
     }
 
     /// An entry by its path in the archive, or failing that by its file name.
-    fn read(&mut self, reference: &str) -> Option<Vec<u8>> {
+    fn read(&mut self, reference: &str) -> Option<(String, Vec<u8>)> {
         let name = reference.rsplit('/').next()?.to_lowercase();
         let names: Vec<String> = self
             .0
@@ -2248,7 +2248,7 @@ impl<'a> Usdz<'a> {
         let mut f = self.0.by_name(entry).ok()?;
         let mut bytes = Vec::new();
         f.read_to_end(&mut bytes).ok()?;
-        Some(bytes)
+        Some((entry.clone(), bytes))
     }
 }
 

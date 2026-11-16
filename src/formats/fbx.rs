@@ -8,6 +8,7 @@
 //! Colors are sRGB, as the FBX SDK's tools write them, except that Blender writes material colors linear; vertex
 //! colors are sRGB from every tool, Blender included (its exporter's default).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -18,8 +19,9 @@ use serde_json::{Map, Value, json};
 
 use crate::assets::Assets;
 use crate::document::{Builder, Document, Keep, Part};
+use crate::images::{Images, Location};
 use crate::material::{self, Alpha, Clearcoat, Factor, Full, Sheen, Tex, UvTransform};
-use crate::mesh::{GRAY, Image, Material, Prim, smooth_normals, srgb_to_linear, triangulate};
+use crate::mesh::{GRAY, Material, Prim, smooth_normals, srgb_to_linear, triangulate};
 use crate::num::f32_of;
 
 use super::xform::{IDENTITY, M4, Trs, column_major, decompose, det3, inverse, mul, scale, set_transform, translate};
@@ -306,7 +308,7 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets, keep: Keep) -> 
         meshes: Vec::new(),
         mesh_of: HashMap::new(),
         materials: Vec::new(),
-        images: Vec::new(),
+        images: Images::new(!keep.image_bytes, input.dir()),
         material_index: HashMap::new(),
         image_index: HashMap::new(),
         default_material: None,
@@ -357,13 +359,13 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets, keep: Keep) -> 
     scene_nodes.append(&mut r.skinned_roots);
     ensure!(!r.nodes.is_empty(), "FBX has no mesh geometry");
 
-    if !r.textured.is_empty()
+    if r.keep.materials
+        && r.keep.textures
+        && !r.textured.is_empty()
         && !r.materials.iter().any(|m| m.base_color_tex.is_some())
-        && let Some(img) = assets.color_texture_for(input.path).and_then(|p| assets.load_image(&p))
+        && let Some(i) = super::color_texture(input.path, assets, &mut r.images)
     {
         // A model that names no color texture takes one by name (see `guess_color_texture`).
-        r.images.push(img);
-        let i = r.images.len() - 1;
         for &m in &r.textured {
             r.materials[m].base_color_tex = Some(Tex::new(i));
             r.materials[m].base_color[..3].copy_from_slice(&[1.0, 1.0, 1.0]);
@@ -396,7 +398,7 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets, keep: Keep) -> 
     }
     let (materials, images) = (std::mem::take(&mut r.materials), std::mem::take(&mut r.images));
     let mut b = r.b;
-    b.materials(&materials, images, &mut json);
+    b.materials(&materials, images.list, &mut json);
     Ok(b.finish(json, Map::new()))
 }
 
@@ -669,7 +671,7 @@ struct Reader<'o, 'a, 'x> {
     /// (geometry, its materials) → mesh.
     mesh_of: HashMap<(i64, Vec<usize>), Built>,
     materials: Vec<Full>,
-    images: Vec<Image>,
+    images: Images,
     material_index: HashMap<i64, usize>,
     image_index: HashMap<i64, Option<usize>>,
     /// The gray material primitives without one take.
@@ -1462,7 +1464,7 @@ fn read_material(
     dir: &Path,
     // None when textures aren't kept: they aren't read.
     assets: Option<&dyn Assets>,
-    images: &mut Vec<Image>,
+    images: &mut Images,
     image_index: &mut HashMap<i64, Option<usize>>,
 ) -> Full {
     let (node, _) = objs.nodes[&id];
@@ -1553,11 +1555,9 @@ fn read_material(
         let Some(assets) = assets else {
             continue;
         };
-        let img = *image_index.entry(tex).or_insert_with(|| {
-            let img = texture_image(tex, objs, dir, assets)?;
-            images.push(img);
-            Some(images.len() - 1)
-        });
+        let img = *image_index
+            .entry(tex)
+            .or_insert_with(|| texture_image(tex, objs, dir, assets, images));
         let Some(t) = img.map(|i| texture_tex(tex, objs, i)) else {
             continue;
         };
@@ -1626,7 +1626,7 @@ fn texture_tex(id: i64, objs: &Objects<'_>, image: usize) -> Tex {
 }
 
 /// A texture's pixels: embedded in a connected `Video`'s `Content`, or the file it names, found in the pack.
-fn texture_image(id: i64, objs: &Objects<'_>, dir: &Path, assets: &dyn Assets) -> Option<Image> {
+fn texture_image(id: i64, objs: &Objects<'_>, dir: &Path, assets: &dyn Assets, images: &mut Images) -> Option<usize> {
     let (node, _) = objs.nodes.get(&id)?;
     let names: Vec<String> = ["RelativeFilename", "FileName"]
         .iter()
@@ -1643,15 +1643,15 @@ fn texture_image(id: i64, objs: &Objects<'_>, dir: &Path, assets: &dyn Assets) -
                 || Path::new("t.png").to_path_buf(),
                 |n| Path::new(&n.replace('\\', "/")).to_path_buf(),
             );
-            if let Some(img) = assets.image(bytes, &hint) {
-                return Some(img);
+            let name = hint.to_string_lossy().into_owned();
+            let convert = |b: &[u8]| assets.image(b, &hint);
+            if let Some(i) = images.bytes(Cow::Borrowed(&bytes[..]), &name, Location::Embedded, convert) {
+                return Some(i);
             }
         }
     }
-    names
-        .iter()
-        .find_map(|n| assets.find(n, dir))
-        .and_then(|p| assets.load_image(&p))
+    let (name, path) = names.iter().find_map(|n| Some((n, assets.find(n, dir)?)))?;
+    images.file(assets, path, name)
 }
 
 /// Vertices already emitted for a primitive, by (control point, normal index, uv index, color index).

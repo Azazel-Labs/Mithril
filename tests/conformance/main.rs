@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use polysmelt::assets::{Folder, Memory};
 use polysmelt::document::{Document, Keep, Pose};
 use polysmelt::formats::{self, EXTENSIONS};
+use polysmelt::images::Location;
 use polysmelt::mesh::Mesh;
 use serde_json::{Map, Value};
 
@@ -792,6 +793,7 @@ fn reading_less_matches_pruning() {
         cameras: false,
         lights: false,
         extras: false,
+        image_bytes: false,
     };
     let keeps = [
         (
@@ -882,6 +884,91 @@ fn reading_less_matches_pruning() {
             }
         }
     }
+    assert!(
+        failures.is_empty(),
+        "{} reads differ:\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
+}
+
+/// A read that leaves images unread names the same ones a full read embeds: each loads, through
+/// its handle, to the image the full read has, and the rest of the document is the same.
+#[test]
+fn unread_images_load_as_read_ones() {
+    let light = Keep {
+        image_bytes: false,
+        ..Keep::ALL
+    };
+    let (mut failures, mut pending) = (Vec::new(), 0);
+    for dir in std::fs::read_dir(corpus()).unwrap().flatten() {
+        if !dir.path().is_dir() || dir.file_name() == "tools" {
+            continue;
+        }
+        for case in cases(&dir.file_name().to_string_lossy()) {
+            let ext = ext_of(&case.file);
+            let needs = case.expect.get("needs").and_then(Value::as_str);
+            if !enabled(&ext) || needs.is_some_and(|f| !has_feature(f)) || case.expect.contains_key("error") {
+                continue;
+            }
+            let assets = Folder::new(&case.dir);
+            let Ok(full) = formats::load(&case.file, &ext, &assets, Keep::ALL) else {
+                continue;
+            };
+            let mut less = match formats::load(&case.file, &ext, &assets, light) {
+                Ok(d) => d,
+                Err(e) => {
+                    failures.push(format!("{}: {e}", case.name));
+                    continue;
+                }
+            };
+            let mut bad = |why: String| failures.push(format!("{}: {why}", case.name));
+            for h in less.images().filter(polysmelt::images::ImageHandle::is_pending) {
+                pending += 1;
+                let uri = less.json["images"][h.index()].get("uri").and_then(Value::as_str);
+                if uri.is_none() {
+                    bad(format!("image {} is pending without a uri", h.index()));
+                }
+                if let Location::File(p) = h.location()
+                    && !p.is_file()
+                {
+                    bad(format!("image {} names {} as its file", h.index(), p.display()));
+                }
+            }
+            if let Err(e) = less.to_glb() {
+                bad(format!("unread images don't write: {e}"));
+            }
+            let unread = less.embed_images(&assets);
+            let read = |d: &Document<'_>| -> Vec<Option<(Vec<u8>, &'static str)>> {
+                d.images()
+                    .map(|h| h.load(&assets).ok().map(|i| (i.bytes, i.mime)))
+                    .collect()
+            };
+            let (a, b) = (read(&less), read(&full));
+            if unread > 0 {
+                // Images the assets can't embed are named all the same: those a full read did
+                // read are among the rest.
+                if b.iter().flatten().any(|img| !a.contains(&Some(img.clone()))) {
+                    bad("an image a full read has isn't among the unread ones".into());
+                }
+                continue;
+            }
+            if a != b {
+                bad("the images load differently".into());
+            }
+            let skip = ["accessors", "bufferViews", "buffers", "images"];
+            let differ: Vec<&String> = less
+                .json
+                .keys()
+                .chain(full.json.keys())
+                .filter(|k| !skip.contains(&k.as_str()) && less.json.get(*k) != full.json.get(*k))
+                .collect();
+            if !differ.is_empty() {
+                bad(format!("{differ:?} differ"));
+            }
+        }
+    }
+    assert!(pending > 0, "no case left an image unread");
     assert!(
         failures.is_empty(),
         "{} reads differ:\n  {}",

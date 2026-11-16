@@ -39,6 +39,12 @@ pub struct Keep {
     pub materials: bool,
     /// Textures, their images and samplers, and where materials use them.
     pub textures: bool,
+    /// The images' bytes. Without them, kept textures' images are found but not read or
+    /// converted: each is a glTF image with a `uri`, and [`Document::images`] has a handle on it
+    /// that says where it is (its file, if it's in one) and reads it on request.
+    /// [`Document::embed_images`] reads them all. [`Document::prune`] leaves images as they
+    /// are: once read, they stay read.
+    pub image_bytes: bool,
     /// Cameras.
     pub cameras: bool,
     /// Lights (`KHR_lights_punctual`).
@@ -62,6 +68,7 @@ impl Keep {
         morph_targets: true,
         materials: true,
         textures: true,
+        image_bytes: true,
         cameras: true,
         lights: true,
         extras: true,
@@ -74,6 +81,13 @@ impl Keep {
         cameras: false,
         lights: false,
         ..Keep::ALL
+    };
+
+    /// [`Keep::MESHES`] without reading the images: textures stay, as references to their
+    /// images (see [`Keep::image_bytes`]).
+    pub const LIGHT: Keep = Keep {
+        image_bytes: false,
+        ..Keep::MESHES
     };
 }
 
@@ -154,7 +168,11 @@ impl Document<'_> {
     /// removed with it, and extensions no longer used are unlisted. Extensions Polysmelt doesn't
     /// know that refer to dropped materials, textures or cameras may be left pointing at them.
     pub fn prune(&mut self, keep: Keep) {
-        if keep == Keep::ALL {
+        if (Keep {
+            image_bytes: true,
+            ..keep
+        }) == Keep::ALL
+        {
             return;
         }
         let mut before = BTreeSet::new();
@@ -236,6 +254,7 @@ impl Document<'_> {
             }
             each(json, "materials", remove_textures);
             dead.push("/textures/");
+            self.refs.clear();
         }
         if !keep.extras {
             remove_key_everywhere(&mut root, "extras");

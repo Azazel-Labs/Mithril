@@ -21,8 +21,9 @@ use super::xform::{self, IDENTITY, M4};
 use crate::Result;
 use crate::assets::Assets;
 use crate::document::{Builder, Document, Keep};
+use crate::images::Images;
 use crate::material::{self, Alpha, Factor, Full, Specular, Tex, UvTransform};
-use crate::mesh::{FastMap, GRAY, Image, MAX_TRIANGLES, Material, Prim, face_normal, srgb_to_linear};
+use crate::mesh::{FastMap, GRAY, MAX_TRIANGLES, Material, Prim, face_normal, srgb_to_linear};
 use crate::num::u32_of;
 
 const MAIN: u16 = 0x4D4D;
@@ -1064,9 +1065,9 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets, keep: Keep) -> 
     let mut materials: Vec<Material> = Vec::new();
     let mut raws: Vec<Map<String, Value>> = Vec::new();
     let mut looks: Vec<Look> = Vec::new();
-    let mut images: Vec<Image> = Vec::new();
     let mut by_name: HashMap<String, usize> = HashMap::new();
     let dir = input.dir();
+    let mut images = Images::new(!keep.image_bytes, dir);
     let mut image_of: HashMap<String, Option<usize>> = HashMap::new();
     let mut objects = Vec::new();
     for (id, b) in chunks(editor) {
@@ -1092,11 +1093,9 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets, keep: Keep) -> 
                     if !(keep.materials && keep.textures) {
                         return None;
                     }
-                    *image_of.entry(f.to_lowercase()).or_insert_with(|| {
-                        let img: Image = assets.find(f, dir).and_then(|p| assets.load_image(&p))?;
-                        images.push(img);
-                        Some(images.len() - 1)
-                    })
+                    *image_of
+                        .entry(f.to_lowercase())
+                        .or_insert_with(|| images.file(assets, assets.find(f, dir)?, f))
                 };
                 let image = m.texture.as_deref().and_then(&mut image_for);
                 let maps = m.raw.get("maps").and_then(Value::as_object);
@@ -1171,7 +1170,9 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets, keep: Keep) -> 
     for p in prims_of.iter().flatten().flatten().filter(|p| !p.uvs.is_empty()) {
         textured[p.material] = true;
     }
-    super::guess_texture(&mut materials, &mut images, &textured, input.path, assets);
+    if keep.materials && keep.textures {
+        super::guess_texture(&mut materials, &mut images, &textured, input.path, assets);
+    }
 
     let mut b = Builder::default();
     let mut nodes: Vec<Value> = Vec::new();
@@ -1433,7 +1434,7 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets, keep: Keep) -> 
         .iter()
         .enumerate()
         .map(|(i, m)| looks.get(i).map_or_else(|| Full::from(m), |l| l.full(m)));
-    b.materials(fulls, images, &mut json);
+    b.materials(fulls, images.list, &mut json);
     if keep.extras
         && let Some(Value::Array(list)) = json.get_mut("materials")
     {

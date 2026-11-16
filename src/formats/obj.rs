@@ -21,6 +21,7 @@ use super::stream;
 use crate::Result;
 use crate::assets::Assets;
 use crate::document::{Builder, Document, Keep, Part};
+use crate::images::Images;
 use crate::material::{self, Clearcoat, Factor, Full, Sheen, Specular, Tex, UvTransform};
 use crate::mesh::{MAX_TRIANGLES, Material, Prim, smooth_normals, srgb_to_linear, triangulate};
 use crate::num::u32_of;
@@ -962,7 +963,7 @@ pub(crate) fn obj(input: Input<'_>, assets: &dyn Assets, keep: Keep) -> Result<D
         });
         textured[m] |= !g.prim.uvs.is_empty();
     }
-    let mut images = Vec::new();
+    let mut images = Images::new(!keep.image_bytes, dir);
     let mut image_of: HashMap<std::path::PathBuf, Option<usize>> = HashMap::new();
     let mut out_materials = Vec::new();
     let mut looks: Vec<Look> = Vec::new();
@@ -993,11 +994,9 @@ pub(crate) fn obj(input: Input<'_>, assets: &dyn Assets, keep: Keep) -> Result<D
             }
             let reference = reference?;
             let found = assets.find(&reference.file, dir)?;
-            let image = (*image_of.entry(found.clone()).or_insert_with(|| {
-                let img = assets.load_image(&found)?;
-                images.push(img);
-                Some(images.len() - 1)
-            }))?;
+            let image = (*image_of
+                .entry(found.clone())
+                .or_insert_with(|| images.file(assets, found, &reference.file)))?;
             Some(reference.tex(image))
         };
         let color = texture(entry.and_then(|e| e.color_map.as_ref()));
@@ -1175,7 +1174,7 @@ pub(crate) fn obj(input: Input<'_>, assets: &dyn Assets, keep: Keep) -> Result<D
         .iter()
         .enumerate()
         .map(|(i, m)| looks.get(i).map_or_else(|| Full::from(m), |l| l.full(m)));
-    b.materials(fulls, images, &mut json);
+    b.materials(fulls, images.list, &mut json);
     // Every MTL statement, in its material's extras.
     if let Some(Value::Array(list)) = json.get_mut("materials") {
         for (mat, &name) in list.iter_mut().zip(&used) {

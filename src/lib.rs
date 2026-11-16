@@ -7,6 +7,7 @@
 //!   [`Keep`](document::Keep) asks for.
 //! - [`mesh`]: the flat triangle-list model, written out as a GLB.
 //! - [`assets`]: how readers find the textures and material libraries a model refers to.
+//! - [`images`]: handles on a document's images, for those a load found but didn't read.
 //! - [`gltf`]: GLB packing, and meshopt compression added to or decoded away from a GLB.
 //! - [`meshopt`]: the `EXT_meshopt_compression` and `KHR_meshopt_compression` bitstreams.
 
@@ -41,6 +42,7 @@ pub mod document;
 mod flatten;
 pub mod formats;
 pub mod gltf;
+pub mod images;
 mod keep;
 mod material;
 pub mod mesh;

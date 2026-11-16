@@ -29,7 +29,7 @@ pub(crate) fn stl(input: Input<'_>) -> Result<Document<'static>> {
     let Some(n) = binary_count(head, size) else {
         let solids: Vec<_> = ascii(blocks)?.into_iter().map(|(name, p)| (name, vec![p])).collect();
         let source = json!({ "format": "STL", "encoding": "ASCII" });
-        return Ok(document(solids, single(Prim::default()), source));
+        return Ok(document(solids, &single(Prim::default()), source));
     };
     ensure!(n <= MAX_TRIANGLES, "too many triangles to convert ({n})");
     let header: [u8; 80] = head[..80].try_into().unwrap_or([0; 80]);
@@ -52,15 +52,16 @@ pub(crate) fn stl(input: Input<'_>) -> Result<Document<'static>> {
         None => bail!("STL changed while being read"),
     };
     let prims = std::mem::take(&mut mesh.prims);
-    Ok(document(vec![(None, prims)], mesh, source))
+    Ok(document(vec![(None, prims)], &mesh, source))
 }
 
 /// The document for `meshes` using `mesh`'s materials, with its triangles counted.
-fn document(meshes: Vec<(Option<String>, Vec<Prim>)>, mesh: Mesh, source: Value) -> Document<'static> {
+fn document(meshes: Vec<(Option<String>, Vec<Prim>)>, mesh: &Mesh, source: Value) -> Document<'static> {
     let triangles: usize = meshes.iter().flat_map(|(_, p)| p).map(|p| p.indices.len() / 3).sum();
     let mut facts = Map::new();
     facts.insert("triangles".into(), json!(triangles));
-    Document::from_named(meshes, &mesh.materials, mesh.images, Some(source), facts)
+    // STL has no textures.
+    Document::from_named(meshes, &mesh.materials, Vec::new(), Some(source), facts)
 }
 
 /// A binary header's text: printable ASCII up to the first NUL, trimmed; `None` when that is

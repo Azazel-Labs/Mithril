@@ -27,6 +27,7 @@ use std::sync::Mutex;
 use serde_json::{Map, Value, json};
 
 use crate::gltf as container;
+use crate::images::{Refs, Source};
 use crate::material::{Full, Writer};
 use crate::mesh::{Image, Material, Mesh, Prim};
 use crate::num::usize_of;
@@ -44,6 +45,8 @@ pub struct Document<'a> {
     /// Facts worth recording about the source: `triangles`, and per format `points`, `lines`,
     /// `vertices`, `voxels`, `voxel_size`, `models`, `objects`, `colors`, `application`.
     pub facts: Map<String, Value>,
+    /// The images named but not read, by image index (see [`Document::images`]).
+    pub(crate) refs: Refs,
 }
 
 impl fmt::Debug for Document<'_> {
@@ -340,6 +343,7 @@ impl<'a> Document<'a> {
             json,
             buffers: Vec::new(),
             facts,
+            refs: Refs::new(),
         }
     }
 
@@ -350,6 +354,7 @@ impl<'a> Document<'a> {
             json: self.json,
             buffers: self.buffers.into_iter().map(Blob::into_owned).collect(),
             facts: self.facts,
+            refs: self.refs,
         }
     }
 
@@ -372,6 +377,29 @@ impl<'a> Document<'a> {
         Ok(Cow::Owned(out))
     }
 
+    /// Buffer view `i`'s bytes.
+    pub(crate) fn view_bytes(&self, i: usize) -> Result<Cow<'_, [u8]>> {
+        let v = list(&self.json, "bufferViews")
+            .get(i)
+            .with_context(|| format!("glTF bufferViews[{i}] doesn't exist"))?;
+        let num = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+        let (offset, len) = (num("byteOffset"), num("byteLength"));
+        let b = self
+            .buffers
+            .get(usize_of(num("buffer")))
+            .context("glTF buffer view names a missing buffer")?;
+        ensure!(
+            offset.saturating_add(len) <= b.len(),
+            "glTF buffer view runs past its buffer"
+        );
+        if let Some(s) = b.slice(offset, len) {
+            return Ok(Cow::Borrowed(s));
+        }
+        let mut out = vec![0; usize_of(len)];
+        b.read_at(offset, &mut out)?;
+        Ok(Cow::Owned(out))
+    }
+
     /// Adds a buffer holding `bytes`; returns its index.
     pub fn push_buffer(&mut self, bytes: Vec<u8>) -> usize {
         self.push_blob(Blob::Bytes(Cow::Owned(bytes)))
@@ -390,10 +418,6 @@ impl<'a> Document<'a> {
     }
 
     /// Adds a buffer view of a whole buffer; returns its index.
-    #[cfg_attr(
-        not(feature = "gltf"),
-        allow(dead_code, reason = "only the glTF reader embeds images")
-    )]
     pub(crate) fn push_view(&mut self, view: Value) -> usize {
         let views = self
             .json
@@ -540,6 +564,7 @@ impl<'a> Document<'a> {
             materials,
             images,
         } = mesh;
+        let images = images.into_iter().map(Source::Image).collect();
         Self::from_named(vec![(None, prims)], &materials, images, None, facts)
     }
 
@@ -549,7 +574,7 @@ impl<'a> Document<'a> {
     pub(crate) fn from_named(
         meshes: Vec<(Option<String>, Vec<Prim>)>,
         materials: &[Material],
-        images: Vec<Image>,
+        images: Vec<Source>,
         source: Option<Value>,
         facts: Map<String, Value>,
     ) -> Document<'static> {
@@ -592,6 +617,8 @@ pub(crate) struct Builder {
     pub parts: Parts,
     pub views: Vec<Value>,
     pub accessors: Vec<Value>,
+    /// The images named but not read, by image index.
+    pub refs: Refs,
 }
 
 impl Builder {
@@ -699,16 +726,23 @@ impl Builder {
     pub(crate) fn materials<M: Into<Full>>(
         &mut self,
         materials: impl IntoIterator<Item = M>,
-        images: Vec<Image>,
+        images: Vec<Source>,
         json: &mut Map<String, Value>,
     ) {
         let mut w = Writer::new(images.len());
         let materials: Vec<Value> = materials.into_iter().map(|m| w.material(&m.into())).collect();
         let images: Vec<Value> = images
             .into_iter()
-            .map(|Image { bytes, mime }| {
-                let v = self.view(Part::bytes(bytes), None);
-                json!({ "bufferView": v, "mimeType": mime })
+            .enumerate()
+            .map(|(i, s)| match s {
+                Source::Image(Image { bytes, mime }) => {
+                    let v = self.view(Part::bytes(bytes), None);
+                    json!({ "bufferView": v, "mimeType": mime })
+                }
+                Source::Ref(r, uri) => {
+                    self.refs.insert(i, r);
+                    json!({ "uri": uri })
+                }
             })
             .collect();
         let (textures, samplers, used) = w.finish();
@@ -747,7 +781,12 @@ impl Builder {
             json.insert("buffers".into(), json!([{ "byteLength": self.parts.len }]));
             buffers.push(Blob::Parts(self.parts));
         }
-        Document { json, buffers, facts }
+        Document {
+            json,
+            buffers,
+            facts,
+            refs: self.refs,
+        }
     }
 
     /// A buffer view of `part`; returns its index.
