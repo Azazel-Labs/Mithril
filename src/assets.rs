@@ -42,18 +42,20 @@ pub trait Assets {
 
     /// A color texture for a model at `model` that names none, by naming convention, from the
     /// model's part of the pack: its folder's parent and below (`Models/` and `Textures/` side by
-    /// side), so a sprite of the same name in another kit of a bundle isn't taken. `None` by
-    /// default.
+    /// side), so a sprite of the same name in another kit of a bundle isn't taken, and only from
+    /// the model's folder, above it, or a folder named for textures, so a sprite or preview of the
+    /// model beside it isn't either. `None` by default.
     fn color_texture_for(&self, model: &Path) -> Option<PathBuf> {
         let _ = model;
         None
     }
 }
 
-/// Assets in a folder tree laid out like the pack a model came in: references are tried next to
-/// the model, then found anywhere under `root` by file name (or the same name in another image
-/// format). A model naming no color texture takes one by name from its part of the pack:
-/// `Barrel.png` or `Barrel_Albedo.png` for `Barrel.obj`.
+/// Assets in a folder tree laid out like the pack a model came in: references are tried relative
+/// to the model (`../Textures/x.png` too, inside `root`), then found under `root` by file name (or
+/// the same name in another image format), the one nearest the model. A model naming no color
+/// texture takes one by name from its part of the pack: `Barrel.png` or `Barrel_Albedo.png` for
+/// `Barrel.obj`. Whichever order the folders list their files in, the same file is found.
 #[cfg(feature = "fs")]
 #[derive(Debug, Clone)]
 pub struct Folder {
@@ -82,15 +84,21 @@ impl Assets for Folder {
             .and_then(Path::parent)
             .filter(|h| h.starts_with(&self.root))
             .unwrap_or(&self.root);
-        color_texture_by_name(model, |visit| walk_images(home, visit))
+        let mut images = Vec::new();
+        walk_files(home, &mut |p| {
+            if image_stem(p).is_some() {
+                images.push(p.to_path_buf());
+            }
+        });
+        color_texture_by_name(model, home, images)
     }
 }
 
 /// Files held in memory by path: assets for loading without file access, found the way
 /// [`Folder`] finds them on disk. Paths are relative to the top of the pack and `/`-separated
-/// (`\` and a leading `./` or `/` read the same). A reference is tried next to the model, then
-/// anywhere by file name, then as the same name in another image format; a model naming no
-/// color texture takes one by name.
+/// (`\` and a leading `./` or `/` read the same). A reference is tried relative to the model,
+/// then by file name, then as the same name in another image format, the one nearest the model;
+/// a model naming no color texture takes one by name.
 #[derive(Debug, Clone, Default)]
 pub struct Memory {
     files: BTreeMap<String, Vec<u8>>,
@@ -126,15 +134,12 @@ impl Memory {
         self.files.keys().map(String::as_str)
     }
 
-    fn images(&self, visit: &mut dyn FnMut(&Path, &str) -> bool) {
-        for k in self.files.keys() {
-            let p = Path::new(k);
-            if let Some(stem) = image_stem(p)
-                && visit(p, &stem)
-            {
-                return;
-            }
-        }
+    fn images(&self) -> impl Iterator<Item = PathBuf> + '_ {
+        self.files
+            .keys()
+            .map(Path::new)
+            .filter(|p| image_stem(p).is_some())
+            .map(Path::to_path_buf)
     }
 }
 
@@ -154,11 +159,9 @@ impl Assets for Memory {
         let by_name = self
             .files
             .keys()
-            .find(|k| k.rsplit('/').next().is_some_and(|n| n.to_lowercase() == name));
-        if let Some(k) = by_name {
-            return Some(k.into());
-        }
-        same_name_other_format(&name, |visit| self.images(visit))
+            .filter(|k| k.rsplit('/').next().is_some_and(|n| n.to_lowercase() == name))
+            .map(PathBuf::from);
+        nearest(model_dir, by_name).or_else(|| same_name_other_format(&name, model_dir, self.images()))
     }
 
     fn read(&self, path: &Path) -> Option<Cow<'_, [u8]>> {
@@ -170,10 +173,9 @@ impl Assets for Memory {
     fn color_texture_for(&self, model: &Path) -> Option<PathBuf> {
         // The model's folder's parent: `a/b` for `a/b/Models/Barrel.obj`.
         let key = memory_key(&model.to_string_lossy());
-        let home = key.rsplitn(3, '/').nth(2).map(|h| format!("{h}/")).unwrap_or_default();
-        color_texture_by_name(model, |visit| {
-            self.images(&mut |p, stem| p.to_string_lossy().starts_with(&home) && visit(p, stem));
-        })
+        let home = Path::new(key.rsplitn(3, '/').nth(2).unwrap_or_default());
+        let images = self.images().filter(|p| p.starts_with(home));
+        color_texture_by_name(Path::new(&key), home, images)
     }
 }
 
@@ -193,54 +195,103 @@ pub(crate) fn memory_key(path: &str) -> String {
     parts.join("/")
 }
 
-/// A model's color texture by its name, from the images `walk` visits (until told to stop).
-fn color_texture_by_name(model: &Path, walk: impl FnOnce(&mut dyn FnMut(&Path, &str) -> bool)) -> Option<PathBuf> {
+/// A model's color texture by its name, from `images` in the pack's part under `home`: one in the
+/// model's folder or above it, or in a folder named for textures (`Textures/`, `Materials/`,
+/// `maps/`), never a sprite or preview of the model from beside it. A name that says it's the
+/// color wins over one that says nothing (`Barrel.png`), then the nearest, then the exact name.
+fn color_texture_by_name(model: &Path, home: &Path, images: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     let stem = model.file_stem()?.to_string_lossy().to_lowercase();
     if stem.len() < 3 || stem.contains('@') {
         return None;
     }
-    // A name that says it's the color wins; one that says nothing ("Barrel.png") will do.
-    let mut plain = None;
-    let mut color = None;
-    walk(&mut |p, file_stem| {
+    let model_dir = model.parent().unwrap_or(Path::new(""));
+    // (role, not the exact name, where, path): the least is the pick.
+    let mut best: Option<(u8, Closeness, bool, PathBuf)> = None;
+    for p in images {
+        let Some(file_stem) = image_stem(&p) else { continue };
         let Some(rest) = file_stem.strip_prefix(&stem) else {
-            return false;
+            continue;
         };
         if !(rest.is_empty() || rest.starts_with(['_', '-', ' ', '.'])) {
-            return false;
+            continue;
         }
-        match texture_role(file_stem) {
-            Some(Role::Color) if color.is_none() => color = Some(p.to_path_buf()),
-            None if plain.is_none() => plain = Some(p.to_path_buf()),
-            _ => {}
+        let role = match texture_role(&file_stem) {
+            Some(Role::Color) => 0,
+            None => 1,
+            Some(Role::Other) => continue,
+        };
+        let dir = p.parent().unwrap_or(Path::new(""));
+        let texture_folder = dir
+            .strip_prefix(home)
+            .unwrap_or(dir)
+            .components()
+            .any(|c| is_texture_folder(&c.as_os_str().to_string_lossy()));
+        if !texture_folder && !model_dir.starts_with(dir) {
+            continue;
         }
-        color.is_some()
-    });
-    color.or(plain)
+        let key = (role, closeness(model_dir, &p), !rest.is_empty(), p);
+        if best.as_ref().is_none_or(|b| key < *b) {
+            best = Some(key);
+        }
+    }
+    best.map(|(.., p)| p)
 }
 
-/// An image with the same name as `name` (lowercase) in another format (`rock.png` for
-/// `rock.tga`, as packs often ship), preferring PNG and JPEG, from the images `walk` visits.
-fn same_name_other_format(name: &str, walk: impl FnOnce(&mut dyn FnMut(&Path, &str) -> bool)) -> Option<PathBuf> {
-    let (stem, ext) = name.rsplit_once('.')?;
-    if !IMAGE_EXTS.contains(&ext) {
-        return None;
-    }
-    let mut best: Option<(u8, PathBuf)> = None;
-    walk(&mut |p, s| {
-        if s == stem {
+/// A folder whose name says it holds textures.
+fn is_texture_folder(name: &str) -> bool {
+    let name = name.to_lowercase();
+    ["tex", "material", "map", "skin", "albedo", "diffuse", "color", "colour"]
+        .iter()
+        .any(|w| name.contains(w))
+}
+
+/// How near a file is to a folder: the folders they share from the top (more is nearer), then
+/// how deep the file is (less is nearer).
+type Closeness = (std::cmp::Reverse<usize>, usize);
+
+fn closeness(dir: &Path, p: &Path) -> Closeness {
+    let parent = p.parent().unwrap_or(Path::new(""));
+    let lower = |c: std::path::Component<'_>| c.as_os_str().to_string_lossy().to_lowercase();
+    let shared = parent
+        .components()
+        .zip(dir.components())
+        .take_while(|(a, b)| lower(*a) == lower(*b))
+        .count();
+    (std::cmp::Reverse(shared), parent.components().count())
+}
+
+/// Of `candidates`, the one nearest the model's folder `dir`, then first by path: the same pick
+/// whatever order they come in.
+fn nearest(dir: &Path, candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    candidates
+        .into_iter()
+        .map(|p| (closeness(dir, &p), p))
+        .min()
+        .map(|(_, p)| p)
+}
+
+/// An image with the same stem as `name` (lowercase) in another format (`rock.png` for
+/// `rock.tga`, as packs often ship), or in any format when `name` has none (Blender's FBX
+/// exporter names packed images `x.fbm\rock`), preferring PNG and JPEG, then the nearest.
+fn same_name_other_format(name: &str, dir: &Path, images: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    let stem = match name.rsplit_once('.') {
+        Some((stem, ext)) if IMAGE_EXTS.contains(&ext) => stem,
+        Some(_) => return None,
+        None => name,
+    };
+    images
+        .into_iter()
+        .filter(|p| image_stem(p).as_deref() == Some(stem))
+        .map(|p| {
             let ext = p
                 .extension()
                 .map(|x| x.to_string_lossy().to_lowercase())
                 .unwrap_or_default();
-            let rank = u8::from(!matches!(ext.as_str(), "png" | "jpg" | "jpeg"));
-            if best.as_ref().is_none_or(|(r, _)| rank < *r) {
-                best = Some((rank, p.to_path_buf()));
-            }
-        }
-        best.as_ref().is_some_and(|(r, _)| *r == 0)
-    });
-    best.map(|(_, p)| p)
+            let other = !matches!(ext.as_str(), "png" | "jpg" | "jpeg");
+            (other, closeness(dir, &p), p)
+        })
+        .min()
+        .map(|(.., p)| p)
 }
 
 /// An image file's lowercased stem; `None` for a file that isn't an image.
@@ -302,72 +353,81 @@ const IMAGE_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "tga", "bmp", "webp", "gif", "tif", "tiff", "dds", "psd",
 ];
 
-/// Visit the image files under `root` (at most 20 000 entries), with their lowercased stems,
-/// until `visit` says stop.
+/// Visit the files under `root` (at most 20 000 entries, each folder's in name order).
 #[cfg(feature = "fs")]
-fn walk_images(root: &Path, visit: &mut dyn FnMut(&Path, &str) -> bool) {
+fn walk_files(root: &Path, visit: &mut dyn FnMut(&Path)) {
     let mut stack = vec![root.to_path_buf()];
     let mut seen = 0;
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        for e in entries.flatten() {
+        let mut entries: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        entries.sort();
+        let mut dirs = Vec::new();
+        for p in entries {
             seen += 1;
             if seen > 20_000 {
                 return;
             }
-            let p = e.path();
             if p.is_dir() {
-                stack.push(p);
-                continue;
-            }
-            if let Some(stem) = image_stem(&p)
-                && visit(&p, &stem)
-            {
-                return;
+                dirs.push(p);
+            } else {
+                visit(&p);
             }
         }
+        stack.extend(dirs.into_iter().rev());
     }
 }
 
-/// Find a texture a model refers to: next to it, relative to it, or anywhere under `root` by
-/// file name (artists' absolute paths like `C:\Users\me\tex\rock.tga` survive only as names).
-/// Failing that, an image with the same name in another format.
+/// `path` with its `.` and `..` parts worked out.
+#[cfg(feature = "fs")]
+fn tidy(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Find a texture a model refers to: relative to it (`../Textures/rock.png` too, inside `root`),
+/// or under `root` by file name, the one nearest the model (artists' absolute paths like
+/// `C:\Users\me\tex\rock.tga` survive only as names). Failing that, an image with the same name
+/// in another format.
 #[cfg(feature = "fs")]
 fn find_texture(reference: &str, model_dir: &Path, root: &Path) -> Option<PathBuf> {
     let cleaned = reference.trim().replace('\\', "/");
     if cleaned.is_empty() {
         return None;
     }
-    let rel = model_dir.join(&cleaned);
-    if !cleaned.starts_with('/') && !cleaned.contains(':') && !cleaned.split('/').any(|c| c == "..") && rel.is_file() {
-        return Some(rel);
-    }
-    let name = cleaned.rsplit('/').next()?.to_lowercase();
-    let mut stack = vec![root.to_path_buf()];
-    let mut seen = 0;
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            seen += 1;
-            if seen > 20_000 {
-                return None;
-            }
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p
-                .file_name()
-                .is_some_and(|n| n.to_string_lossy().to_lowercase() == name)
-            {
-                return Some(p);
-            }
+    if !cleaned.starts_with('/') && !cleaned.contains(':') {
+        let rel = model_dir.join(&cleaned);
+        let up = cleaned.split('/').any(|c| c == "..");
+        let inside = !up || tidy(&rel).starts_with(tidy(root));
+        if inside && rel.is_file() {
+            return Some(if up { tidy(&rel) } else { rel });
         }
     }
-    same_name_other_format(&name, |visit| walk_images(root, visit))
+    let name = cleaned.rsplit('/').next()?.to_lowercase();
+    let mut named = Vec::new();
+    let mut images = Vec::new();
+    walk_files(root, &mut |p| {
+        if p.file_name()
+            .is_some_and(|n| n.to_string_lossy().to_lowercase() == name)
+        {
+            named.push(p.to_path_buf());
+        } else if image_stem(p).is_some() {
+            images.push(p.to_path_buf());
+        }
+    });
+    nearest(model_dir, named).or_else(|| same_name_other_format(&name, model_dir, images))
 }
 
 #[cfg(all(test, feature = "fs"))]
@@ -419,9 +479,10 @@ mod tests {
             guess("Bundle/Kit3D/Models/Crate.fbx"),
             Some(PathBuf::from("Bundle/Kit3D/Textures/Crate.png"))
         );
+        assert_eq!(guess("Models/Stairs.fbx"), None, "a sprite is never taken");
         assert_eq!(
-            guess("Models/Stairs.fbx"),
-            Some(PathBuf::from("Bundle/Kit2D/Sprites/Stairs.png")),
+            guess("Models/Crate.fbx"),
+            Some(PathBuf::from("Bundle/Kit3D/Textures/Crate.png")),
             "a model near the top searches the whole pack"
         );
     }

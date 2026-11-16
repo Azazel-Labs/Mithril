@@ -106,6 +106,8 @@ pub(crate) struct Images {
         allow(dead_code, reason = "only readers of texture files use it")
     )]
     dir: PathBuf,
+    /// The texture files read so far, so a file named twice is one image.
+    files: std::collections::HashMap<PathBuf, Option<usize>>,
 }
 
 #[cfg_attr(
@@ -126,6 +128,7 @@ impl Images {
             list: Vec::new(),
             lazy,
             dir: dir.to_path_buf(),
+            files: std::collections::HashMap::new(),
         }
     }
 
@@ -141,6 +144,19 @@ impl Images {
     /// The texture file at `path`, found by the assets for `reference`: its index, or `None`
     /// when it's read and isn't an image the assets can embed.
     pub fn file(&mut self, assets: &dyn Assets, path: PathBuf, reference: &str) -> Option<usize> {
+        if let Some(&i) = self.files.get(&path) {
+            return i;
+        }
+        let i = self.read_file(assets, path.clone(), reference);
+        self.files.insert(path, i);
+        i
+    }
+
+    #[cfg_attr(
+        not(any(feature = "obj", feature = "ply", feature = "3ds", feature = "fbx", feature = "usd")),
+        allow(dead_code, reason = "only readers of texture files use it")
+    )]
+    fn read_file(&mut self, assets: &dyn Assets, path: PathBuf, reference: &str) -> Option<usize> {
         if !self.lazy {
             let img = assets.load_image(&path)?;
             return Some(self.push(Source::Image(img)));

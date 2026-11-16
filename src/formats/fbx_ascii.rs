@@ -254,6 +254,13 @@ fn node<'a>(lex: &mut Lexer<'a>, w: &mut Writer<std::io::Cursor<Vec<u8>>>, name:
                         _ => bail!("line {}: unexpected value in an array", lex.line),
                     }
                 }
+                // Some exporters write `2,5` for 2.5, which can't be told from two numbers.
+                ensure!(
+                    arr.len() == n,
+                    "line {}: an array of {n} values holds {} (numbers written with decimal commas?)",
+                    lex.line,
+                    arr.len()
+                );
                 vals.push(Val::Arr(arr));
             }
             Tok::Name(_) | Tok::Open | Tok::Close => unreachable!(),

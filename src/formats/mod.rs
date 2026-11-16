@@ -641,6 +641,171 @@ end_header
         assert_eq!(px.get_pixel(0, 0).0, [200, 100, 50]);
     }
 
+    /// Writes each `(path, bytes)` under `root`, making folders.
+    #[allow(dead_code)]
+    fn put(root: &Path, files: &[(&str, &[u8])]) {
+        for (rel, bytes) in files {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        }
+    }
+
+    /// The color of the first texture a mesh's materials wear.
+    #[allow(dead_code)]
+    fn texture_color(m: &Mesh) -> Option<[u8; 3]> {
+        let i = m.materials.iter().find_map(|x| x.color_image)?;
+        Some(
+            image::load_from_memory(&m.images[i].bytes)
+                .unwrap()
+                .to_rgb8()
+                .get_pixel(0, 0)
+                .0,
+        )
+    }
+
+    #[test]
+    #[cfg(feature = "obj")]
+    fn a_texture_by_name_is_never_a_sprite_or_preview_beside_the_model() {
+        // A Kenney kit: the 3D models, and 2D pictures of the same things beside them.
+        let dir = tempfile::tempdir().unwrap();
+        let obj = format!("{QUAD}f 1/1 2/2 3/3 4/4\n");
+        put(
+            dir.path(),
+            &[
+                ("Models/console.obj", obj.as_bytes()),
+                ("sprites_isometric/console_NE.png", &png([255, 0, 0])),
+                ("sprites_topdown/console.png", &png([0, 0, 255])),
+                ("Previews/console.png", &png([0, 255, 0])),
+            ],
+        );
+        let model = dir.path().join("Models/console.obj");
+        let (m, _) = load_in(&model, "obj", dir.path());
+        assert_eq!(texture_color(&m.unwrap()), None);
+
+        put(
+            dir.path(),
+            &[
+                ("Textures/console_Base.png", &png([1, 2, 3])),
+                ("Textures/console.png", &png([200, 100, 50])),
+            ],
+        );
+        let (m, _) = load_in(&model, "obj", dir.path());
+        assert_eq!(texture_color(&m.unwrap()), Some([200, 100, 50]), "the exact name");
+    }
+
+    #[test]
+    #[cfg(feature = "obj")]
+    fn a_texture_named_by_another_path_is_the_one_nearest_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let obj = format!("mtllib m.mtl\nusemtl m\n{QUAD}f 1/1 2/2 3/3 4/4\n");
+        let red = png([255, 0, 0]);
+        let blue = png([0, 0, 255]);
+        put(
+            dir.path(),
+            &[
+                ("a_kit/Models/m.obj", obj.as_bytes()),
+                ("a_kit/Models/colormap.png", &red),
+                ("a_kit/Textures/wood.png", &red),
+                ("a_kit/Textures/stone.png", &red),
+                ("a_kit/Models/stone.jpg", &red),
+                ("z_kit/colormap.png", &blue),
+                ("z_kit/Textures/wood.png", &blue),
+                ("z_kit/Textures/stone.png", &blue),
+                ("z_kit/Models/m.fbm/cobblestone.png", &blue),
+                ("a_kit/Models/cobblestone.png", &red),
+            ],
+        );
+        let model = dir.path().join("a_kit/Models/m.obj");
+        for map in [
+            "C:\\Users\\artist\\tex\\colormap.png",
+            "/home/artist/colormap.png",
+            "../Textures/wood.png",
+            "stone.tga",
+            "m.fbm\\cobblestone",
+        ] {
+            std::fs::write(
+                dir.path().join("a_kit/Models/m.mtl"),
+                format!("newmtl m\nKd 1 1 1\nmap_Kd {map}\n"),
+            )
+            .unwrap();
+            let (m, _) = load_in(&model, "obj", dir.path());
+            assert_eq!(texture_color(&m.unwrap()), Some([255, 0, 0]), "{map}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "obj")]
+    fn a_texture_named_twice_is_one_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let obj = format!("mtllib m.mtl\n{QUAD}usemtl a\nf 1/1 2/2 3/3\nusemtl b\nf 1/1 3/3 4/4\n");
+        put(
+            dir.path(),
+            &[
+                ("m.obj", obj.as_bytes()),
+                (
+                    "m.mtl",
+                    b"newmtl a\nKd 1 1 1\nmap_Kd tex.png\nnewmtl b\nKd 1 1 1\nmap_Kd ./tex.png\n",
+                ),
+                ("tex.png", &png([255, 0, 0])),
+            ],
+        );
+        let (m, _) = load_in(&dir.path().join("m.obj"), "obj", dir.path());
+        assert_eq!(m.unwrap().images.len(), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "fbx")]
+    fn fbx_textures_naming_one_file_are_one_image() {
+        // Blender writes a Texture node per material, `colormap` and `colormap.001`, for one file.
+        let quad = |id: u32, model: u32, x: u32| {
+            format!(
+                "\tGeometry: {id}, \"Geometry::Q{id}\", \"Mesh\" {{\n\t\tVertices: *12 {{\n\t\t\ta: {x},0,0,{},0,0,{},1,0,{x},1,0\n\t\t}}\n\
+                 \t\tPolygonVertexIndex: *4 {{\n\t\t\ta: 0,1,2,-4\n\t\t}}\n\t\tLayerElementUV: 0 {{\n\
+                 \t\t\tMappingInformationType: \"ByPolygonVertex\"\n\t\t\tReferenceInformationType: \"IndexToDirect\"\n\
+                 \t\t\tUV: *8 {{\n\t\t\t\ta: 0,0,1,0,1,1,0,1\n\t\t\t}}\n\t\t\tUVIndex: *4 {{\n\t\t\t\ta: 0,1,2,3\n\t\t\t}}\n\t\t}}\n\t}}\n\
+                 \tModel: {model}, \"Model::M{model}\", \"Mesh\" {{\n\t}}\n",
+                x + 1,
+                x + 1
+            )
+        };
+        let fbx = format!(
+            "; FBX 7.3.0 project file\nFBXHeaderExtension:  {{\n\tFBXVersion: 7300\n}}\nObjects:  {{\n{}{}\
+             \tMaterial: 30, \"Material::colormap\", \"\" {{\n\t}}\n\tMaterial: 31, \"Material::colormap-specular\", \"\" {{\n\t}}\n\
+             \tTexture: 40, \"Texture::colormap\", \"\" {{\n\t\tRelativeFilename: \"tex.png\"\n\t}}\n\
+             \tTexture: 41, \"Texture::colormap.001\", \"\" {{\n\t\tRelativeFilename: \"tex.png\"\n\t}}\n}}\n\
+             Connections:  {{\n\tC: \"OO\",10,20\n\tC: \"OO\",11,21\n\tC: \"OO\",20,0\n\tC: \"OO\",21,0\n\tC: \"OO\",30,20\n\
+             \tC: \"OO\",31,21\n\tC: \"OP\",40,30, \"DiffuseColor\"\n\tC: \"OP\",41,31, \"DiffuseColor\"\n}}\n",
+            quad(10, 20, 0),
+            quad(11, 21, 2)
+        );
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), &[("m.fbx", fbx.as_bytes()), ("tex.png", &png([255, 0, 0]))]);
+        let (m, _) = load_in(&dir.path().join("m.fbx"), "fbx", dir.path());
+        let m = m.unwrap();
+        assert_eq!(m.images.len(), 1);
+        assert!(
+            m.materials.iter().all(|x| x.color_image == Some(0)),
+            "{:?}",
+            m.materials
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "fbx")]
+    fn an_ascii_fbx_written_with_decimal_commas_is_refused() {
+        // Asset Forge writes 2.5 as `2,5`: `*12` declared, 18 numbers there.
+        let fbx = "; FBX 7.3.0 project file\nFBXHeaderExtension:  {\n\tFBXVersion: 7300\n}\nObjects:  {\n\
+                   \tGeometry: 2, \"Geometry::Quad\", \"Mesh\" {\n\t\tVertices: *12 {\n\
+                   \t\t\ta: 0,0,0,0,5,0,0,0,5,0,5,0,5,0,0,0,5,0\n\t\t}\n\
+                   \t\tPolygonVertexIndex: *4 {\n\t\t\ta: 0,1,2,-4\n\t\t}\n\t}\n\
+                   \tModel: 20, \"Model::Quad\", \"Mesh\" {\n\t}\n}\nConnections:  {\n\tC: \"OO\",2,20\n\tC: \"OO\",20,0\n}\n";
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), &[("q.fbx", fbx.as_bytes())]);
+        let err = load(&dir.path().join("q.fbx"), "fbx", &Folder::new(dir.path()), Keep::ALL).unwrap_err();
+        assert!(format!("{err:#}").contains("decimal commas"), "{err:#}");
+    }
+
     #[test]
     #[cfg(feature = "obj")]
     fn a_model_colored_by_its_materials_takes_no_texture_by_name() {
