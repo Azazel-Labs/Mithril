@@ -21,6 +21,7 @@ use super::xform::{self, IDENTITY, M4};
 use crate::Result;
 use crate::assets::Assets;
 use crate::document::{Builder, Document, Keep};
+use crate::material::{self, Alpha, Factor, Full, Specular, Tex, UvTransform};
 use crate::mesh::{FastMap, GRAY, Image, MAX_TRIANGLES, Material, Prim, face_normal, srgb_to_linear};
 use crate::num::u32_of;
 
@@ -220,6 +221,9 @@ struct Mat {
     alpha: f32,
     texture: Option<String>,
     glossiness: Option<f32>,
+    /// The highlight's color, and how strong it is (0 to 1).
+    specular: Option<[f32; 3]>,
+    shine_strength: Option<f32>,
     self_illum: f32,
     two_sided: bool,
     /// Every value the material chunk holds, by name, as written.
@@ -233,6 +237,8 @@ fn material(d: &[u8]) -> Mat {
         alpha: 1.0,
         texture: None,
         glossiness: None,
+        specular: None,
+        shine_strength: None,
         self_illum: 0.0,
         two_sided: false,
         raw: Map::new(),
@@ -247,6 +253,8 @@ fn material(d: &[u8]) -> Mat {
             MAT_AMBIENT | MAT_DIFFUSE | MAT_SPECULAR => {
                 if id == MAT_DIFFUSE {
                     m.color = color(b).unwrap_or(m.color);
+                } else if id == MAT_SPECULAR {
+                    m.specular = color(b);
                 }
                 let key = match id {
                     MAT_AMBIENT => "ambient",
@@ -270,7 +278,10 @@ fn material(d: &[u8]) -> Mat {
                         m.self_illum = p.unwrap_or(0.0);
                         "selfIllumination"
                     }
-                    MAT_SHIN_STRENGTH => "shininessStrength",
+                    MAT_SHIN_STRENGTH => {
+                        m.shine_strength = p;
+                        "shininessStrength"
+                    }
                     MAT_XPFALL => "transparencyFalloff",
                     _ => "reflectionBlur",
                 };
@@ -313,6 +324,68 @@ fn material(d: &[u8]) -> Mat {
         m.raw.insert("maps".into(), Value::Object(maps));
     }
     m
+}
+
+/// What a material shows beyond its flat view: how its color map is laid out, its highlight and the map that
+/// tints it, its glow map, and whether the color map's alpha cuts it.
+#[derive(Default)]
+struct Look {
+    color: Option<Tex>,
+    specular: Option<Specular>,
+    emissive: Option<Tex>,
+    alpha_source: bool,
+}
+
+/// Bit flags of a map's tiling: mirrored, not tiled, the image's alpha as opacity.
+const TILE_MIRROR: u64 = 0x2;
+const TILE_NONE: u64 = 0x10;
+const TILE_ALPHA: u64 = 0x40;
+
+/// `image` laid out as a map says: its tiling as the wrap and its scale, offset and angle as a texture transform.
+/// 3DS's are taken as `uv' = rotate(angle) * scale * uv + offset` with V up, and turned into glTF's V-down UVs.
+fn map_tex(map: &Map<String, Value>, image: usize) -> Tex {
+    #[allow(clippy::cast_possible_truncation, reason = "they were f32s")]
+    let num = |k: &str, d: f32| map.get(k).and_then(Value::as_f64).map_or(d, |v| v as f32);
+    let scale = |k: &str| Some(num(k, 1.0)).filter(|s| *s != 0.0).unwrap_or(1.0);
+    let (su, sv) = (scale("uScale"), scale("vScale"));
+    let (tu, tv) = (num("uOffset", 0.0), num("vOffset", 0.0));
+    let angle = num("rotation", 0.0).to_radians();
+    let (sin, cos) = angle.sin_cos();
+    let mut t = Tex::new(image);
+    let x = UvTransform {
+        offset: [tu - sv * sin, 1.0 - tv - sv * cos],
+        rotation: angle,
+        scale: [su, sv],
+    };
+    // With V flipped, the identity comes back as (0, 0) offset.
+    if (su, sv, tu, tv, angle) != (1.0, 1.0, 0.0, 0.0, 0.0) {
+        t.transform = Some(x);
+    }
+    let tiling = map.get("tiling").and_then(Value::as_u64).unwrap_or(0);
+    if tiling & TILE_NONE != 0 {
+        t.wrap = [material::CLAMP; 2];
+    } else if tiling & TILE_MIRROR != 0 {
+        t.wrap = [material::MIRROR; 2];
+    }
+    t
+}
+
+impl Look {
+    fn full(&self, m: &Material) -> Full {
+        let mut f = Full::from(m);
+        if let (Some(t), Some(c)) = (&mut f.base_color_tex, &self.color) {
+            *t = Tex {
+                image: t.image,
+                ..c.clone()
+            };
+            if self.alpha_source {
+                f.alpha = Alpha::Blend;
+            }
+        }
+        f.specular.clone_from(&self.specular);
+        f.emissive_tex.clone_from(&self.emissive);
+        f
+    }
 }
 
 /// A texture map's file and every value it holds.
@@ -990,6 +1063,7 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets, keep: Keep) -> 
 
     let mut materials: Vec<Material> = Vec::new();
     let mut raws: Vec<Map<String, Value>> = Vec::new();
+    let mut looks: Vec<Look> = Vec::new();
     let mut images: Vec<Image> = Vec::new();
     let mut by_name: HashMap<String, usize> = HashMap::new();
     let dir = input.dir();
@@ -1014,12 +1088,35 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets, keep: Keep) -> 
             }
             MATERIAL => {
                 let m = material(b);
-                let image = m.texture.as_ref().and_then(|f| {
+                let mut image_for = |f: &str| {
                     *image_of.entry(f.to_lowercase()).or_insert_with(|| {
                         let img: Image = assets.find(f, dir).and_then(|p| assets.load_image(&p))?;
                         images.push(img);
                         Some(images.len() - 1)
                     })
+                };
+                let image = m.texture.as_deref().and_then(&mut image_for);
+                let maps = m.raw.get("maps").and_then(Value::as_object);
+                let map = |k: &str| maps.and_then(|ms| ms.get(k)).and_then(Value::as_object);
+                let mut slot = |k: &str| {
+                    let map = map(k)?;
+                    let image = image_for(map.get("file")?.as_str()?)?;
+                    Some(map_tex(map, image))
+                };
+                let (spec_tex, emissive) = (slot("specular"), slot("selfIllumination"));
+                let tiling = map("texture").and_then(|t| t.get("tiling")).and_then(Value::as_u64);
+                looks.push(Look {
+                    color: image.and(map("texture")).map(|t| map_tex(t, 0)),
+                    // Phong's highlight: its color, scaled by its strength.
+                    specular: (m.specular.is_some() || m.shine_strength.is_some() || spec_tex.is_some()).then(|| {
+                        Specular {
+                            factor: Factor::of(m.shine_strength.unwrap_or(1.0)),
+                            color: m.specular.unwrap_or([1.0; 3]),
+                            color_tex: spec_tex,
+                        }
+                    }),
+                    emissive,
+                    alpha_source: tiling.is_some_and(|t| t & TILE_ALPHA != 0),
                 });
                 // A texture shows as painted, not tinted by the color under it.
                 let rgb = if image.is_some() { [1.0; 3] } else { m.color };
@@ -1329,7 +1426,11 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets, keep: Keep) -> 
             json!({ "KHR_lights_punctual": { "lights": lights } }),
         );
     }
-    b.materials(&materials, images, &mut json);
+    let fulls = materials
+        .iter()
+        .enumerate()
+        .map(|(i, m)| looks.get(i).map_or_else(|| Full::from(m), |l| l.full(m)));
+    b.materials(fulls, images, &mut json);
     if keep.extras
         && let Some(Value::Array(list)) = json.get_mut("materials")
     {

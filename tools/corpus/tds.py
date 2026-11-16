@@ -26,6 +26,8 @@ UVS, SMOOTHING, MESH_MATRIX, LIGHT, CAMERA = 0x4140, 0x4150, 0x4160, 0x4600, 0x4
 MATERIAL, MAT_NAME, MAT_AMBIENT, MAT_DIFFUSE, MAT_SPECULAR = 0xAFFF, 0xA000, 0xA010, 0xA020, 0xA030
 MAT_SHININESS, MAT_SHIN_STRENGTH, MAT_TRANSPARENCY = 0xA040, 0xA041, 0xA050
 MAT_TWO_SIDE, MAT_SELF_ILPCT, MAT_TEXMAP, MAP_FILE = 0xA081, 0xA084, 0xA200, 0xA300
+MAT_SPECMAP, MAT_SELFIMAP = 0xA204, 0xA33D
+MAP_TILING, MAP_USCALE, MAP_VSCALE, MAP_UOFFSET, MAP_VOFFSET, MAP_ANGLE = 0xA351, 0xA354, 0xA356, 0xA358, 0xA35A, 0xA35C
 COLOR_F, COLOR_24, LIN_COLOR_24, LIN_COLOR_F = 0x0010, 0x0011, 0x0012, 0x0013
 PERCENT_I, PERCENT_F = 0x0030, 0x0031
 KEYFRAMER, KFHDR, KFSEG, OBJECT_NODE_TAG = 0xB000, 0xB00A, 0xB008, 0xB002
@@ -72,8 +74,16 @@ def material(name, diffuse=None, *extra):
     return chunk(MATERIAL, *parts, *extra)
 
 
-def texmap(filename):
-    return chunk(MAT_TEXMAP, pct(100), chunk(MAP_FILE, cstr(filename)))
+def texmap(filename, *extra, cid=MAT_TEXMAP):
+    return chunk(cid, pct(100), chunk(MAP_FILE, cstr(filename)), *extra)
+
+
+def tiling(flags):
+    return chunk(MAP_TILING, u16s([flags]))
+
+
+def mapf(cid, v):
+    return chunk(cid, f32s([v]))
 
 
 def trimesh(verts, faces, uvs=None, mats=(), smoothing=None, matrix=None, flags=7):
@@ -353,6 +363,64 @@ textured("texture_absolute_path", "C:\\3DSMAX\\MAPS\\teal.png", {"maps/teal.png"
          extra=": a texture named by the absolute path it had on the author's machine")
 textured("texture_missing", "gone.png", {}, expect_textured=False,
          extra=": a texture that isn't there leaves the diffuse color")
+
+# --- the full material: map layout, the highlight and glow maps ---------------------------------
+
+M0 = "/materials/0"
+BASE_TEX = M0 + "/pbrMetallicRoughness/baseColorTexture"
+XFORM = BASE_TEX + "/extensions/KHR_texture_transform"
+
+
+def full_case(name, spec, mat, files, json):
+    quad = trimesh(QUAD, QUAD_FACES, uvs=QUAD_UV, mats=[("Tex", [0, 1])])
+    case(FMT, name, {"quad.3ds": model(mat, obj("Quad", quad)), **files},
+         {"spec": SPEC + spec, "source": SRC, "triangles": 2, "json": json})
+
+
+full_case("texture_scale_offset_mirror",
+          ": a map's MAP_TILING (mirrored), MAP_U/VSCALE and MAP_U/VOFFSET as KHR_texture_transform on V-flipped "
+          "UVs (offset v is 1 - vOffset - vScale) and a mirroring sampler",
+          material("Tex", color24(RED), texmap("teal.png", tiling(0x2), mapf(MAP_USCALE, 2), mapf(MAP_VSCALE, 3),
+                                               mapf(MAP_UOFFSET, 0.25), mapf(MAP_VOFFSET, 0.5))),
+          {"teal.png": png(TEAL)},
+          {XFORM: {"offset": [0.25, -2.5], "scale": [2, 3]}, "/samplers/0": {"wrapS": 33648, "wrapT": 33648}})
+
+full_case("texture_angle",
+          ": MAP_ANG (degrees) as the transform's rotation; turning about the V-flipped origin moves it",
+          material("Tex", color24(RED), texmap("teal.png", mapf(MAP_ANGLE, 90))),
+          {"teal.png": png(TEAL)},
+          {XFORM: {"offset": [-1, 1], "rotation": r(math.pi / 2)}, XFORM + "/scale": None})
+
+full_case("texture_no_tiling",
+          ": MAP_TILING's no-tiling flag (0x10) clamps",
+          material("Tex", color24(RED), texmap("teal.png", tiling(0x10))),
+          {"teal.png": png(TEAL)},
+          {XFORM: None, "/samplers/0": {"wrapS": 33071, "wrapT": 33071}})
+
+full_case("texture_alpha_source",
+          ": MAP_TILING's alpha-source flag (0x40): the map's alpha is the opacity",
+          material("Tex", color24(RED), texmap("teal.png", tiling(0x40))),
+          {"teal.png": png(TEAL)},
+          {M0 + "/alphaMode": "BLEND"})
+
+spec_c = r(srgb_to_linear(200 / 255))
+full_case("specular_highlight",
+          ": MAT_SPECULAR and MAT_SHIN2PCT as KHR_materials_specular (color and strength), MAT_SPECMAP as its "
+          "color texture",
+          chunk(MATERIAL, chunk(MAT_NAME, cstr("Tex")), chunk(MAT_DIFFUSE, color24(RED)),
+                chunk(MAT_SPECULAR, color24((200, 200, 200))), chunk(MAT_SHIN_STRENGTH, pct(50)),
+                texmap("teal.png", cid=MAT_SPECMAP)),
+          {"teal.png": png(TEAL)},
+          {M0 + "/extensions/KHR_materials_specular": {"specularFactor": 0.5,
+                                                        "specularColorFactor": [spec_c] * 3,
+                                                        "specularColorTexture": {}}})
+
+full_case("self_illumination_map",
+          ": MAT_SELFIMAP as the emissive texture",
+          chunk(MATERIAL, chunk(MAT_NAME, cstr("Tex")), chunk(MAT_DIFFUSE, color24(RED)),
+                texmap("teal.png", cid=MAT_SELFIMAP)),
+          {"teal.png": png(TEAL)},
+          {M0 + "/emissiveTexture": {}, M0 + "/emissiveFactor": [1, 1, 1]})
 
 case(FMT, "uvs_fewer_than_vertices",
      {"quad.3ds": model(obj("Quad", trimesh(QUAD, QUAD_FACES, uvs=QUAD_UV[:2])))},

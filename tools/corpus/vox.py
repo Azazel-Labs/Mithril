@@ -254,6 +254,23 @@ case(FMT, "matl_emit",
      {"spec": EXT + ": MATL _emit glows in its palette color", "source": SRC,
       "materials": [{"color": lin(PAL[0]), "emissive": lin(PAL[0])[:3]}]})
 
+case(FMT, "matl_glass",
+     {"m.vox": vox(size(1, 1, 1), xyzi([(0, 0, 0, 1)]), rgba(PAL),
+                   matl(1, {"_type": "_glass", "_trans": "0.8", "_ior": "0.5", "_rough": "0.1"}))},
+     {"spec": EXT + ": MATL _glass: _trans as KHR_materials_transmission, and _ior (the index less one) as "
+              "KHR_materials_ior",
+      "source": SRC, "materials": [{"roughness": 0.1}],
+      "json": {"/materials/0/extensions/KHR_materials_transmission/transmissionFactor": 0.8,
+               "/materials/0/extensions/KHR_materials_ior/ior": 1.5}})
+
+case(FMT, "matl_emit_flux",
+     {"m.vox": vox(size(1, 1, 1), xyzi([(0, 0, 0, 1)]), rgba(PAL),
+                   matl(1, {"_type": "_emit", "_emit": "1", "_flux": "2"}))},
+     {"spec": EXT + ": MATL _emit with _flux (power) brighter than one, as KHR_materials_emissive_strength",
+      "source": SRC,
+      "json": {"/materials/0/emissiveFactor": [1, 0, 0],
+               "/materials/0/extensions/KHR_materials_emissive_strength/emissiveStrength": 3}})
+
 # --- errors -----------------------------------------------------------------------------------
 
 case(FMT, "not_vox", {"bad.vox": b"NOPE" + bytes(32)},

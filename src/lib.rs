@@ -42,6 +42,7 @@ mod flatten;
 pub mod formats;
 pub mod gltf;
 mod keep;
+mod material;
 pub mod mesh;
 pub mod meshopt;
 mod num;

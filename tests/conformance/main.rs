@@ -234,6 +234,44 @@ fn document(e: &Map<String, Value>, doc: &Document<'_>) -> Result<(), String> {
     Ok(())
 }
 
+/// `json`: values the glTF JSON holds, by JSON pointer (`/materials/0/extensions/KHR_materials_ior/ior`). Numbers
+/// match to within 1e-4 (relative), arrays and objects member by member; `null` means the pointer must lead nowhere.
+fn pointers(e: &Map<String, Value>, doc: &Document<'_>) -> Result<(), String> {
+    fn same(got: &Value, want: &Value) -> bool {
+        match (got, want) {
+            (Value::Number(g), Value::Number(w)) => {
+                let (g, w) = (g.as_f64().unwrap_or(f64::NAN), w.as_f64().unwrap_or(f64::NAN));
+                (g - w).abs() <= 1e-4 * w.abs().max(1.0)
+            }
+            (Value::Array(g), Value::Array(w)) => g.len() == w.len() && g.iter().zip(w).all(|(g, w)| same(g, w)),
+            (Value::Object(g), Value::Object(w)) => w.iter().all(|(k, w)| g.get(k).is_some_and(|g| same(g, w))),
+            _ => got == want,
+        }
+    }
+    for (pointer, want) in e.get("json").and_then(Value::as_object).into_iter().flatten() {
+        // The document's JSON is a map: its first segment is a key, the rest a pointer into that member.
+        let (top, rest) = pointer
+            .trim_start_matches('/')
+            .split_once('/')
+            .unwrap_or((pointer.trim_start_matches('/'), ""));
+        let got = doc.json.get(top).and_then(|v| {
+            if rest.is_empty() {
+                Some(v)
+            } else {
+                v.pointer(&format!("/{rest}"))
+            }
+        });
+        match (got, want) {
+            (None, Value::Null) => {}
+            (Some(got), Value::Null) => return Err(format!("{pointer} is {got}, expected nothing")),
+            (None, _) => return Err(format!("{pointer} is missing, expected {want}")),
+            (Some(got), _) if !same(got, want) => return Err(format!("{pointer} is {got}, expected {want}")),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// `poses`: the bounds of what's drawn in animation `animation` at `time` seconds.
 fn poses(e: &Map<String, Value>, doc: &Document<'_>, tol: f32) -> Result<(), String> {
     for p in e.get("poses").and_then(Value::as_array).into_iter().flatten() {
@@ -376,6 +414,7 @@ fn run(case: &Case) -> Result<(), String> {
         }
     }
     document(e, &doc)?;
+    pointers(e, &doc)?;
     poses(e, &doc, tol)?;
     decoded(case, &ext, mesh.as_ref(), tol)?;
     if e.get("no_mesh").and_then(Value::as_bool) == Some(true) {

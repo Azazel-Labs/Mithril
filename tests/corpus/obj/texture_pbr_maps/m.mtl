@@ -1,0 +1,8 @@
+newmtl pbr
+Kd 1 1 1
+Pr 1
+map_Pr orm.png
+map_Pm orm.png
+Ke 1 1 1
+map_Ke glow.png
+map_Bump -bm 0.5 normal.png

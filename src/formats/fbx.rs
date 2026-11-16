@@ -18,6 +18,7 @@ use serde_json::{Map, Value, json};
 
 use crate::assets::Assets;
 use crate::document::{Builder, Document, Keep, Part};
+use crate::material::{self, Alpha, Clearcoat, Factor, Full, Sheen, Tex, UvTransform};
 use crate::mesh::{GRAY, Image, Material, Prim, smooth_normals, srgb_to_linear, triangulate};
 use crate::num::f32_of;
 
@@ -357,15 +358,15 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets, keep: Keep) -> 
     ensure!(!r.nodes.is_empty(), "FBX has no mesh geometry");
 
     if !r.textured.is_empty()
-        && !r.materials.iter().any(|m| m.color_image.is_some())
+        && !r.materials.iter().any(|m| m.base_color_tex.is_some())
         && let Some(img) = assets.color_texture_for(input.path).and_then(|p| assets.load_image(&p))
     {
         // A model that names no color texture takes one by name (see `guess_color_texture`).
         r.images.push(img);
         let i = r.images.len() - 1;
         for &m in &r.textured {
-            r.materials[m].color_image = Some(i);
-            r.materials[m].color[..3].copy_from_slice(&[1.0, 1.0, 1.0]);
+            r.materials[m].base_color_tex = Some(Tex::new(i));
+            r.materials[m].base_color[..3].copy_from_slice(&[1.0, 1.0, 1.0]);
         }
     }
 
@@ -667,7 +668,7 @@ struct Reader<'o, 'a, 'x> {
     meshes: Vec<Value>,
     /// (geometry, its materials) → mesh.
     mesh_of: HashMap<(i64, Vec<usize>), Built>,
-    materials: Vec<Material>,
+    materials: Vec<Full>,
     images: Vec<Image>,
     material_index: HashMap<i64, usize>,
     image_index: HashMap<i64, Option<usize>>,
@@ -872,7 +873,7 @@ impl Reader<'_, '_, '_> {
 
     fn default_material(&mut self) -> usize {
         *self.default_material.get_or_insert_with(|| {
-            self.materials.push(Material::plain("default", GRAY));
+            self.materials.push(Material::plain("default", GRAY).into());
             self.materials.len() - 1
         })
     }
@@ -1407,6 +1408,53 @@ fn kind_of(node: NodeHandle<'_>) -> &str {
     node.attributes().get(2).and_then(string).unwrap_or("")
 }
 
+/// The material slot a texture connects to, from the property it connects as: the classic slots (`DiffuseColor`,
+/// `NormalMap`, ...), Stingray PBS's (`Maya|TEX_color_map`, ...) and 3ds Max Physical's
+/// (`3dsMax|Parameters|base_color_map`, ...).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Slot {
+    Color,
+    Normal,
+    Emissive,
+    Occlusion,
+    Metallic,
+    Roughness,
+    Opacity,
+}
+
+fn slot(prop: &str) -> Option<Slot> {
+    let s: String = prop
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_lowercase();
+    Some(
+        if s.contains("emissive") || s.contains("emitcolor") || s.contains("emission") {
+            Slot::Emissive
+        } else if s.contains("normal") || s == "bump" || s.ends_with("bumpmap") {
+            Slot::Normal
+        } else if s.contains("aomap") || s.contains("ambientocclusion") {
+            Slot::Occlusion
+        } else if s.contains("metallic") || s.contains("metalness") {
+            Slot::Metallic
+        } else if s.contains("roughness") {
+            Slot::Roughness
+        } else if s.contains("transparentcolor")
+            || s.contains("transparencyfactor")
+            || s.contains("opacity")
+            || s.contains("cutout")
+        {
+            Slot::Opacity
+        } else if s.contains("diffusecolor") || s == "diffuse" || s.contains("basecolor") || s.ends_with("texcolormap")
+        {
+            Slot::Color
+        } else {
+            return None;
+        },
+    )
+}
+
+#[allow(clippy::too_many_lines, reason = "one property after another")]
 fn read_material(
     id: i64,
     objs: &Objects<'_>,
@@ -1415,7 +1463,7 @@ fn read_material(
     assets: &dyn Assets,
     images: &mut Vec<Image>,
     image_index: &mut HashMap<i64, Option<usize>>,
-) -> Material {
+) -> Full {
     let (node, _) = objs.nodes[&id];
     let p = props(node);
     let name = node
@@ -1436,7 +1484,10 @@ fn read_material(
     let d = to_linear(vec3(&p, "DiffuseColor", vec3(&p, "Diffuse", [0.8, 0.8, 0.8])));
     let alpha =
         scalar(&p, "Opacity").unwrap_or_else(|| 1.0 - scalar(&p, "TransparencyFactor").unwrap_or(0.0).clamp(0.0, 1.0));
-    let mut mat = Material::plain(&name, [d[0], d[1], d[2], f32_of(alpha.clamp(0.0, 1.0))]);
+    let mut mat = Full::from(Material::plain(
+        &name,
+        [d[0], d[1], d[2], f32_of(alpha.clamp(0.0, 1.0))],
+    ));
     // The emissive color is a color (sRGB unless Blender's); its factor is a linear intensity.
     let factor = f32_of(scalar(&p, "EmissiveFactor").unwrap_or(1.0).max(0.0));
     mat.emissive = to_linear(vec3(&p, "EmissiveColor", vec3(&p, "Emissive", [0.0; 3]))).map(|c| c * factor);
@@ -1448,29 +1499,126 @@ fn read_material(
     if linear && let Some(m) = scalar(&p, "ReflectionFactor") {
         mat.metallic = f32_of(m.clamp(0.0, 1.0));
     }
-    for (tex, prop) in objs.children.get(&id).cloned().unwrap_or_default() {
-        let slot = prop.to_lowercase();
-        let is_color = slot.contains("diffusecolor") || slot.contains("basecolor") || slot == "diffuse";
-        let is_normal = slot.contains("normalmap") || slot == "bump" || slot.contains("normal");
-        if !is_color && !is_normal {
-            continue;
+    let f = |k: &str| scalar(&p, k).map(f32_of);
+    // Stingray PBS (Maya, and 3ds Max's export of it).
+    if p.contains_key("Maya|base_color") {
+        let c = to_linear(vec3(&p, "Maya|base_color", [1.0; 3]));
+        mat.base_color[..3].copy_from_slice(&c);
+        mat.metallic = f("Maya|metallic").unwrap_or(0.0);
+        mat.roughness = f("Maya|roughness").unwrap_or(0.5);
+        let e = to_linear(vec3(&p, "Maya|emissive", [0.0; 3]));
+        mat.emissive = e.map(|c| c * f("Maya|emissive_intensity").unwrap_or(1.0).max(0.0));
+    }
+    // 3ds Max's Physical Material.
+    let k = |name: &str| format!("3dsMax|Parameters|{name}");
+    if p.contains_key(&k("base_color")) {
+        let c = to_linear(vec3(&p, &k("base_color"), [1.0; 3]));
+        let w = f(&k("base_weight")).unwrap_or(1.0);
+        mat.base_color[..3].copy_from_slice(&c.map(|c| c * w));
+        mat.metallic = f(&k("metalness")).unwrap_or(0.0);
+        let r = f(&k("roughness")).unwrap_or(0.0);
+        // Its roughness may be a glossiness.
+        mat.roughness = if f(&k("roughness_inv")).is_some_and(|i| i > 0.5) {
+            1.0 - r
+        } else {
+            r
+        };
+        let e = to_linear(vec3(&p, &k("emit_color"), [0.0; 3]));
+        mat.emissive = e.map(|c| c * f(&k("emission")).unwrap_or(0.0).max(0.0));
+        if let Some(t) = f(&k("trans_weight")).filter(|t| *t > 0.0) {
+            mat.transmission = Some(Factor::of(t));
         }
+        mat.ior = f(&k("trans_ior")).filter(|i| *i >= 1.0);
+        if let Some(c) = f(&k("coat")).filter(|c| *c > 0.0) {
+            mat.clearcoat = Some(Clearcoat {
+                factor: Factor::of(c),
+                roughness: Factor::of(f(&k("coat_roughness")).unwrap_or(0.0)),
+                normal: None,
+            });
+        }
+        if let Some(s) = f(&k("sheen")).filter(|s| *s > 0.0) {
+            mat.sheen = Some(Sheen {
+                color: to_linear(vec3(&p, &k("sheen_color"), [1.0; 3])).map(|c| c * s),
+                color_tex: None,
+                roughness: Factor::of(f(&k("sheen_roughness")).unwrap_or(0.3)),
+            });
+        }
+    }
+    let (mut metallic, mut roughness, mut opacity) = (None, None, None);
+    for (tex, prop) in objs.children.get(&id).cloned().unwrap_or_default() {
+        let Some(slot) = slot(&prop) else {
+            continue;
+        };
         let img = *image_index.entry(tex).or_insert_with(|| {
             let img = texture_image(tex, objs, dir, assets)?;
             images.push(img);
             Some(images.len() - 1)
         });
-        if is_color && mat.color_image.is_none() {
-            mat.color_image = img;
-            // A textured material's diffuse factor is usually a leftover; white shows the texture as painted.
-            if img.is_some() {
-                mat.color[..3].copy_from_slice(&[1.0, 1.0, 1.0]);
+        let Some(t) = img.map(|i| texture_tex(tex, objs, i)) else {
+            continue;
+        };
+        match slot {
+            Slot::Color if mat.base_color_tex.is_none() => {
+                // A textured material's diffuse factor is usually a leftover; white shows the texture as painted.
+                if !p.contains_key("Maya|base_color") {
+                    mat.base_color[..3].copy_from_slice(&[1.0, 1.0, 1.0]);
+                }
+                mat.base_color_tex = Some(t);
             }
-        } else if is_normal && mat.normal_image.is_none() {
-            mat.normal_image = img;
+            Slot::Normal if mat.normal_tex.is_none() => mat.normal_tex = Some(t),
+            Slot::Emissive if mat.emissive_tex.is_none() => mat.emissive_tex = Some(t),
+            Slot::Occlusion if mat.occlusion_tex.is_none() => mat.occlusion_tex = Some(t),
+            Slot::Metallic => metallic = Some(t),
+            Slot::Roughness => roughness = Some(t),
+            Slot::Opacity => opacity = Some(t),
+            _ => {}
         }
     }
+    // glTF reads roughness and metalness from one image's green and blue.
+    if let (Some(m), Some(r)) = (&metallic, &roughness)
+        && m.image == r.image
+    {
+        mat.metallic_roughness_tex.clone_from(&roughness);
+        mat.metallic = 1.0;
+        mat.roughness = 1.0;
+    }
+    // Opacity from the color texture is its alpha, glTF's own arrangement.
+    if let (Some(o), Some(c)) = (&opacity, &mat.base_color_tex)
+        && o.image == c.image
+        && mat.alpha == Alpha::Opaque
+    {
+        mat.alpha = Alpha::Blend;
+    }
     mat
+}
+
+/// A texture of `image` as texture `id` lays it out: its wrap modes, and its translation, rotation and scaling (on
+/// UVs with V up, as `uv' = rotate * scale * uv + translate`) as a transform of the document's V-down UVs.
+fn texture_tex(id: i64, objs: &Objects<'_>, image: usize) -> Tex {
+    let mut t = Tex::new(image);
+    let Some((node, _)) = objs.nodes.get(&id) else {
+        return t;
+    };
+    let p = props(*node);
+    let wrap = |k: &str| match scalar(&p, k) {
+        Some(w) if w != 0.0 => material::CLAMP,
+        _ => material::REPEAT,
+    };
+    t.wrap = [wrap("WrapModeU"), wrap("WrapModeV")];
+    let [tu, tv, _] = vec3(&p, "Translation", [0.0; 3]).map(f32_of);
+    let [_, _, angle] = vec3(&p, "Rotation", [0.0; 3]).map(f32_of);
+    let [su, sv, _] = vec3(&p, "Scaling", [1.0; 3]).map(f32_of);
+    let (su, sv) = (if su == 0.0 { 1.0 } else { su }, if sv == 0.0 { 1.0 } else { sv });
+    let angle = angle.to_radians();
+    if (su, sv, tu, tv, angle) != (1.0, 1.0, 0.0, 0.0, 0.0) {
+        let (sin, cos) = angle.sin_cos();
+        t.transform = Some(UvTransform {
+            offset: [tu - sv * sin, 1.0 - tv - sv * cos],
+            rotation: angle,
+            scale: [su, sv],
+        });
+    }
+    t
 }
 
 /// A texture's pixels: embedded in a connected `Video`'s `Content`, or the file it names, found in the pack.

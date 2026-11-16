@@ -1,0 +1,8 @@
+newmtl full
+Kd 1 1 1
+Ks 0.25 0.25 0.25
+Ni 1.45
+Ps 0.5 0.5 0.5
+Pc 1
+Pcr 0.1
+aniso 0.5

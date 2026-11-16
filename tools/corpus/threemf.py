@@ -10,6 +10,7 @@ metres: (x, y, z) becomes (x, z, -y) times the unit.
 """
 
 import io
+import math
 import re
 import zipfile
 
@@ -310,6 +311,58 @@ textured("texture", "/3D/Textures/teal.png", {"3D/Textures/teal.png": png(TEAL)}
          spec=": a 2D texture and its coordinates (origin bottom-left, so V flips)")
 textured("texture_missing", "/3D/Textures/gone.png", {}, ok=False,
          spec=": a texture whose part isn't in the package")
+
+# --- display properties: how base materials look beyond their color ----------------------------
+
+
+def displayed(name, spec, props, json):
+    two = ('<basematerials id="7" displaypropertiesid="8"><base name="A" displaycolor="#FF0000"/>'
+           '<base name="B" displaycolor="#0000FF"/></basematerials>')
+    body = mesh(CUBE_P, CUBE_T, lambda i: ' pid="7" p1="1"' if i >= 6 else "")
+    case(FMT, name, {"cube.3mf": package({"3D/3dmodel.model": model(
+        two + props + obj(1, body, ' pid="7" pindex="0"'), item(1))})},
+        {"spec": MAT + spec, "source": SRC, **CUBE, "primitives": 2, "json": json})
+
+
+displayed("display_pbmetallic", ": metallic display properties (pbmetallic) for each base material",
+          '<m:pbmetallicdisplayproperties id="8"><m:pbmetallic name="A" metallicness="1" roughness="0.2"/>'
+          '<m:pbmetallic name="B" metallicness="0" roughness="0.7"/></m:pbmetallicdisplayproperties>',
+          {"/materials/0/pbrMetallicRoughness": {"metallicFactor": 1, "roughnessFactor": 0.2},
+           "/materials/1/pbrMetallicRoughness": {"metallicFactor": 0, "roughnessFactor": 0.7}})
+
+spec_c = r(srgb_to_linear(128 / 255) / 0.04)
+displayed("display_pbspecular",
+          ": specular display properties (pbspecular): glossiness as 1 - roughness, and the specular color "
+          "(what reflects head on, sRGB) as KHR_materials_specular's color, which scales a dielectric's 4%",
+          '<m:pbspeculardisplayproperties id="8"><m:pbspecular name="A" specularcolor="#808080" glossiness="0.75"/>'
+          '<m:pbspecular name="B"/></m:pbspeculardisplayproperties>',
+          {"/materials/0/pbrMetallicRoughness": {"metallicFactor": 0, "roughnessFactor": 0.25},
+           "/materials/0/extensions/KHR_materials_specular/specularColorFactor": [spec_c] * 3})
+
+displayed("display_translucent",
+          ": translucent display properties: transmission, the mean index of refraction, and the attenuation per "
+          "millimetre as KHR_materials_volume (the most absorbed channel's 1/e distance, each channel's color there)",
+          '<m:translucentdisplayproperties id="8"><m:translucent name="A" attenuation="0.5 1 2" '
+          'refractiveindex="1.4 1.5 1.6" roughness="0.1"/><m:translucent name="B" attenuation="0 0 0" '
+          'refractiveindex="1.5 1.5 1.5" roughness="0"/></m:translucentdisplayproperties>',
+          {"/materials/0/pbrMetallicRoughness/roughnessFactor": 0.1,
+           "/materials/0/extensions/KHR_materials_transmission/transmissionFactor": 1,
+           "/materials/0/extensions/KHR_materials_ior/ior": 1.5,
+           "/materials/0/extensions/KHR_materials_volume": {
+               "thicknessFactor": 0.5, "attenuationDistance": 0.5,
+               "attenuationColor": [r(math.exp(-0.25)), r(math.exp(-0.5)), r(math.exp(-1))]},
+           "/materials/1/extensions/KHR_materials_volume": None})
+
+tiled = ('<m:texture2d id="10" path="/3D/Textures/teal.png" contenttype="image/png" tilestyleu="mirror" '
+         'tilestylev="clamp"/><m:texture2dgroup id="11" texid="10">' +
+         "".join(f'<m:tex2coord u="{u}" v="{v}"/>' for u, v in COORDS) + "</m:texture2dgroup>")
+case(FMT, "texture_tile_styles",
+     {"quad.3mf": package({"3D/3dmodel.model": model(
+         tiled + obj(1, mesh(QUAD, QUAD_T, lambda i: ' pid="11" p1="{}" p2="{}" p3="{}"'.format(*QUAD_T[i]))),
+         item(1)), "3D/Textures/teal.png": png(TEAL)})},
+     {"spec": MAT + ": a texture's tilestyleu and tilestylev as its sampler's wrap", "source": SRC, "triangles": 2,
+      "materials": [{"textured": True}],
+      "json": {"/samplers/0": {"wrapS": 33648, "wrapT": 33071}}})
 
 # --- slicer projects --------------------------------------------------------------------------
 

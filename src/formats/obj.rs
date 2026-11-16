@@ -21,6 +21,7 @@ use super::stream;
 use crate::Result;
 use crate::assets::Assets;
 use crate::document::{Builder, Document, Part};
+use crate::material::{self, Clearcoat, Factor, Full, Sheen, Specular, Tex, UvTransform};
 use crate::mesh::{MAX_TRIANGLES, Material, Prim, smooth_normals, srgb_to_linear, triangulate};
 use crate::num::u32_of;
 
@@ -40,8 +41,25 @@ struct MtlEntry {
     roughness: Option<f32>,
     metallic: Option<f32>,
     shininess: Option<f32>,
-    color_map: Option<String>,
-    normal_map: Option<String>,
+    color_map: Option<MapRef>,
+    normal_map: Option<MapRef>,
+    /// `map_Ke`, `map_Ks`, `map_Ps`, and `map_Pr` and `map_Pm` (glTF's metal-roughness texture when one file).
+    emissive_map: Option<MapRef>,
+    specular_map: Option<MapRef>,
+    sheen_map: Option<MapRef>,
+    roughness_map: Option<MapRef>,
+    metallic_map: Option<MapRef>,
+    /// `Ks`, Phong's highlight color.
+    specular: Option<[f32; 3]>,
+    /// `Ni`.
+    ior: Option<f32>,
+    /// `Ps`, `Pc`, `Pcr` and `aniso`: the PBR extension's sheen, clearcoat and anisotropy.
+    sheen: Option<[f32; 3]>,
+    clearcoat: Option<f32>,
+    clearcoat_roughness: Option<f32>,
+    anisotropy: Option<f32>,
+    /// `illum`.
+    illum: Option<f32>,
     /// Every statement as written: numbers as numbers, the rest as text.
     raw: Map<String, Value>,
 }
@@ -123,13 +141,56 @@ fn nums<const N: usize>(rest: &[u8]) -> ([f32; N], usize) {
     (out, n)
 }
 
-/// A texture statement's file name, after any options (`-s 1 1 1`, `-bm 0.5`, ...). The name
-/// is the rest of the line, so it may contain spaces.
-fn map_file(rest: &[u8]) -> Option<String> {
+/// A texture statement: its file, and the options glTF has a place for.
+#[derive(Debug, Clone, PartialEq)]
+struct MapRef {
+    file: String,
+    /// `-o` and `-s`: `uv' = uv * scale + offset`, V up.
+    offset: [f32; 2],
+    scale: [f32; 2],
+    /// `-clamp on`.
+    clamp: bool,
+    /// `-bm`: a bump or normal map's strength.
+    bump: f32,
+}
+
+impl MapRef {
+    /// The texture of `image` as this statement lays it out, in glTF's V-down UVs.
+    fn tex(&self, image: usize) -> Tex {
+        let mut t = Tex::new(image);
+        let [su, sv] = self.scale;
+        let [ou, ov] = self.offset;
+        #[allow(clippy::float_cmp, reason = "the identity is written exactly")]
+        let moved = self.scale != [1.0; 2] || self.offset != [0.0; 2];
+        if moved {
+            t.transform = Some(UvTransform {
+                offset: [ou, 1.0 - sv - ov],
+                rotation: 0.0,
+                scale: [su, sv],
+            });
+        }
+        if self.clamp {
+            t.wrap = [material::CLAMP; 2];
+        }
+        t.scale = self.bump;
+        t
+    }
+}
+
+/// A texture statement: the file name after any options (`-s 1 1 1`, `-bm 0.5`, ...), and the options' values.
+fn map_ref(rest: &[u8]) -> Option<MapRef> {
+    let mut m = MapRef {
+        file: String::new(),
+        offset: [0.0; 2],
+        scale: [1.0; 2],
+        clamp: false,
+        bump: 1.0,
+    };
     let mut rest = trim(rest);
     while rest.first() == Some(&b'-') {
         let (opt, after) = split_key(rest);
-        let args = match opt.to_ascii_lowercase().as_slice() {
+        let opt = opt.to_ascii_lowercase();
+        let args = match opt.as_slice() {
             b"-blendu" | b"-blendv" | b"-bm" | b"-boost" | b"-cc" | b"-clamp" | b"-imfchan" | b"-texres" | b"-type" => {
                 1
             }
@@ -139,16 +200,79 @@ fn map_file(rest: &[u8]) -> Option<String> {
             _ => break,
         };
         rest = after;
+        let mut values = Vec::new();
         for k in 0..args {
             let (w, after) = split_key(rest);
             // Optional arguments end at the first word that isn't a number.
             if k > 0 && args == 3 && num(w).is_none() {
                 break;
             }
+            values.push(w);
             rest = after;
         }
+        let n = |i: usize| values.get(i).and_then(|w| num(w)).filter(|x| x.is_finite());
+        match opt.as_slice() {
+            b"-o" => m.offset = [n(0).unwrap_or(0.0), n(1).unwrap_or(0.0)],
+            b"-s" => m.scale = [n(0).unwrap_or(1.0), n(1).unwrap_or(1.0)],
+            b"-clamp" => m.clamp = values.first().is_some_and(|w| w.eq_ignore_ascii_case(b"on")),
+            b"-bm" => m.bump = n(0).unwrap_or(1.0),
+            _ => {}
+        }
     }
-    (!rest.is_empty()).then(|| text(rest))
+    m.file = text(rest);
+    (!rest.is_empty()).then_some(m)
+}
+
+/// What a material shows beyond its flat view, from the MTL statements glTF has a place for.
+#[derive(Default)]
+struct Look {
+    color: Option<Tex>,
+    normal: Option<Tex>,
+    metal_rough: Option<Tex>,
+    emissive: Option<Tex>,
+    specular: Option<Specular>,
+    ior: Option<f32>,
+    sheen: Option<Sheen>,
+    clearcoat: Option<Clearcoat>,
+    anisotropy: Option<f32>,
+    unlit: bool,
+}
+
+impl Look {
+    fn full(&self, m: &Material) -> Full {
+        let mut f = Full::from(m);
+        // `guess_texture` may have found a color texture the MTL file doesn't name.
+        if let (Some(t), Some(c)) = (&mut f.base_color_tex, &self.color) {
+            *t = Tex {
+                image: t.image,
+                ..c.clone()
+            };
+        }
+        if let (Some(t), Some(n)) = (&mut f.normal_tex, &self.normal) {
+            *t = Tex {
+                image: t.image,
+                ..n.clone()
+            };
+        }
+        if let Some(t) = &self.metal_rough {
+            f.metallic_roughness_tex = Some(t.clone());
+            // The texture is the value, unscaled, unless the file says otherwise.
+            if m.metallic <= 0.0 {
+                f.metallic = 1.0;
+            }
+        }
+        f.emissive_tex.clone_from(&self.emissive);
+        f.specular.clone_from(&self.specular);
+        f.ior = self.ior;
+        f.sheen.clone_from(&self.sheen);
+        f.clearcoat.clone_from(&self.clearcoat);
+        f.anisotropy = self.anisotropy.map(|a| material::Anisotropy {
+            strength: Factor::of(a),
+            rotation: 0.0,
+        });
+        f.unlit = self.unlit;
+        f
+    }
 }
 
 /// Adds an MTL file's materials to `out`.
@@ -180,8 +304,20 @@ fn read_mtl(data: &[u8], out: &mut HashMap<String, MtlEntry>) {
             b"pr" if n > 0 => e.roughness = Some(f[0]),
             b"pm" if n > 0 => e.metallic = Some(f[0]),
             b"ns" if n > 0 => e.shininess = Some(f[0]),
-            b"map_kd" => e.color_map = map_file(rest),
-            b"map_bump" | b"bump" | b"norm" | b"map_kn" => e.normal_map = map_file(rest),
+            b"ks" => e.specular = rgb().or(e.specular),
+            b"ni" if n > 0 => e.ior = Some(f[0]),
+            b"ps" => e.sheen = rgb().or(e.sheen),
+            b"pc" if n > 0 => e.clearcoat = Some(f[0]),
+            b"pcr" if n > 0 => e.clearcoat_roughness = Some(f[0]),
+            b"aniso" if n > 0 => e.anisotropy = Some(f[0]),
+            b"illum" if n > 0 => e.illum = Some(f[0]),
+            b"map_kd" => e.color_map = map_ref(rest),
+            b"map_bump" | b"bump" | b"norm" | b"map_kn" => e.normal_map = map_ref(rest),
+            b"map_ke" => e.emissive_map = map_ref(rest),
+            b"map_ks" => e.specular_map = map_ref(rest),
+            b"map_ps" => e.sheen_map = map_ref(rest),
+            b"map_pr" => e.roughness_map = map_ref(rest),
+            b"map_pm" => e.metallic_map = map_ref(rest),
             _ => {}
         }
     });
@@ -823,6 +959,7 @@ pub(crate) fn obj(input: Input<'_>, assets: &dyn Assets) -> Result<Document<'sta
     let mut images = Vec::new();
     let mut image_of: HashMap<std::path::PathBuf, Option<usize>> = HashMap::new();
     let mut out_materials = Vec::new();
+    let mut looks: Vec<Look> = Vec::new();
     for (m, &name) in used.iter().enumerate() {
         let name = &names[name];
         let entry = mtl.get(name);
@@ -844,19 +981,69 @@ pub(crate) fn obj(input: Input<'_>, assets: &dyn Assets) -> Result<Document<'sta
                 mat.roughness = r;
             }
         }
-        let mut texture = |reference: Option<&String>| -> Option<usize> {
+        let mut texture = |reference: Option<&MapRef>| -> Option<Tex> {
             if !textured[m] {
                 return None;
             }
-            let found = assets.find(reference?, dir)?;
-            *image_of.entry(found.clone()).or_insert_with(|| {
+            let reference = reference?;
+            let found = assets.find(&reference.file, dir)?;
+            let image = (*image_of.entry(found.clone()).or_insert_with(|| {
                 let img = assets.load_image(&found)?;
                 images.push(img);
                 Some(images.len() - 1)
-            })
+            }))?;
+            Some(reference.tex(image))
         };
-        mat.color_image = texture(entry.and_then(|e| e.color_map.as_ref()));
-        mat.normal_image = texture(entry.and_then(|e| e.normal_map.as_ref()));
+        let color = texture(entry.and_then(|e| e.color_map.as_ref()));
+        let normal = texture(entry.and_then(|e| e.normal_map.as_ref()));
+        mat.color_image = color.as_ref().map(|t| t.image);
+        mat.normal_image = normal.as_ref().map(|t| t.image);
+        let mut look = Look {
+            color,
+            normal,
+            ..Look::default()
+        };
+        if let Some(e) = entry {
+            look.emissive = texture(e.emissive_map.as_ref());
+            // glTF reads roughness and metalness from one image's green and blue.
+            if e.roughness_map.is_some() && e.roughness_map == e.metallic_map {
+                look.metal_rough = texture(e.roughness_map.as_ref());
+            }
+            let pbr = e.roughness.is_some() || e.metallic.is_some();
+            let spec_tex = texture(e.specular_map.as_ref());
+            if !pbr && (e.specular.is_some() || spec_tex.is_some()) {
+                // Phong's highlight, where half is glTF's usual.
+                look.specular = Some(Specular {
+                    factor: Factor::of(1.0),
+                    color: e.specular.unwrap_or([0.5; 3]).map(|c| c * 2.0),
+                    color_tex: spec_tex,
+                });
+            }
+            // Every exporter writes Ni, often a placeholder of 1 (which would take the highlight away).
+            look.ior = e.ior.filter(|i| *i > 1.0 && *i <= 5.0);
+            let sheen_tex = texture(e.sheen_map.as_ref());
+            if e.sheen.is_some() || sheen_tex.is_some() {
+                look.sheen = Some(Sheen {
+                    color: e.sheen.unwrap_or([1.0; 3]),
+                    color_tex: sheen_tex,
+                    roughness: Factor::of(0.0),
+                });
+            }
+            if e.clearcoat.is_some() || e.clearcoat_roughness.is_some() {
+                look.clearcoat = Some(Clearcoat {
+                    factor: Factor::of(e.clearcoat.unwrap_or(1.0)),
+                    roughness: Factor::of(e.clearcoat_roughness.unwrap_or(0.0)),
+                    normal: None,
+                });
+            }
+            look.anisotropy = e.anisotropy;
+            // Color on, ambient off: the color as it is, unlit.
+            #[allow(clippy::float_cmp, reason = "illum is a whole number")]
+            {
+                look.unlit = e.illum == Some(0.0);
+            }
+        }
+        looks.push(look);
         out_materials.push(mat);
     }
     let linear = super::linear_colors(input, "obj");
@@ -865,6 +1052,9 @@ pub(crate) fn obj(input: Input<'_>, assets: &dyn Assets) -> Result<Document<'sta
             for c in m.color[..3].iter_mut().chain(&mut m.emissive) {
                 *c = srgb_to_linear(*c);
             }
+        }
+        for s in looks.iter_mut().filter_map(|l| l.sheen.as_mut()) {
+            s.color = s.color.map(srgb_to_linear);
         }
     }
     super::guess_texture(&mut out_materials, &mut images, &textured, input.path, assets);
@@ -973,7 +1163,11 @@ pub(crate) fn obj(input: Input<'_>, assets: &dyn Assets) -> Result<Document<'sta
     );
     json.insert("nodes".into(), Value::Array(nodes));
     json.insert("meshes".into(), Value::Array(meshes));
-    b.materials(&out_materials, images, &mut json);
+    let fulls = out_materials
+        .iter()
+        .enumerate()
+        .map(|(i, m)| looks.get(i).map_or_else(|| Full::from(m), |l| l.full(m)));
+    b.materials(fulls, images, &mut json);
     // Every MTL statement, in its material's extras.
     if let Some(Value::Array(list)) = json.get_mut("materials") {
         for (mat, &name) in list.iter_mut().zip(&used) {

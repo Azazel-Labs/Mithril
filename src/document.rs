@@ -27,6 +27,7 @@ use std::sync::Mutex;
 use serde_json::{Map, Value, json};
 
 use crate::gltf as container;
+use crate::material::{Full, Writer};
 use crate::mesh::{Image, Material, Mesh, Prim};
 use crate::num::usize_of;
 use crate::{Context as _, Result};
@@ -692,10 +693,17 @@ impl Builder {
         a
     }
 
-    /// Adds `materials` and `images` to `json`: one texture per image, all sharing a repeating,
-    /// mipmapped sampler. Nothing is added for an empty list.
-    pub(crate) fn materials(&mut self, materials: &[Material], images: Vec<Image>, json: &mut Map<String, Value>) {
-        let image_count = images.len();
+    /// Adds `materials` and `images` to `json`, with the textures and samplers they use (texture `i` is image
+    /// `i`, repeating, and more for other wraps) and the extensions they use added to `extensionsUsed`. Nothing is
+    /// added for an empty list.
+    pub(crate) fn materials<M: Into<Full>>(
+        &mut self,
+        materials: impl IntoIterator<Item = M>,
+        images: Vec<Image>,
+        json: &mut Map<String, Value>,
+    ) {
+        let mut w = Writer::new(images.len());
+        let materials: Vec<Value> = materials.into_iter().map(|m| w.material(&m.into())).collect();
         let images: Vec<Value> = images
             .into_iter()
             .map(|Image { bytes, mime }| {
@@ -703,59 +711,22 @@ impl Builder {
                 json!({ "bufferView": v, "mimeType": mime })
             })
             .collect();
-        let mut bright = false;
-        let materials: Vec<Value> = materials
-            .iter()
-            .map(|m| {
-                let color = m.color.map(|c| c.clamp(0.0, 1.0));
-                let mut pbr = json!({
-                    "baseColorFactor": color,
-                    "metallicFactor": m.metallic.clamp(0.0, 1.0),
-                    "roughnessFactor": m.roughness.clamp(0.0, 1.0),
-                });
-                if let Some(i) = m.color_image.filter(|&i| i < image_count) {
-                    pbr["baseColorTexture"] = json!({ "index": i });
-                }
-                let mut mat = json!({ "name": m.name, "pbrMetallicRoughness": pbr });
-                if let Some(i) = m.normal_image.filter(|&i| i < image_count) {
-                    mat["normalTexture"] = json!({ "index": i });
-                }
-                if m.color[3] < 1.0 {
-                    mat["alphaMode"] = json!("BLEND");
-                }
-                if m.emissive.iter().any(|&e| e > 0.0) {
-                    // Brighter than one: the factor scaled down, and the strength that scales it back.
-                    let strength = m.emissive.iter().copied().fold(1.0, f32::max);
-                    mat["emissiveFactor"] = json!(m.emissive.map(|e| (e / strength).clamp(0.0, 1.0)));
-                    if strength > 1.0 && strength.is_finite() {
-                        mat["extensions"] =
-                            json!({ "KHR_materials_emissive_strength": { "emissiveStrength": strength } });
-                        bright = true;
-                    }
-                }
-                if m.double_sided {
-                    mat["doubleSided"] = json!(true);
-                }
-                mat
-            })
-            .collect();
+        let (textures, samplers, used) = w.finish();
         if !materials.is_empty() {
             json.insert("materials".into(), json!(materials));
         }
-        if bright {
-            let used = json.entry("extensionsUsed").or_insert_with(|| json!([]));
-            if let Some(list) = used.as_array_mut() {
-                list.push(json!("KHR_materials_emissive_strength"));
+        if !used.is_empty() {
+            let list = json.entry("extensionsUsed").or_insert_with(|| json!([]));
+            if let Some(list) = list.as_array_mut() {
+                for e in used {
+                    if !list.iter().any(|v| v == e) {
+                        list.push(json!(e));
+                    }
+                }
             }
         }
         if !images.is_empty() {
-            json.insert(
-                "samplers".into(),
-                json!([{ "magFilter": 9729, "minFilter": 9987, "wrapS": 10497, "wrapT": 10497 }]),
-            );
-            let textures: Vec<Value> = (0..images.len())
-                .map(|i| json!({ "sampler": 0, "source": i }))
-                .collect();
+            json.insert("samplers".into(), json!(samplers));
             json.insert("textures".into(), json!(textures));
             json.insert("images".into(), json!(images));
         }

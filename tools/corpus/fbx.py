@@ -324,11 +324,13 @@ def material_node(id, name, shading="lambert", **ps):
                           props70(*entries)])
 
 
-def texture_node(id, name, filename, relative=None):
-    return Node("Texture", L(id), ON("Texture", name), S(""),
-                children=[Node("Type", S("TextureVideoClip")), Node("Version", I(202)),
-                          Node("TextureName", ON("Texture", name)), Node("Media", ON("Video", name)),
-                          Node("FileName", S(filename)), Node("RelativeFilename", S(relative or filename))])
+def texture_node(id, name, filename, relative=None, props=()):
+    ch = [Node("Type", S("TextureVideoClip")), Node("Version", I(202))]
+    if props:
+        ch.append(props70(*props))
+    ch += [Node("TextureName", ON("Texture", name)), Node("Media", ON("Video", name)),
+           Node("FileName", S(filename)), Node("RelativeFilename", S(relative or filename))]
+    return Node("Texture", L(id), ON("Texture", name), S(""), children=ch)
 
 
 def video_node(id, name, filename, content=None):
@@ -979,5 +981,72 @@ case(FMT, "not_fbx", {"not_fbx.fbx": "solid cube\nendsolid cube\n"},
      {"spec": f"{SPEC}: a text file that isn't FBX", "source": SRC, "error": "FBX"})
 case(FMT, "empty_file", {"empty_file.fbx": b""},
      {"spec": f"{SPEC}: an empty file", "source": SRC, "error": "FBX"})
+
+# --- the full material: texture layout, PBR slots, Stingray PBS and 3ds Max Physical ------------
+
+M0 = "/materials/0"
+XFORM = M0 + "/pbrMetallicRoughness/baseColorTexture/extensions/KHR_texture_transform"
+
+
+def full_case(name, spec, mat, textures, json, files):
+    """`textures`: (texture id, file, [(slot, ...)], Properties70 entries)."""
+    s = Scene()
+    s.model(10, "Cube")
+    s.geometry(cube_geometry(), 10)
+    s.obj(mat, ("OO", 20, 10))
+    for tid, fname, slots, props in textures:
+        s.obj(texture_node(tid, f"T{tid}", fname, props=props), *[("OP", tid, 20, sl) for sl in slots])
+        s.obj(video_node(tid + 100, f"T{tid}", fname), ("OO", tid + 100, tid))
+    write(name, s, spec, {"uvs": True, "faces_outward": True, "json": json}, files=files)
+
+
+full_case("texture_translation_scaling_wrap",
+          "a Texture's Translation and Scaling as KHR_texture_transform on V-flipped UVs (offset v is 1 - ty - sy), "
+          "and WrapModeU/V (1 clamps) as its sampler's wrap",
+          material_node(20, "Skin", DiffuseColor=(1, 1, 1)),
+          [(30, "skin.png", ["DiffuseColor"],
+            [P("Translation", "Vector", "", "A", 0.25, 0.5, 0), P("Scaling", "Vector", "", "A", 2, 3, 1),
+             P("WrapModeU", "enum", "", "", 1), P("WrapModeV", "enum", "", "", 0)])],
+          {XFORM: {"offset": [0.25, -2.5], "scale": [2, 3]}, "/samplers/0": {"wrapS": 33071, "wrapT": 10497}},
+          {"skin.png": RED})
+
+full_case("texture_rotation",
+          "a Texture's Rotation about Z (degrees) as the transform's rotation; turning about the V-flipped origin "
+          "moves it",
+          material_node(20, "Skin", DiffuseColor=(1, 1, 1)),
+          [(30, "skin.png", ["DiffuseColor"], [P("Rotation", "Vector", "", "A", 0, 0, 90)])],
+          {XFORM: {"offset": [-1, 1], "rotation": r(math.pi / 2)}, XFORM + "/scale": None},
+          {"skin.png": RED})
+
+full_case("material_stingray_pbs",
+          "a Stingray PBS material (Maya): base_color, metallic and roughness, and its color, normal, AO, emissive "
+          "and metallic and roughness maps (one image for both is glTF's metallic-roughness texture)",
+          material_node(20, "Skin", **{"Maya|base_color": (1, 1, 1), "Maya|metallic": 0.3, "Maya|roughness": 0.6}),
+          [(30, "color.png", ["Maya|TEX_color_map"], []),
+           (31, "orm.png", ["Maya|TEX_ao_map", "Maya|TEX_metallic_map", "Maya|TEX_roughness_map"], []),
+           (32, "normal.png", ["Maya|TEX_normal_map"], []),
+           (33, "glow.png", ["Maya|TEX_emissive_map"], [])],
+          {M0 + "/pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1], "metallicFactor": 1,
+                                          "roughnessFactor": 1, "baseColorTexture": {},
+                                          "metallicRoughnessTexture": {}},
+           M0 + "/normalTexture": {}, M0 + "/occlusionTexture": {}, M0 + "/emissiveTexture": {}},
+          {"color.png": RED, "orm.png": png((255, 128, 64), 4), "normal.png": png((128, 128, 255), 4),
+           "glow.png": png((0, 255, 0), 4)})
+
+MAX = "3dsMax|Parameters|"
+full_case("material_max_physical",
+          "a 3ds Max Physical Material: base color and weight, metalness, roughness, transparency weight and IOR as "
+          "KHR_materials_transmission and _ior, and coating as KHR_materials_clearcoat",
+          material_node(20, "Skin", **{MAX + "base_color": (1, 1, 1), MAX + "base_weight": 0.5,
+                                       MAX + "metalness": 0.2, MAX + "roughness": 0.4,
+                                       MAX + "trans_weight": 0.5, MAX + "trans_ior": 1.6,
+                                       MAX + "coat": 0.3, MAX + "coat_roughness": 0.1}),
+          [],
+          {M0 + "/pbrMetallicRoughness": {"baseColorFactor": [0.5, 0.5, 0.5, 1], "metallicFactor": 0.2,
+                                          "roughnessFactor": 0.4},
+           M0 + "/extensions/KHR_materials_transmission/transmissionFactor": 0.5,
+           M0 + "/extensions/KHR_materials_ior/ior": 1.6,
+           M0 + "/extensions/KHR_materials_clearcoat": {"clearcoatFactor": 0.3, "clearcoatRoughnessFactor": 0.1}},
+          {})
 
 print("fbx cases written")

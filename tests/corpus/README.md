@@ -31,13 +31,13 @@ cases.
 | --- | --- | --- | --- |
 | STL | 29 | 27 | 2 |
 | PLY | 36 | 32 | 4 |
-| VOX | 24 | 24 | none |
-| OBJ | 45 | 36 | 9 |
-| 3DS | 37 | 37 | none |
-| 3MF | 38 | 38 | none |
-| FBX | 99 | 85 | 14 |
-| USD | 125 | 105 | 20 |
-| glTF | 59 | 46 | 13 |
+| VOX | 27 | 27 | none |
+| OBJ | 51 | 42 | 9 |
+| 3DS | 43 | 43 | none |
+| 3MF | 43 | 43 | none |
+| FBX | 115 | 101 | 14 |
+| USD | 134 | 114 | 20 |
+| glTF | 61 | 48 | 13 |
 
 - **Generated** cases are written byte by byte by `tools/corpus/<format>.py` (3DS is
   `tds.py`, 3MF is `threemf.py`). Each one targets one clause of the format's specification,
@@ -125,6 +125,8 @@ are required. Every other key is optional and is checked only when present.
 | `faces_outward` | For convex models: every triangle faces away from the centre of the bounds. Catches mirrors that turn faces inside out. |
 | `tolerance` | Relative tolerance for the numeric checks (default `1e-4`). |
 | `materials` | A list of material checks (below). |
+| `document` | Counts in the document's glTF JSON (`nodes`, `skins`, `animations`, `cameras`, `lights`, `joints`, `morph_targets`, `channels`), plus `node_names` and primitive `attributes` that must be there. |
+| `json` | Values in the document's glTF JSON, keyed by JSON pointer (`/materials/0/extensions/KHR_materials_ior/ior`). Numbers match to within `1e-4`, and objects match on the members given. `null` means the pointer must lead nowhere. |
 
 Each `materials` entry is matched by `name`, or by position when it has no name:
 

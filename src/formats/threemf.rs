@@ -22,6 +22,7 @@ use zip::ZipArchive;
 /// The 3MF package.
 type Zip<'a> = ZipArchive<Box<dyn super::ReadSeek + 'a>>;
 
+use crate::material::{self, Factor, Full, Specular, Tex, Volume};
 use crate::mesh::{GRAY, Image, MAX_TRIANGLES, Material, Prim, face_normal, srgb_to_linear};
 
 /// A 3MF transform: the first three columns of a 4x4 matrix, row by row (points are row vectors).
@@ -81,6 +82,77 @@ enum Group {
     Coords { texture: u32, uvs: Vec<[f32; 2]> },
 }
 
+/// How a base material or color looks beyond its color, from the materials extension's display properties
+/// (their floats kept as bits, so looks can be told apart).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Finish {
+    /// `pbmetallic`: metalness and roughness.
+    Metal { metallic: u32, roughness: u32 },
+    /// `pbspecular`: the specular color (sRGB) and glossiness.
+    Specular { color: [u8; 3], glossiness: u32 },
+    /// `translucent`: attenuation per unit length in RGB, the index of refraction in RGB, and roughness.
+    Translucent {
+        attenuation: [u32; 3],
+        ior: [u32; 3],
+        roughness: u32,
+    },
+}
+
+impl Finish {
+    fn full(self, mut m: Full) -> Full {
+        let f = f32::from_bits;
+        match self {
+            Finish::Metal { metallic, roughness } => {
+                m.metallic = f(metallic);
+                m.roughness = f(roughness);
+            }
+            Finish::Specular { color, glossiness } => {
+                m.metallic = 0.0;
+                m.roughness = 1.0 - f(glossiness);
+                // glTF's specular color scales the 4% a dielectric reflects head on.
+                let color = color.map(|c| srgb_to_linear(f32::from(c) / 255.0) / 0.04);
+                m.specular = Some(Specular {
+                    factor: Factor::of(1.0),
+                    color,
+                    color_tex: None,
+                });
+            }
+            Finish::Translucent {
+                attenuation,
+                ior,
+                roughness,
+            } => {
+                m.metallic = 0.0;
+                m.roughness = f(roughness);
+                m.transmission = Some(Factor::of(1.0));
+                let ior = ior.map(f);
+                m.ior = Some((ior[0] + ior[1] + ior[2]) / 3.0);
+                let a = attenuation.map(|a| f(a).max(0.0));
+                let most = a[0].max(a[1]).max(a[2]);
+                if most > 0.0 && most.is_finite() {
+                    // As far as the most absorbed channel takes to fall to 1/e, and each channel's color there.
+                    let d = 1.0 / most;
+                    m.volume = Some(Volume {
+                        thickness: Factor::of(d),
+                        attenuation_distance: Some(d),
+                        attenuation_color: a.map(|a| (-a * d).exp()),
+                    });
+                }
+            }
+        }
+        m
+    }
+}
+
+/// A texture's wrap from its `tilestyleu` or `tilestylev`.
+fn tile_style(v: Option<&str>) -> u32 {
+    match v {
+        Some("mirror") => material::MIRROR,
+        Some("clamp" | "none") => material::CLAMP,
+        _ => material::REPEAT,
+    }
+}
+
 /// A build item: an object (in another model file, by the production extension) placed by a transform.
 struct Item {
     path: Option<String>,
@@ -94,8 +166,12 @@ struct Item {
 struct Part {
     objects: HashMap<u32, Object>,
     groups: HashMap<u32, Group>,
-    /// 2D textures by resource id: the zip part holding the image.
-    textures: HashMap<u32, String>,
+    /// 2D textures by resource id: the zip part holding the image, and its wrap.
+    textures: HashMap<u32, (String, [u32; 2])>,
+    /// Display properties by resource id, an entry for each of a group's.
+    displays: HashMap<u32, Vec<Finish>>,
+    /// The display properties of a group, by group id.
+    group_display: HashMap<u32, u32>,
     build: Vec<Item>,
     application: Option<String>,
     /// Every `<metadata name>` and its text.
@@ -221,27 +297,36 @@ pub(crate) fn load(input: super::Input<'_>) -> Result<Document<'static>> {
         let [r, g, b] = [c[0], c[1], c[2]].map(|v| srgb_to_linear(f32::from(v) / 255.0));
         [r, g, b, f32::from(c[3]) / 255.0]
     };
-    let mut materials = Vec::new();
+    let mut materials: Vec<Full> = Vec::new();
     for (i, look) in out.order.iter().enumerate() {
         let named = |fallback: String| out.names.get(look).cloned().unwrap_or(fallback);
         let material = match *look {
-            Look::Plain => Material::plain("default", GRAY),
-            Look::Color(c) => Material::plain(&named(format!("color_{i}")), lin(c)),
-            Look::Vertex => Material::plain("vertex_colors", [1.0; 4]),
+            Look::Plain => Material::plain("default", GRAY).into(),
+            Look::Color(c, finish) => {
+                let m = Full::from(Material::plain(&named(format!("color_{i}")), lin(c)));
+                match finish {
+                    Some(f) => f.full(m),
+                    None => m,
+                }
+            }
+            Look::Vertex => Material::plain("vertex_colors", [1.0; 4]).into(),
             Look::Texture(t) => {
                 let image = *image_of.entry(t).or_insert_with(|| {
-                    let real = names.get(&out.textures[t])?;
+                    let real = names.get(&out.textures[t].0)?;
                     let mut bytes = Vec::new();
                     zip.by_name(real).ok()?.take(MAX_PART).read_to_end(&mut bytes).ok()?;
                     images.push(Image::png_or_jpeg(&bytes)?);
                     Some(images.len() - 1)
                 });
                 match image {
-                    Some(i) => Material {
-                        color_image: Some(i),
-                        ..Material::plain(&format!("texture_{t}"), [1.0; 4])
+                    Some(i) => Full {
+                        base_color_tex: Some(Tex {
+                            wrap: out.textures[t].1,
+                            ..Tex::new(i)
+                        }),
+                        ..Material::plain(&format!("texture_{t}"), [1.0; 4]).into()
                     },
-                    None => Material::plain(&format!("texture_{t}"), GRAY),
+                    None => Material::plain(&format!("texture_{t}"), GRAY).into(),
                 }
             }
         };
@@ -286,7 +371,7 @@ pub(crate) fn load(input: super::Input<'_>) -> Result<Document<'static>> {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Look {
     Plain,
-    Color([u8; 4]),
+    Color([u8; 4], Option<Finish>),
     /// Colors blended across it from its corners.
     Vertex,
     /// Textured: an index into `Emit::textures`.
@@ -302,8 +387,8 @@ struct Emit<'a> {
     order: Vec<Look>,
     /// Base material names, for the looks that come from one.
     names: HashMap<Look, String>,
-    /// The zip parts of the textures used.
-    textures: Vec<String>,
+    /// The zip parts of the textures used, and their wraps.
+    textures: Vec<(String, [u32; 2])>,
     /// The colors shown, for the facts.
     distinct: HashSet<[u8; 3]>,
     b: Builder,
@@ -406,12 +491,12 @@ impl Emit<'_> {
             let (look, uvs, colors) = match filament {
                 Some(n) => {
                     let [r, g, b] = self.slicer.filament(n);
-                    (Look::Color([r, g, b, 255]), None, None)
+                    (Look::Color([r, g, b, 255], None), None, None)
                 }
                 None => self.properties(part, o, t),
             };
             match look {
-                Look::Color(c) => {
+                Look::Color(c, _) => {
                     self.distinct.insert([c[0], c[1], c[2]]);
                 }
                 Look::Vertex => {
@@ -468,7 +553,7 @@ impl Emit<'_> {
     #[allow(clippy::type_complexity)]
     fn properties(&mut self, part: &Part, o: &Object, t: &Tri) -> (Look, Option<[[f32; 2]; 3]>, Option<[[u8; 4]; 3]>) {
         let plain = (Look::Plain, None, None);
-        let Some(group) = t.pid.or(o.pid).and_then(|g| part.groups.get(&g)) else {
+        let Some((gid, group)) = t.pid.or(o.pid).and_then(|g| Some((g, part.groups.get(&g)?))) else {
             return plain;
         };
         let p1 = t.p1.or(o.pindex).unwrap_or(0) as usize;
@@ -477,7 +562,12 @@ impl Emit<'_> {
             Group::Colors(cs) => {
                 let c = at.map(|i| cs.get(i).and_then(|e| e.0));
                 if c[0] == c[1] && c[1] == c[2] {
-                    let look = c[0].map_or(Look::Plain, Look::Color);
+                    let finish = part
+                        .group_display
+                        .get(&gid)
+                        .and_then(|d| part.displays.get(d))
+                        .and_then(|d| d.get(p1).copied());
+                    let look = c[0].map_or(Look::Plain, |c| Look::Color(c, finish));
                     if let Some(name) = cs.get(p1).and_then(|e| e.1.as_ref())
                         && look != Look::Plain
                     {
@@ -500,7 +590,7 @@ impl Emit<'_> {
                 else {
                     return plain;
                 };
-                let key = norm(path);
+                let key = (norm(&path.0), path.1);
                 let t = if let Some(t) = self.textures.iter().position(|k| *k == key) {
                     t
                 } else {
@@ -594,6 +684,8 @@ fn parse_part(r: impl Read, triangles: &mut usize) -> Result<Part> {
     let mut part = Part::default();
     let mut object: Option<(u32, Object)> = None;
     let mut group: Option<u32> = None;
+    // The display properties whose entries are being read.
+    let mut display: Option<u32> = None;
     let mut in_build = false;
     // The `<metadata name>` whose text is being read.
     let mut meta: Option<String> = None;
@@ -620,6 +712,11 @@ fn parse_part(r: impl Read, triangles: &mut usize) -> Result<Part> {
                         }
                     }
                     b"basematerials" | b"colorgroup" | b"texture2dgroup" => group = None,
+                    b"pbmetallicdisplayproperties"
+                    | b"pbspeculardisplayproperties"
+                    | b"translucentdisplayproperties" => {
+                        display = None;
+                    }
                     b"build" => in_build = false,
                     b"metadata" => meta = None,
                     _ => {}
@@ -708,6 +805,9 @@ fn parse_part(r: impl Read, triangles: &mut usize) -> Result<Part> {
             }
             kind @ (b"basematerials" | b"colorgroup" | b"texture2dgroup") => {
                 group = attr(&e, b"id").and_then(|v| v.parse().ok());
+                if let (Some(g), Some(d)) = (group, attr(&e, b"displaypropertiesid").and_then(|v| v.parse().ok())) {
+                    part.group_display.insert(g, d);
+                }
                 if let Some(g) = group {
                     let new = if kind == b"texture2dgroup" {
                         let texture = attr(&e, b"texid").and_then(|v| v.parse().ok());
@@ -744,7 +844,48 @@ fn parse_part(r: impl Read, triangles: &mut usize) -> Result<Part> {
             }
             b"texture2d" => {
                 if let (Some(id), Some(path)) = (attr(&e, b"id").and_then(|v| v.parse().ok()), attr(&e, b"path")) {
-                    part.textures.insert(id, path);
+                    let wrap = [b"tilestyleu", b"tilestylev"].map(|k| tile_style(attr(&e, k).as_deref()));
+                    part.textures.insert(id, (path, wrap));
+                }
+            }
+            b"pbmetallicdisplayproperties" | b"pbspeculardisplayproperties" | b"translucentdisplayproperties" => {
+                display = attr(&e, b"id").and_then(|v| v.parse().ok());
+                if let Some(d) = display {
+                    part.displays.insert(d, Vec::new());
+                }
+                if empty {
+                    display = None;
+                }
+            }
+            kind @ (b"pbmetallic" | b"pbspecular" | b"translucent") => {
+                if let Some(list) = display.and_then(|d| part.displays.get_mut(&d)) {
+                    let f = |k: &[u8], d: f32| attr(&e, k).and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(d);
+                    let rgb = |k: &[u8], d: f32| {
+                        let v = attr(&e, k).unwrap_or_default();
+                        let mut n = v.split_whitespace().filter_map(|w| w.parse::<f32>().ok());
+                        let first = n.next().unwrap_or(d);
+                        [first, n.next().unwrap_or(first), n.next().unwrap_or(first)].map(f32::to_bits)
+                    };
+                    list.push(match kind {
+                        b"pbmetallic" => Finish::Metal {
+                            metallic: f(b"metallicness", 0.0).to_bits(),
+                            roughness: f(b"roughness", 1.0).to_bits(),
+                        },
+                        b"pbspecular" => {
+                            let c = attr(&e, b"specularcolor")
+                                .and_then(|v| hex_rgba(&v))
+                                .unwrap_or([0x38, 0x38, 0x38, 255]);
+                            Finish::Specular {
+                                color: [c[0], c[1], c[2]],
+                                glossiness: f(b"glossiness", 0.0).to_bits(),
+                            }
+                        }
+                        _ => Finish::Translucent {
+                            attenuation: rgb(b"attenuation", 0.0),
+                            ior: rgb(b"refractiveindex", 1.0),
+                            roughness: f(b"roughness", 0.0).to_bits(),
+                        },
+                    });
                 }
             }
             b"build" => in_build = !empty,

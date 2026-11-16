@@ -114,16 +114,22 @@ def xform(name, *body, ops=(), meta=None, typ="Xform"):
 
 
 def preview_material(name, *inputs, textures=(), extra=()):
-    """A UsdPreviewSurface material; `inputs` are lines in the shader; `textures` are (input, file, output, type)."""
+    """A UsdPreviewSurface material; `inputs` are lines in the shader; `textures` are (input, file, output, type),
+    optionally followed by more lines for the texture and a UsdTransform2d's lines for its coordinates."""
     shader = ['uniform token info:id = "UsdPreviewSurface"', *inputs, "token outputs:surface"]
     nodes = []
     if textures:
         nodes.append(prim("Shader", "uv", 'uniform token info:id = "UsdPrimvarReader_float2"',
                           'string inputs:varname = "st"', "float2 outputs:result"))
-    for i, (inp, file, out, typ) in enumerate(textures):
+    for i, (inp, file, out, typ, *more) in enumerate(textures):
         tname = f"tex{i}"
+        st = f"</Root/{name}/uv.outputs:result>"
+        if len(more) > 1:
+            nodes.append(prim("Shader", f"xf{i}", 'uniform token info:id = "UsdTransform2d"',
+                              f"float2 inputs:in.connect = {st}", *more[1], "float2 outputs:result"))
+            st = f"</Root/{name}/xf{i}.outputs:result>"
         lines = ['uniform token info:id = "UsdUVTexture"', f"asset inputs:file = @{file}@",
-                 f"float2 inputs:st.connect = </Root/{name}/uv.outputs:result>",
+                 f"float2 inputs:st.connect = {st}", *(more[0] if more else ()),
                  f"{'float3' if out == 'rgb' else 'float'} outputs:{out}"]
         if inp == "normal":
             lines += ['token inputs:sourceColorSpace = "raw"', "float4 inputs:scale = (2, 2, 2, 1)",
@@ -551,6 +557,45 @@ mat_case("normal_map", "a diffuse texture and a normal map", [],
          {"image_count": 2, "materials": [{"name": "Mat", "textured": True, "normal_map": True}]},
          textures=[("diffuseColor", "./red.png", "rgb", "color3f"), ("normal", "./flat_n.png", "rgb", "normal3f")],
          files={"red.png": RED, "flat_n.png": png((128, 128, 255), 4)})
+
+# The full material: texture layout, the specular workflow's color, clearcoat, ior and masking.
+M0 = "/materials/0"
+mat_case("texture_transform2d",
+         "a UsdTransform2d on a texture's st as KHR_texture_transform on V-flipped UVs (offset v is 1 - ty - sy), "
+         "and wrapS and wrapT as its sampler's wrap",
+         [], {"materials": [{"name": "Mat", "textured": True}],
+              "json": {M0 + "/pbrMetallicRoughness/baseColorTexture/extensions/KHR_texture_transform":
+                       {"offset": [0.25, -2.5], "scale": [2, 3]},
+                       "/samplers/0": {"wrapS": 33648, "wrapT": 33071}}},
+         textures=[("diffuseColor", "./red.png", "rgb", "color3f",
+                    ['token inputs:wrapS = "mirror"', 'token inputs:wrapT = "clamp"'],
+                    ["float2 inputs:scale = (2, 3)", "float2 inputs:translation = (0.25, 0.5)",
+                     "float inputs:rotation = 0"])],
+         files={"red.png": RED})
+mat_case("material_specular_color",
+         "useSpecularWorkflow 1: specularColor (what reflects head on) as KHR_materials_specular's color, which "
+         "scales a dielectric's 4%",
+         ["color3f inputs:diffuseColor = (0.5, 0.5, 0.5)", "int inputs:useSpecularWorkflow = 1",
+          "color3f inputs:specularColor = (0.08, 0.04, 0.02)"],
+         {"json": {M0 + "/extensions/KHR_materials_specular/specularColorFactor": [2, 1, 0.5],
+                   M0 + "/pbrMetallicRoughness/metallicFactor": 0}})
+mat_case("material_clearcoat_ior", "clearcoat, clearcoatRoughness and ior as KHR_materials_clearcoat and _ior",
+         ["float inputs:clearcoat = 0.7", "float inputs:clearcoatRoughness = 0.2", "float inputs:ior = 1.33"],
+         {"json": {M0 + "/extensions/KHR_materials_clearcoat": {"clearcoatFactor": 0.7,
+                                                                 "clearcoatRoughnessFactor": 0.2},
+                   M0 + "/extensions/KHR_materials_ior/ior": 1.33}})
+mat_case("material_opacity_threshold", "opacityThreshold above zero: masked at that cutoff",
+         ["float inputs:opacity = 1", "float inputs:opacityThreshold = 0.4"],
+         {"json": {M0 + "/alphaMode": "MASK", M0 + "/alphaCutoff": 0.4}})
+mat_case("texture_occlusion_roughness_metallic",
+         "occlusion, roughness and metallic from one image's r, g and b: glTF's occlusion and metallic-roughness "
+         "textures",
+         [], {"json": {M0 + "/pbrMetallicRoughness": {"metallicFactor": 1, "roughnessFactor": 1,
+                                                      "metallicRoughnessTexture": {}},
+                       M0 + "/occlusionTexture": {}}},
+         textures=[("occlusion", "./orm.png", "r", "float"), ("roughness", "./orm.png", "g", "float"),
+                   ("metallic", "./orm.png", "b", "float")],
+         files={"orm.png": png((255, 128, 64), 4)})
 
 subsets = prim("Xform", "Root", cube("Cube", 1.0, (0, 0, 0), bind("/Root/Body"),
                                      prim("GeomSubset", "lid", 'uniform token elementType = "face"',

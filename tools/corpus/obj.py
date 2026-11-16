@@ -372,4 +372,80 @@ case(FMT, "texture_without_uvs", {
     "source": SRC, "triangles": 1, "materials": [{"name": "tex", "textured": False}],
 })
 
+# The full material: what MTL says beyond the flat material, as glTF's extensions and texture options.
+M0 = "/materials/0"
+EXT = M0 + "/extensions/"
+lin_half = r(srgb_to_linear(0.5))
+
+case(FMT, "mtl_extensions", {
+    "model.obj": "mtllib m.mtl\nusemtl full\n" + TRI + "f 1 2 3\n",
+    "m.mtl": "newmtl full\nKd 1 1 1\nKs 0.25 0.25 0.25\nNi 1.45\nPs 0.5 0.5 0.5\nPc 1\nPcr 0.1\naniso 0.5\n",
+}, {
+    "spec": MTL_SPEC + " and the PBR extension: Ks, Ni, Ps, Pc, Pcr and aniso as KHR_materials_specular, _ior, "
+            "_sheen, _clearcoat and _anisotropy",
+    "source": SRC, "triangles": 1,
+    "json": {
+        EXT + "KHR_materials_ior/ior": 1.45,
+        # Phong's half-strength highlight is glTF's usual one.
+        EXT + "KHR_materials_specular/specularColorFactor": [0.5, 0.5, 0.5],
+        EXT + "KHR_materials_sheen/sheenColorFactor": [lin_half, lin_half, lin_half],
+        EXT + "KHR_materials_clearcoat": {"clearcoatFactor": 1, "clearcoatRoughnessFactor": 0.1},
+        EXT + "KHR_materials_anisotropy/anisotropyStrength": 0.5,
+    },
+})
+
+case(FMT, "mtl_ior_placeholder", {
+    "model.obj": "mtllib m.mtl\nusemtl plain\n" + TRI + "f 1 2 3\n",
+    "m.mtl": "newmtl plain\nKd 1 1 1\nNi 1.000000\n",
+}, {
+    "spec": MTL_SPEC + ": Ni 1, the placeholder exporters write, isn't an index of refraction",
+    "source": SRC, "triangles": 1,
+    "json": {EXT + "KHR_materials_ior": None},
+})
+
+case(FMT, "mtl_illum_unlit", {
+    "model.obj": "mtllib m.mtl\nusemtl flat\n" + TRI + "f 1 2 3\n",
+    "m.mtl": "newmtl flat\nKd 0 1 0\nillum 0\n",
+}, {
+    "spec": MTL_SPEC + ": illum 0 (color on, ambient off) as KHR_materials_unlit",
+    "source": SRC, "triangles": 1,
+    "json": {EXT + "KHR_materials_unlit": {}},
+})
+
+case(FMT, "texture_scale_offset_clamp", {
+    "model.obj": "mtllib m.mtl\nusemtl tex\n" + TRI + "f 1/1 2/2 3/3\n",
+    "m.mtl": "newmtl tex\nKd 1 1 1\nmap_Kd -s 2 3 -o 0.25 0.5 -clamp on albedo.png\n",
+    "albedo.png": png(RED),
+}, {
+    "spec": MTL_SPEC + ": map_Kd -s, -o and -clamp as KHR_texture_transform (V flipped: offset v is 1 - sv - ov) "
+            "and a clamping sampler",
+    "source": SRC, "triangles": 1,
+    "materials": [{"name": "tex", "textured": True}],
+    "json": {
+        M0 + "/pbrMetallicRoughness/baseColorTexture/extensions/KHR_texture_transform":
+            {"offset": [0.25, -2.5], "scale": [2, 3]},
+        "/samplers/0": {"wrapS": 33071, "wrapT": 33071},
+    },
+})
+
+case(FMT, "texture_pbr_maps", {
+    "model.obj": "mtllib m.mtl\nusemtl pbr\n" + TRI + "f 1/1 2/2 3/3\n",
+    "m.mtl": "newmtl pbr\nKd 1 1 1\nPr 1\nmap_Pr orm.png\nmap_Pm orm.png\nKe 1 1 1\nmap_Ke glow.png\n"
+             "map_Bump -bm 0.5 normal.png\n",
+    "orm.png": png([255, 128, 64]),
+    "glow.png": png(GREEN),
+    "normal.png": png([128, 128, 255]),
+}, {
+    "spec": "MTL PBR extension: map_Pr and map_Pm naming one image as glTF's metallic-roughness texture, "
+            "map_Ke as the emissive texture, and map_Bump -bm as the normal texture's scale",
+    "source": SRC, "triangles": 1,
+    "json": {
+        M0 + "/pbrMetallicRoughness/metallicFactor": 1,
+        M0 + "/pbrMetallicRoughness/roughnessFactor": 1,
+        M0 + "/pbrMetallicRoughness/metallicRoughnessTexture": {},
+        M0 + "/emissiveTexture": {},
+        M0 + "/normalTexture/scale": 0.5,
+    },
+})
+
 print("obj corpus written")

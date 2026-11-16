@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use serde_json::{Map, Value, json};
 
 use crate::document::{Builder, Document, Keep};
+use crate::material::{Factor, Full};
 use crate::mesh::{Material, Prim, srgb_to_linear};
 use crate::{Context as _, Result};
 
@@ -161,29 +162,39 @@ enum Node {
     },
 }
 
+/// A `MATL` chunk as glTF has places for it: metal's metalness and roughness, glass's transmission and its
+/// roughness, an emitter's glow, and the index of refraction (written as how far above one it is). A blend has
+/// what it mixes.
 #[derive(Default, Clone, Copy)]
 struct Matl {
     metal: f32,
     rough: Option<f32>,
     emit: f32,
+    transmission: Option<f32>,
+    ior: Option<f32>,
 }
 
 impl Matl {
     fn new(d: &Dict) -> Matl {
-        let f = |k: &str| d.get(k).and_then(|v| v.parse::<f32>().ok());
+        let f = |k: &str| d.get(k).and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite());
         let ty = d.get("_type").map_or("_diffuse", String::as_str);
+        let (metal, glass, emit) = match ty {
+            "_metal" => (true, false, false),
+            "_glass" => (false, true, false),
+            "_emit" => (false, false, true),
+            "_blend" => (true, true, true),
+            _ => (false, false, false),
+        };
         Matl {
-            metal: if ty == "_metal" {
-                f("_metal").unwrap_or(0.0)
-            } else {
-                0.0
-            },
-            rough: (ty == "_metal").then(|| f("_rough")).flatten(),
-            emit: if ty == "_emit" {
+            metal: if metal { f("_metal").unwrap_or(0.0) } else { 0.0 },
+            rough: (metal || glass).then(|| f("_rough")).flatten(),
+            emit: if emit {
                 f("_emit").unwrap_or(0.0) * (1.0 + f("_flux").unwrap_or(0.0))
             } else {
                 0.0
             },
+            transmission: glass.then(|| f("_trans").unwrap_or(if ty == "_glass" { 1.0 } else { 0.0 })),
+            ior: (metal || glass).then(|| f("_ior")).flatten().map(|i| 1.0 + i),
         }
     }
 }
@@ -306,19 +317,22 @@ pub(crate) fn vox(data: &[u8], keep: Keep) -> Result<Document<'static>> {
 
     let palette = v.palette.unwrap_or_else(default_palette);
     let matl: HashMap<u32, Matl> = v.matl.iter().map(|(i, d)| (*i, Matl::new(d))).collect();
-    let materials: Vec<Material> = colors
+    let materials: Vec<Full> = colors
         .iter()
         .map(|&c| {
             let rgba = palette[usize::from(c)];
             let [r, g, b] = [rgba[0], rgba[1], rgba[2]].map(|v| srgb_to_linear(f32::from(v) / 255.0));
-            let mut mat = Material::plain(&format!("color_{c}"), [r, g, b, 1.0]);
+            let mut mat = Full::from(Material::plain(&format!("color_{c}"), [r, g, b, 1.0]));
             if let Some(x) = matl.get(&u32::from(c)) {
-                mat.metallic = x.metal.clamp(0.0, 1.0);
+                mat.metallic = x.metal;
                 if let Some(rough) = x.rough {
-                    mat.roughness = rough.clamp(0.0, 1.0);
+                    mat.roughness = rough;
                 }
-                let e = x.emit.clamp(0.0, 1.0);
+                // Brighter than one goes in KHR_materials_emissive_strength.
+                let e = x.emit.max(0.0);
                 mat.emissive = [r * e, g * e, b * e];
+                mat.transmission = x.transmission.filter(|t| *t > 0.0).map(Factor::of);
+                mat.ior = x.ior.filter(|i| *i >= 1.0);
             }
             mat
         })

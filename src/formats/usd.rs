@@ -45,6 +45,7 @@ use super::Input;
 use super::xform::{IDENTITY, M4, Trs, decompose, inverse, mul, scale, set_transform, translate};
 use crate::assets::{Assets, memory_key};
 use crate::document::{Builder, Document, Keep, Part};
+use crate::material::{self, Alpha, Clearcoat, Factor, Full, Specular, Tex, UvTransform};
 use crate::mesh::{GRAY, Image, MAX_TRIANGLES, Material, Prim, triangulate};
 use crate::num::f32_of;
 
@@ -347,7 +348,7 @@ struct Reader<'a> {
     /// A surface (its prototype's path when it's an instance, its material binding, whether it's skinned) to its
     /// mesh, `None` when it has no faces.
     mesh_of: HashMap<String, Option<usize>>,
-    materials: Vec<Material>,
+    materials: Vec<Full>,
     /// Material prim path (or `display:<rgba>` for a display color) to its index in `materials`.
     material_of: HashMap<String, usize>,
     images: Vec<Image>,
@@ -1535,7 +1536,7 @@ impl Reader<'_> {
         }
         let material = match bound {
             Some(path) => self.preview_surface(&path),
-            None => Material::plain("default", display),
+            None => Material::plain("default", display).into(),
         };
         let i = self.materials.len();
         self.materials.push(material);
@@ -1543,44 +1544,215 @@ impl Reader<'_> {
         i
     }
 
-    fn preview_surface(&mut self, path: &sdf::Path) -> Material {
+    #[allow(clippy::too_many_lines, reason = "one input after another")]
+    fn preview_surface(&mut self, path: &sdf::Path) -> Full {
         let name = leaf(path.as_str()).to_owned();
         let Ok(Some(ps)) = shade::read_preview_surface(self.stage, path) else {
-            return Material::plain(&name, GRAY);
+            return Material::plain(&name, GRAY).into();
         };
-        // UsdPreviewSurface colors are linear, as glTF's are. Unauthored inputs take the shader's fallbacks.
-        let mut color = match ps.diffuse_color.value() {
-            Some(c) => [c.x, c.y, c.z, 1.0],
-            None if ps.diffuse_color.texture().is_some() => [1.0; 4],
-            None => [0.18, 0.18, 0.18, 1.0],
-        };
-        if let Some(&o) = ps.opacity.value() {
-            color[3] = o.clamp(0.0, 1.0);
-        }
-        let specular_workflow = self
-            .stage
-            .prim(ps.shader.as_str())
-            .ok()
+        let shader = self.stage.prim(ps.shader.as_str()).ok();
+        let source = |input: &str| shader.as_ref().and_then(|s| self.texture_source(s, input));
+        let (diffuse, normal, emissive, occlusion) = (
+            source("diffuseColor"),
+            source("normal"),
+            source("emissiveColor"),
+            source("occlusion"),
+        );
+        let (metallic_src, roughness_src, opacity_src) = (source("metallic"), source("roughness"), source("opacity"));
+        let specular_src = source("specularColor");
+        let specular_workflow = shader
+            .as_ref()
             .and_then(|s| match self.value(&s.attribute("inputs:useSpecularWorkflow")) {
                 Some(sdf::Value::Int(v)) => Some(v != 0),
                 _ => None,
             })
             .unwrap_or(false);
-        let metallic = if specular_workflow {
+        let mut tex = |file: Option<&str>, src: Option<&Source>| {
+            let image = self.image(file?)?;
+            Some(src.map_or_else(|| Tex::new(image), |s| s.tex(image)))
+        };
+
+        // UsdPreviewSurface colors are linear, as glTF's are. Unauthored inputs take the shader's fallbacks.
+        let base_color_tex = tex(ps.diffuse_color.texture(), diffuse.as_ref());
+        let mut color = match ps.diffuse_color.value() {
+            Some(c) => [c.x, c.y, c.z, 1.0],
+            // A texture's scale tints it.
+            None if ps.diffuse_color.texture().is_some() => diffuse.as_ref().map_or([1.0; 4], |d| d.scale),
+            None => [0.18, 0.18, 0.18, 1.0],
+        };
+        let mut alpha = Alpha::Opaque;
+        if let Some(&o) = ps.opacity.value() {
+            color[3] = o.clamp(0.0, 1.0);
+            if o < 1.0 {
+                alpha = Alpha::Blend;
+            }
+        } else if let (Some(o), Some(d)) = (&opacity_src, &diffuse) {
+            // Opacity from the color texture's alpha is glTF's own arrangement.
+            if o.file == d.file && o.channel == "a" {
+                alpha = Alpha::Blend;
+            }
+        }
+        if let Some(&t) = ps.opacity_threshold.value().filter(|t| **t > 0.0) {
+            alpha = Alpha::Mask(t);
+        }
+        let mut metallic = if specular_workflow {
             0.0
         } else {
             ps.metallic.value().copied().unwrap_or(0.0)
         };
-        let emissive = ps.emissive_color.value().map_or([0.0; 3], |c| [c.x, c.y, c.z]);
-        let color_image = ps.diffuse_color.texture().and_then(|t| self.image(t));
-        let normal_image = ps.normal.texture().and_then(|t| self.image(t));
-        Material {
-            color_image,
-            normal_image,
-            emissive,
-            metallic: metallic.clamp(0.0, 1.0),
-            roughness: ps.roughness.value().copied().unwrap_or(0.5).clamp(0.0, 1.0),
-            ..Material::plain(&name, color)
+        let mut roughness = ps.roughness.value().copied().unwrap_or(0.5);
+        // glTF reads roughness from green and metalness from blue of one image.
+        let mut metallic_roughness_tex = None;
+        if let Some(r) = roughness_src.as_ref().filter(|r| r.channel == "g")
+            && let Some(file) = ps.roughness.texture()
+        {
+            let metal_too = metallic_src
+                .as_ref()
+                .is_some_and(|m| m.channel == "b" && m.file == r.file);
+            if metal_too || ps.metallic.texture().is_none() {
+                metallic_roughness_tex = tex(Some(file), Some(r));
+                roughness = 1.0;
+                if metal_too && !specular_workflow {
+                    metallic = 1.0;
+                }
+            }
+        }
+        let emissive_tex = tex(ps.emissive_color.texture(), emissive.as_ref());
+        let emissive_color = match ps.emissive_color.value() {
+            Some(c) => [c.x, c.y, c.z],
+            None if emissive_tex.is_some() => emissive
+                .as_ref()
+                .map_or([1.0; 3], |e| [e.scale[0], e.scale[1], e.scale[2]]),
+            None => [0.0; 3],
+        };
+        let occlusion_tex = occlusion
+            .as_ref()
+            .filter(|o| o.channel == "r")
+            .and_then(|o| tex(ps.occlusion.texture(), Some(o)));
+        let specular = specular_workflow.then(|| {
+            // UsdPreviewSurface's specular color is what reflects head on; glTF's scales a dielectric's 4%.
+            let c = ps.specular_color.value().map_or([0.0; 3], |c| [c.x, c.y, c.z]);
+            Specular {
+                factor: Factor::of(1.0),
+                color: if ps.specular_color.texture().is_some() {
+                    [1.0 / 0.04; 3]
+                } else {
+                    c.map(|c| c / 0.04)
+                },
+                color_tex: tex(ps.specular_color.texture(), specular_src.as_ref()),
+            }
+        });
+        let clearcoat = ps.clearcoat.value().filter(|c| **c > 0.0).map(|&c| Clearcoat {
+            factor: Factor::of(c),
+            roughness: Factor::of(ps.clearcoat_roughness.value().copied().unwrap_or(0.01)),
+            normal: None,
+        });
+        Full {
+            name,
+            base_color: color,
+            base_color_tex,
+            metallic,
+            roughness,
+            metallic_roughness_tex,
+            normal_tex: tex(ps.normal.texture(), normal.as_ref()),
+            occlusion_tex,
+            emissive: emissive_color,
+            emissive_tex,
+            alpha,
+            specular,
+            clearcoat,
+            ior: ps.ior.value().copied(),
+            ..Full::default()
+        }
+    }
+
+    /// The `UsdUVTexture` an input of `shader` reads, through node graphs: the output it uses (`rgb`, `r`, ...),
+    /// its wrap, its scale, and the `UsdTransform2d` on its coordinates.
+    fn texture_source(&self, shader: &usd::Prim, input: &str) -> Option<Source> {
+        let (tex, channel) = self.connected(shader, &format!("inputs:{input}"))?;
+        let file = match self.value(&tex.attribute("inputs:file")) {
+            Some(sdf::Value::AssetPath(a)) => Some(a.authored_path),
+            _ => None,
+        };
+        let wrap = |k: &str| match self.token(&tex.attribute(k)).as_deref() {
+            Some("mirror") => material::MIRROR,
+            Some("clamp" | "black") => material::CLAMP,
+            _ => material::REPEAT,
+        };
+        let scale = match self.value(&tex.attribute("inputs:scale")) {
+            Some(sdf::Value::Vec4f(v)) => [v.x, v.y, v.z, v.w],
+            #[allow(clippy::cast_possible_truncation, reason = "colors")]
+            Some(sdf::Value::Vec4d(v)) => [v.x as f32, v.y as f32, v.z as f32, v.w as f32],
+            _ => [1.0; 4],
+        };
+        let mut transform = None;
+        if let Some((t, _)) = self.connected(&tex, "inputs:st")
+            && self.token(&t.attribute("info:id")).as_deref() == Some("UsdTransform2d")
+        {
+            let [su, sv] = self.vec2(&t.attribute("inputs:scale")).unwrap_or([1.0; 2]);
+            let [tu, tv] = self.vec2(&t.attribute("inputs:translation")).unwrap_or([0.0; 2]);
+            let angle = self.number(&t.attribute("inputs:rotation"), 0.0).to_radians();
+            if (su, sv, tu, tv, angle) != (1.0, 1.0, 0.0, 0.0, 0.0) {
+                // USD's `st` has V up; the document's UVs are flipped.
+                let (sin, cos) = angle.sin_cos();
+                transform = Some(UvTransform {
+                    offset: [tu - sv * sin, 1.0 - tv - sv * cos],
+                    rotation: angle,
+                    scale: [su, sv],
+                });
+            }
+        }
+        Some(Source {
+            file,
+            channel,
+            wrap: [wrap("inputs:wrapS"), wrap("inputs:wrapT")],
+            scale,
+            transform,
+        })
+    }
+
+    /// The shader and output an attribute connects to, followed through node graphs' outputs.
+    fn connected(&self, prim: &usd::Prim, attr: &str) -> Option<(usd::Prim, String)> {
+        let mut path = prim.attribute(attr).connections().ok()?.into_iter().next()?;
+        for _ in 0..8 {
+            let (at, prop) = path.as_str().rsplit_once('.')?;
+            let p = self.stage.prim(at).ok()?;
+            let next = p.attribute(prop).connections().ok().and_then(|c| c.into_iter().next());
+            match next {
+                Some(n) if prop.starts_with("outputs:") => path = n,
+                _ => return Some((p, prop.strip_prefix("outputs:").unwrap_or(prop).to_owned())),
+            }
+        }
+        None
+    }
+
+    fn vec2(&self, attr: &usd::Attribute) -> Option<[f32; 2]> {
+        match self.value(attr)? {
+            sdf::Value::Vec2f(v) => Some([v.x, v.y]),
+            #[allow(clippy::cast_possible_truncation, reason = "texture coordinates")]
+            sdf::Value::Vec2d(v) => Some([v.x as f32, v.y as f32]),
+            _ => None,
+        }
+    }
+}
+
+/// A `UsdUVTexture` as an input reads it.
+struct Source {
+    file: Option<String>,
+    /// The output read: `rgb`, `r`, `g`, `b` or `a`.
+    channel: String,
+    wrap: [u32; 2],
+    /// `inputs:scale`, which tints what it reads.
+    scale: [f32; 4],
+    transform: Option<UvTransform>,
+}
+
+impl Source {
+    fn tex(&self, image: usize) -> Tex {
+        Tex {
+            transform: self.transform,
+            wrap: self.wrap,
+            ..Tex::new(image)
         }
     }
 }
