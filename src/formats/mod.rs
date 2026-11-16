@@ -25,6 +25,8 @@ mod fbx;
 pub mod fbx_ascii;
 #[cfg(feature = "gltf")]
 mod gltf;
+#[cfg(feature = "gltf")]
+mod gltf1;
 #[cfg(feature = "obj")]
 mod obj;
 #[cfg(feature = "ply")]

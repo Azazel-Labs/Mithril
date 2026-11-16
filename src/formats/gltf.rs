@@ -8,6 +8,8 @@
 //!   decode from their compressed data.
 //! - Images named by URI (a data URI, or a file found as buffers are) move into a buffer, so the
 //!   document stands on its own. One that isn't found keeps its URI.
+//! - glTF 1.0 (and its binary GLB, `KHR_binary_glTF`) is upgraded to 2.0 first; see
+//!   [`super::gltf1`].
 
 use std::borrow::Cow;
 #[cfg(feature = "fs")]
@@ -18,7 +20,7 @@ use std::path::{Component, Path};
 
 use serde_json::{Map, Value, json};
 
-use super::Input;
+use super::{Input, gltf1};
 use crate::assets::Assets;
 #[cfg(feature = "fs")]
 use crate::document::FileSpan;
@@ -41,15 +43,34 @@ pub(crate) fn load<'a>(input: Input<'a>, assets: &'a dyn Assets) -> Result<Docum
         #[cfg(not(feature = "fs"))]
         None => unreachable!("a model without its bytes needs the `fs` feature"),
     };
+    let (mut json, fix) = if gltf1::is_v1(&json) {
+        let (json, fix) = gltf1::upgrade(json)?;
+        (json, Some(fix))
+    } else {
+        (json, None)
+    };
     let version = json
         .get("asset")
         .and_then(|a| a.get("version"))
         .and_then(Value::as_str)
-        .unwrap_or("");
-    ensure!(
-        version.starts_with("2."),
-        "glTF version {version:?} isn't 2.x (glTF 1.0 isn't read)"
-    );
+        .unwrap_or("")
+        .to_owned();
+    if version.starts_with('1') {
+        // A 1.0 label on a 2.0 document: read as the 2.0 it is, the label kept as its source's.
+        let asset = &mut json["asset"];
+        asset["version"] = "2.0".into();
+        let extras = &mut asset["extras"];
+        if !extras.is_object() {
+            *extras = Value::Object(Map::new());
+        }
+        let source = &mut extras["source"];
+        if !source.is_object() {
+            *source = Value::Object(Map::new());
+        }
+        source["version"] = version.into();
+    } else {
+        ensure!(version.starts_with("2."), "glTF version {version:?} isn't 1.x or 2.x");
+    }
     let mut doc = Document {
         json,
         buffers: Vec::new(),
@@ -78,8 +99,15 @@ pub(crate) fn load<'a>(input: Input<'a>, assets: &'a dyn Assets) -> Result<Docum
         );
         if let Some(b) = b.as_object_mut() {
             b.remove("uri");
+            // glTF 1.0 lets the length go unsaid.
+            if declared == 0 {
+                b.insert("byteLength".into(), json!(blob.len()));
+            }
         }
         doc.buffers.push(blob);
+    }
+    if let Some(fix) = fix {
+        gltf1::finish(&mut doc, &fix)?;
     }
     embed_images(&mut doc, input, assets);
     Ok(doc)
@@ -175,7 +203,20 @@ fn glb_layout(
 ) -> Result<(Map<String, Value>, Option<Span>)> {
     let head = read(0, 20).context("GLB is truncated")?;
     let u32_at = |b: &[u8], at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
-    ensure!(u32_at(&head, 4) == 2, "GLB version {} is not 2", u32_at(&head, 4));
+    if u32_at(&head, 4) == 1 {
+        // glTF 1.0's binary glTF: the JSON's length and format (0, JSON) in the header, then
+        // the body, unpadded, to the end.
+        ensure!(u32_at(&head, 16) == 0, "binary glTF 1.0 content isn't JSON");
+        let json_len = u64::from(u32_at(&head, 12));
+        let end = u64::from(u32_at(&head, 8)).min(total);
+        ensure!(20 + json_len <= end, "GLB is truncated");
+        let text = read(20, usize_of(json_len))?;
+        let Value::Object(json) = serde_json::from_slice(&text).context("GLB JSON doesn't parse")? else {
+            bail!("glTF JSON is not an object")
+        };
+        return Ok((json, Some((20 + json_len, end - 20 - json_len))));
+    }
+    ensure!(u32_at(&head, 4) == 2, "GLB version {} is not 1 or 2", u32_at(&head, 4));
     ensure!(&head[16..20] == b"JSON", "GLB doesn't start with a JSON chunk");
     let json_len = u64::from(u32_at(&head, 12));
     ensure!(20 + json_len <= total, "GLB is truncated");
@@ -335,14 +376,17 @@ mod tests {
             };
             let original = std::fs::read(&path).unwrap();
             let written = doc.to_glb().unwrap();
-            let (a, abin) = split(&original);
-            let (b, bbin) = split(&written);
             let name = path.display();
-            assert_eq!(normalized(a.clone()), normalized(b.clone()), "{name}: the JSON changed");
-            assert!(
-                views(&a, abin) == views(&b, bbin),
-                "{name}: a buffer view's bytes changed"
-            );
+            // A glTF 1.0 file comes back as 2.0; only the second round trip must match.
+            if original[4..8] != 1u32.to_le_bytes() {
+                let (a, abin) = split(&original);
+                let (b, bbin) = split(&written);
+                assert_eq!(normalized(a.clone()), normalized(b.clone()), "{name}: the JSON changed");
+                assert!(
+                    views(&a, abin) == views(&b, bbin),
+                    "{name}: a buffer view's bytes changed"
+                );
+            }
             // And again, now exactly.
             let again = crate::formats::load_bytes(&written, "x.glb", "glb", &crate::assets::Memory::new(), Keep::ALL)
                 .and_then(|d: Document<'_>| d.to_glb())

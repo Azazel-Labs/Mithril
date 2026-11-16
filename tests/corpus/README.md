@@ -37,7 +37,7 @@ cases.
 | 3MF | 43 | 43 | none |
 | FBX | 115 | 101 | 14 |
 | USD | 134 | 114 | 20 |
-| glTF | 62 | 49 | 13 |
+| glTF | 70 | 57 | 13 |
 
 - **Generated** cases are written byte by byte by `tools/corpus/<format>.py` (3DS is
   `tds.py`, 3MF is `threemf.py`). Each one targets one clause of the format's specification,
@@ -100,8 +100,11 @@ python tools/corpus/obj.py
   (TRS and matrices, mirrors, the default scene, no scenes, no nodes), skins and morph
   targets at rest, `EXT_mesh_gpu_instancing`, metallic-roughness and specular-glossiness
   materials, and textures (embedded, external, data URI, missing, WebP fallback, a second UV
-  set, `KHR_texture_transform`). Errors: Draco, glTF 1.0, truncation, buffers outside the
-  model's folder, and accessors that overrun their views.
+  set, `KHR_texture_transform`). glTF 1.0, upgraded as it's read: objects keyed by ID,
+  binary glTF, `KHR_materials_common` and technique materials, accessor strides, a node's
+  several meshes, skins found by joint name with a bind shape matrix, animation parameters,
+  cameras and lights. Errors: Draco, truncation, buffers outside the model's folder, and
+  accessors that overrun their views.
 
 ## `expect.json`
 
