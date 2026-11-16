@@ -8,6 +8,10 @@
 //! Each ASCII `solid` is a node and mesh of its own, named as the file names it; a binary
 //! file's header text, when it is text, is kept in the asset's `extras.source`.
 //!
+//! STL is for printing, where Z is up (the build plate is XY), so the solids sit under a
+//! `RootNode` that turns them from Z-up to glTF's Y-up. Units are left as they are: STL has none,
+//! though most files are millimetres.
+//!
 //! The file is read a block at a time, never whole.
 
 use std::collections::HashMap;
@@ -28,12 +32,12 @@ pub(crate) fn stl(input: Input<'_>) -> Result<Document<'static>> {
     let head = blocks.need(1024)?;
     let Some(n) = binary_count(head, size) else {
         let solids: Vec<_> = ascii(blocks)?.into_iter().map(|(name, p)| (name, vec![p])).collect();
-        let source = json!({ "format": "STL", "encoding": "ASCII" });
+        let source = json!({ "format": "STL", "encoding": "ASCII", "upAxis": "Z" });
         return Ok(document(solids, &single(Prim::default()), source));
     };
     ensure!(n <= MAX_TRIANGLES, "too many triangles to convert ({n})");
     let header: [u8; 80] = head[..80].try_into().unwrap_or([0; 80]);
-    let mut source = json!({ "format": "STL", "encoding": "binary" });
+    let mut source = json!({ "format": "STL", "encoding": "binary", "upAxis": "Z" });
     if let Some(text) = header_text(&header) {
         source["header"] = json!(text);
     }
@@ -61,7 +65,16 @@ fn document(meshes: Vec<(Option<String>, Vec<Prim>)>, mesh: &Mesh, source: Value
     let mut facts = Map::new();
     facts.insert("triangles".into(), json!(triangles));
     // STL has no textures.
-    Document::from_named(meshes, &mesh.materials, Vec::new(), Some(source), facts)
+    let mut doc = Document::from_named(meshes, &mesh.materials, Vec::new(), Some(source), facts);
+    // Z-up to Y-up: a quarter turn about X.
+    let h = std::f32::consts::FRAC_1_SQRT_2;
+    let roots = doc.json["scenes"][0]["nodes"].take();
+    if let Some(nodes) = doc.json["nodes"].as_array_mut() {
+        nodes.push(json!({ "name": "RootNode", "children": roots, "rotation": [-h, 0.0, 0.0, h] }));
+        let root = nodes.len() - 1;
+        doc.json["scenes"][0]["nodes"] = json!([root]);
+    }
+    doc
 }
 
 /// A binary header's text: printable ASCII up to the first NUL, trimmed; `None` when that is
@@ -355,12 +368,27 @@ mod tests {
         );
         let doc = read(text.as_bytes());
         let nodes = doc.json["nodes"].as_array().unwrap();
-        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes.len(), 3);
         assert_eq!(nodes[0]["name"], "left part");
         assert_eq!(doc.json["meshes"][0]["name"], "left part");
         assert!(nodes[1].get("name").is_none());
+        assert_eq!(nodes[2]["children"], json!([0, 1]));
+        assert_eq!(doc.json["scenes"][0]["nodes"], json!([2]));
         assert_eq!(doc.json["asset"]["extras"]["source"]["encoding"], "ASCII");
         assert_eq!(doc.facts["triangles"], 2);
+    }
+
+    #[test]
+    fn z_up_becomes_y_up() {
+        // A triangle standing 2 high along Z stands 2 high along Y.
+        let text = "solid t
+facet normal 0 0 1 outer loop vertex 0 0 0 vertex 1 0 0 vertex 0 0 2 endloop endfacet
+";
+        let doc = read(text.as_bytes());
+        assert_eq!(doc.json["asset"]["extras"]["source"]["upAxis"], "Z");
+        let mesh = doc.flatten(crate::document::Pose::Rest).unwrap().unwrap();
+        let top = mesh.prims[0].positions.iter().map(|p| p[1]).fold(f32::MIN, f32::max);
+        assert!((top - 2.0).abs() < 1e-5, "{top}");
     }
 
     #[test]

@@ -63,7 +63,8 @@ python tools/corpus/obj.py
 
 - **STL**: binary and ASCII. Covers headers that start with `solid`, truncation, trailing
   bytes, VisCAM and Magics colors, NaN and degenerate facets, and normals that are wrong or
-  zero. Also several solids in one file, CRLF line endings and non-UTF-8 names.
+  zero. Also several solids in one file, CRLF line endings and non-UTF-8 names, all turned
+  from Z up to Y up.
 - **PLY**: ASCII and binary in both byte orders, and every property type. Covers vertex
   colors in each encoding, the various UV property names, n-gons and triangle strips, point
   clouds and Gaussian splats. Also unknown elements and broken headers.
