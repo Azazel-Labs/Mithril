@@ -46,7 +46,9 @@ impl Document<'_> {
     /// - quantized `POSITION`, `NORMAL`, `TANGENT` and `TEXCOORD_n` accessors
     ///   (`KHR_mesh_quantization`), morph targets' included, converted to floats with the same
     ///   values a reader would see, and their bounds recomputed. Node transforms are kept, so a
-    ///   mesh quantized with a scaling node draws where it did.
+    ///   mesh quantized with a scaling node draws where it did;
+    /// - indices holding their type's largest value (255 as bytes, 65535 as shorts), which glTF
+    ///   forbids and WebGL 2 reads as a primitive restart, widened to the next type.
     ///
     /// Those extensions leave `extensionsUsed` and `extensionsRequired`, and buffers nothing
     /// points into any more (meshopt fallbacks, buffers that held only compressed data) are
@@ -166,6 +168,49 @@ fn read(doc: &Document<'_>) -> Result<Plan> {
             }
         }
     }
+    // Indices holding their type's largest value, which glTF forbids and WebGL 2 reads as a
+    // primitive restart: widened to the next type.
+    for p in primitives(json) {
+        let Some(a) = index(p, "indices") else { continue };
+        if plan.accessors.contains_key(&a) {
+            continue;
+        }
+        let acc = r.acc(a)?;
+        let (top, wider) = match acc.ctype {
+            5121 => (255.0, 5123),
+            5123 => (65535.0, 5125),
+            _ => continue,
+        };
+        let values = r.read_acc(&acc, [0.0f32; 4])?;
+        if !values.iter().any(|v| v[0] >= top) {
+            continue;
+        }
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for v in &values {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "u8 and u16 indices read as floats exactly"
+            )]
+            let i = v[0] as u32;
+            if wider == 5123 {
+                bytes.extend_from_slice(&u16::try_from(i).unwrap_or(u16::MAX).to_le_bytes());
+            } else {
+                bytes.extend_from_slice(&i.to_le_bytes());
+            }
+        }
+        let count = values.len();
+        plan.accessors.insert(
+            a,
+            Data {
+                bytes,
+                ctype: wider,
+                count,
+                bounds: None,
+                indices: true,
+            },
+        );
+    }
     plan.views = r.meshopt.drain().collect();
     Ok(plan)
 }
@@ -222,8 +267,9 @@ fn from_draco(declared: &Value, bytes: &[u8], n: usize, is_indices: bool, attrs:
             .collect();
         let max = idx.iter().copied().max().unwrap_or(0);
         let ctype = match ctype {
-            5121 if max <= 0xFF => 5121,
-            5121 | 5123 if max <= 0xFFFF => 5123,
+            // The type's largest value restarts the strip in WebGL 2 and glTF forbids it.
+            5121 if max < 0xFF => 5121,
+            5121 | 5123 if max < 0xFFFF => 5123,
             _ => 5125,
         };
         let mut out = Vec::with_capacity(idx.len() * 4);

@@ -1764,6 +1764,45 @@ mod tests {
     }
 
     #[test]
+    fn decode_widens_indices_holding_their_types_largest_value() {
+        // 256 vertices on a line, u8 indices naming the last one: 255, a restart in WebGL 2.
+        let dir = tempfile::tempdir().unwrap();
+        let mut bin = Vec::new();
+        for i in 0..256u16 {
+            for v in [f32::from(i), f32::from(i % 2), 0.0] {
+                bin.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let index_offset = bin.len();
+        bin.extend_from_slice(&[0, 1, 2, 253, 254, 255, 0, 0]);
+        std::fs::write(dir.path().join("line.bin"), &bin).unwrap();
+        let json = serde_json::json!({
+            "asset": {"version": "2.0"},
+            "buffers": [{"uri": "line.bin", "byteLength": bin.len()}],
+            "bufferViews": [
+                {"buffer": 0, "byteLength": index_offset},
+                {"buffer": 0, "byteOffset": index_offset, "byteLength": 6},
+            ],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "count": 256, "type": "VEC3",
+                 "min": [0.0, 0.0, 0.0], "max": [255.0, 1.0, 0.0]},
+                {"bufferView": 1, "componentType": 5121, "count": 6, "type": "SCALAR"},
+            ],
+            "meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "indices": 1}]}],
+            "nodes": [{"mesh": 0}],
+            "scenes": [{"nodes": [0]}],
+        });
+        let path = dir.path().join("line.gltf");
+        std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let mut doc = crate::formats::load(&path, "gltf", &Folder::new(dir.path()), Keep::ALL).unwrap();
+        let before = doc.flatten(Pose::Rest).unwrap().unwrap();
+        doc.decode().unwrap();
+        assert_eq!(doc.json["accessors"][1]["componentType"], 5123);
+        let after = doc.flatten(Pose::Rest).unwrap().unwrap();
+        assert_eq!(to_glb(&before).unwrap(), to_glb(&after).unwrap());
+    }
+
+    #[test]
     fn reads_meshopt_compressed_gltf_with_external_buffers() {
         // A compressed GLB split into a .gltf and its buffer files.
         let dir = tempfile::tempdir().unwrap();
