@@ -778,3 +778,114 @@ fn corpus_covers_every_extension() {
     let missing: Vec<_> = EXTENSIONS.iter().filter(|e| !seen.contains(**e)).collect();
     assert!(missing.is_empty(), "no conformance cases for {missing:?}");
 }
+
+/// A reader told to drop something comes out as a full read pruned the same way: what readers
+/// skip (material libraries, texture files, shaders) changes nothing that's kept.
+#[test]
+fn reading_less_matches_pruning() {
+    let none = Keep {
+        animations: false,
+        skins: false,
+        morph_targets: false,
+        materials: false,
+        textures: false,
+        cameras: false,
+        lights: false,
+        extras: false,
+    };
+    let keeps = [
+        (
+            "no textures",
+            Keep {
+                textures: false,
+                ..Keep::ALL
+            },
+        ),
+        (
+            "no materials",
+            Keep {
+                materials: false,
+                ..Keep::ALL
+            },
+        ),
+        ("meshes", Keep::MESHES),
+        ("nothing", none),
+    ];
+    let mut failures = Vec::new();
+    for dir in std::fs::read_dir(corpus()).unwrap().flatten() {
+        if !dir.path().is_dir() || dir.file_name() == "tools" {
+            continue;
+        }
+        for case in cases(&dir.file_name().to_string_lossy()) {
+            let ext = ext_of(&case.file);
+            let needs = case.expect.get("needs").and_then(Value::as_str);
+            if !enabled(&ext) || needs.is_some_and(|f| !has_feature(f)) || case.expect.contains_key("error") {
+                continue;
+            }
+            let assets = Folder::new(&case.dir);
+            for (label, keep) in keeps {
+                let Ok(mut full) = formats::load(&case.file, &ext, &assets, Keep::ALL) else {
+                    continue;
+                };
+                full.prune(keep);
+                let less = match formats::load(&case.file, &ext, &assets, keep) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        failures.push(format!("{} ({label}): {e}", case.name));
+                        continue;
+                    }
+                };
+                // Skipped work leaves no data behind, where pruning leaves it unreferenced; and a
+                // reader that skips skins, cameras or lights may leave fewer nodes. Both are
+                // compared through the meshes they make. Without textures, a material's factors
+                // are its own, not the ones a found texture calls for, so only its name is.
+                let mut skip = vec!["accessors", "bufferViews", "buffers", "nodes", "scenes"];
+                if !keep.textures {
+                    skip.push("materials");
+                }
+                let differ: Vec<String> = less
+                    .json
+                    .keys()
+                    .chain(full.json.keys())
+                    .filter(|k| !skip.contains(&k.as_str()) && less.json.get(*k) != full.json.get(*k))
+                    .map(|k| {
+                        let show = |d: &Document<'_>| {
+                            d.json.get(k).map_or_else(
+                                || "none".to_owned(),
+                                |v| v.to_string().chars().take(300).collect::<String>(),
+                            )
+                        };
+                        format!("{k}: {} vs pruned {}", show(&less), show(&full))
+                    })
+                    .collect();
+                let names = |d: &Document<'_>| -> Vec<Value> {
+                    d.json
+                        .get("materials")
+                        .and_then(Value::as_array)
+                        .map_or_else(Vec::new, |m| {
+                            m.iter().map(|m| m.get("name").cloned().unwrap_or_default()).collect()
+                        })
+                };
+                let flat = |d: &Document<'_>| d.flatten(Pose::Rest).ok().flatten().map(|m| format!("{:?}", m.prims));
+                if !differ.is_empty() {
+                    failures.push(format!("{} ({label}): {}", case.name, differ.join("; ")));
+                } else if names(&less) != names(&full) {
+                    failures.push(format!("{} ({label}): material names differ", case.name));
+                } else if less.counts() != full.counts() {
+                    failures.push(format!("{} ({label}): counts differ", case.name));
+                } else if keep.skins && flat(&less) != flat(&full) {
+                    // (Pruning a skin off a full read leaves the mesh in its bind space, where a
+                    // reader that skips the skin places it; so without skins only the counts are
+                    // compared.)
+                    failures.push(format!("{} ({label}): the flat mesh differs", case.name));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} reads differ:\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
+}

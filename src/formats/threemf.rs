@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Read};
 
-use crate::document::{Builder, Document};
+use crate::document::{Builder, Document, Keep};
 use crate::{Context as _, Result};
 use quick_xml::events::{BytesStart, Event};
 use serde_json::{Map, Value, json};
@@ -211,7 +211,7 @@ impl Slicer {
 
 /// Load a 3MF: the build as nodes, an object's triangles as a mesh with a primitive per look, and
 /// the facts worth keeping.
-pub(crate) fn load(input: super::Input<'_>) -> Result<Document<'static>> {
+pub(crate) fn load(input: super::Input<'_>, keep: Keep) -> Result<Document<'static>> {
     let mut zip: Zip<'_> = ZipArchive::new(input.seekable()?).context("not a 3MF file (it isn't a zip)")?;
     let names: HashMap<String, String> = zip
         .file_names()
@@ -312,6 +312,10 @@ pub(crate) fn load(input: super::Input<'_>) -> Result<Document<'static>> {
             Look::Vertex => Material::plain("vertex_colors", [1.0; 4]).into(),
             Look::Texture(t) => {
                 let image = *image_of.entry(t).or_insert_with(|| {
+                    // A texture that would only be dropped isn't unzipped.
+                    if !(keep.materials && keep.textures) {
+                        return None;
+                    }
                     let real = names.get(&out.textures[t].0)?;
                     let mut bytes = Vec::new();
                     zip.by_name(real).ok()?.take(MAX_PART).read_to_end(&mut bytes).ok()?;
@@ -1112,7 +1116,7 @@ mod tests {
             <build><item objectid="2" transform="1 0 0 0 1 0 0 0 1 100 0 0"/><item objectid="2"/></build></model>"##
         );
         let f = zip_of(&[("_rels/.rels", RELS), ("3D/3dmodel.model", &model)]);
-        let doc = load(crate::formats::Input::file(f.path())).unwrap();
+        let doc = load(crate::formats::Input::file(f.path()), Keep::ALL).unwrap();
         let (mesh, facts) = (flat(&doc), &doc.facts);
         assert_eq!(facts["triangles"], 4);
         assert_eq!(facts["objects"], 2);
@@ -1148,7 +1152,7 @@ mod tests {
             ("Metadata/model_settings.config", settings),
             ("Metadata/project_settings.config", project),
         ]);
-        let doc = load(crate::formats::Input::file(f.path())).unwrap();
+        let doc = load(crate::formats::Input::file(f.path()), Keep::ALL).unwrap();
         assert_eq!(doc.facts["triangles"], 3);
         // Part 1 in white with one triangle painted green; part 2 in red.
         assert_eq!(colors(&flat(&doc)), [[255, 255, 255], [0, 255, 0], [255, 0, 0]]);
@@ -1170,7 +1174,7 @@ mod tests {
             ("Metadata/Slic3r_PE_model.config", cfg),
             ("Metadata/Slic3r_PE.config", settings),
         ]);
-        let doc = load(crate::formats::Input::file(f.path())).unwrap();
+        let doc = load(crate::formats::Input::file(f.path()), Keep::ALL).unwrap();
         // Volume 0 in extruder 2 (no color of its own: its filament's yellow); volume 1 in the object's extruder 1.
         assert_eq!(colors(&flat(&doc)), [[255, 255, 0], [0, 0, 255]]);
     }

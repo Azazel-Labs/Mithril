@@ -229,21 +229,21 @@ fn convert<'a>(input: Input<'a>, ext: &str, assets: &'a dyn Assets, keep: Keep) 
         #[cfg(feature = "stl")]
         "stl" => stl::stl(input),
         #[cfg(feature = "ply")]
-        "ply" => ply::ply(input, assets),
+        "ply" => ply::ply(input, assets, keep),
         #[cfg(feature = "vox")]
         "vox" => vox::vox(&input.read()?, keep),
         #[cfg(feature = "3mf")]
-        "3mf" => threemf::load(input),
+        "3mf" => threemf::load(input, keep),
         #[cfg(feature = "3ds")]
         "3ds" => tds::load(input, assets, keep),
         #[cfg(feature = "usd")]
         "usd" | "usda" | "usdc" | "usdz" => usd::load(input, assets, keep),
         #[cfg(feature = "obj")]
-        "obj" => obj::obj(input, assets),
+        "obj" => obj::obj(input, assets, keep),
         #[cfg(feature = "fbx")]
         "fbx" => fbx::load(input, assets, keep),
         #[cfg(feature = "gltf")]
-        "gltf" | "glb" => gltf::load(input, assets),
+        "gltf" | "glb" => gltf::load(input, assets, keep),
         e if EXTENSIONS.contains(&e) => bail!("built without the `{}` feature", feature_for(e)),
         _ => bail!("not a model format handled here: .{ext}"),
     }

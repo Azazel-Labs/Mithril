@@ -18,7 +18,7 @@ use serde_json::{Map, Value, json};
 use super::Input;
 use super::stream::{self, Blocks};
 use crate::assets::Assets;
-use crate::document::{Builder, Document, Part};
+use crate::document::{Builder, Document, Keep, Part};
 use crate::mesh::{FastMap, MAX_TRIANGLES, Material, Mesh, Prim, smooth_normals, srgb_to_linear, triangulate};
 use crate::num::{f32_of, u32_of};
 use crate::{Context as _, Result};
@@ -503,7 +503,7 @@ struct Body {
     local: Vec<[u32; 3]>,
 }
 
-pub(crate) fn ply(input: Input<'_>, assets: &dyn Assets) -> Result<Document<'static>> {
+pub(crate) fn ply(input: Input<'_>, assets: &dyn Assets, keep: Keep) -> Result<Document<'static>> {
     let path = input.path;
     let mut blocks = input.blocks()?;
     // The header, whole.
@@ -572,7 +572,9 @@ pub(crate) fn ply(input: Input<'_>, assets: &dyn Assets) -> Result<Document<'sta
     // The attributes the edges share: the triangles' when their vertices are the file's.
     let mut shared = None;
     if has_faces {
-        let (mesh, src) = build(&mut body, head.texture, path, assets)?;
+        // A texture that would only be dropped isn't read.
+        let texture = head.texture.filter(|_| keep.materials && keep.textures);
+        let (mesh, src) = build(&mut body, texture, path, assets)?;
         facts.insert("triangles".into(), json!(mesh.triangles()));
         facts.insert(
             "vertices".into(),
@@ -1107,7 +1109,12 @@ mod tests {
     use super::*;
 
     fn read(text: &str) -> Document<'static> {
-        ply(Input::memory(text.as_bytes(), "t.ply"), &crate::assets::Memory::new()).unwrap()
+        ply(
+            Input::memory(text.as_bytes(), "t.ply"),
+            &crate::assets::Memory::new(),
+            Keep::ALL,
+        )
+        .unwrap()
     }
 
     #[test]

@@ -1089,6 +1089,9 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets, keep: Keep) -> 
             MATERIAL => {
                 let m = material(b);
                 let mut image_for = |f: &str| {
+                    if !(keep.materials && keep.textures) {
+                        return None;
+                    }
                     *image_of.entry(f.to_lowercase()).or_insert_with(|| {
                         let img: Image = assets.find(f, dir).and_then(|p| assets.load_image(&p))?;
                         images.push(img);

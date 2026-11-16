@@ -860,7 +860,7 @@ impl Reader<'_, '_, '_> {
                     self.objs,
                     self.linear,
                     self.dir,
-                    self.assets,
+                    self.keep.textures.then_some(self.assets),
                     &mut self.images,
                     &mut self.image_index,
                 );
@@ -1460,7 +1460,8 @@ fn read_material(
     objs: &Objects<'_>,
     linear: bool,
     dir: &Path,
-    assets: &dyn Assets,
+    // None when textures aren't kept: they aren't read.
+    assets: Option<&dyn Assets>,
     images: &mut Vec<Image>,
     image_index: &mut HashMap<i64, Option<usize>>,
 ) -> Full {
@@ -1547,6 +1548,9 @@ fn read_material(
     let (mut metallic, mut roughness, mut opacity) = (None, None, None);
     for (tex, prop) in objs.children.get(&id).cloned().unwrap_or_default() {
         let Some(slot) = slot(&prop) else {
+            continue;
+        };
+        let Some(assets) = assets else {
             continue;
         };
         let img = *image_index.entry(tex).or_insert_with(|| {

@@ -20,7 +20,7 @@ use super::stream;
 
 use crate::Result;
 use crate::assets::Assets;
-use crate::document::{Builder, Document, Part};
+use crate::document::{Builder, Document, Keep, Part};
 use crate::material::{self, Clearcoat, Factor, Full, Sheen, Specular, Tex, UvTransform};
 use crate::mesh::{MAX_TRIANGLES, Material, Prim, smooth_normals, srgb_to_linear, triangulate};
 use crate::num::u32_of;
@@ -863,7 +863,7 @@ fn loose_prim(b: &mut Builder, at: &[u32], lines: bool, v: &[[f32; 3]], colors: 
 /// OBJ, with MTL colors and textures (base color and normal map). Faces may mix corners with
 /// and without texture coordinates or normals. The file is read a block at a time, and each
 /// corner becomes a vertex of its part's primitive in its material as it's read.
-pub(crate) fn obj(input: Input<'_>, assets: &dyn Assets) -> Result<Document<'static>> {
+pub(crate) fn obj(input: Input<'_>, assets: &dyn Assets, keep: Keep) -> Result<Document<'static>> {
     let mut blocks = input.blocks()?;
     let size = blocks.size_hint();
     let dir = input.dir();
@@ -939,7 +939,13 @@ pub(crate) fn obj(input: Input<'_>, assets: &dyn Assets) -> Result<Document<'sta
         ..
     } = r;
 
-    let mtl = read_libraries(&libs, dir, assets);
+    // Material libraries and textures that would only be dropped aren't read.
+    let textures = keep.materials && keep.textures;
+    let mtl = if keep.materials {
+        read_libraries(&libs, dir, assets)
+    } else {
+        HashMap::new()
+    };
     // The materials used, in first-use order, and whether any triangles using each have texture
     // coordinates.
     let mut index_of: HashMap<usize, usize> = HashMap::new();
@@ -982,7 +988,7 @@ pub(crate) fn obj(input: Input<'_>, assets: &dyn Assets) -> Result<Document<'sta
             }
         }
         let mut texture = |reference: Option<&MapRef>| -> Option<Tex> {
-            if !textured[m] {
+            if !textures || !textured[m] {
                 return None;
             }
             let reference = reference?;
@@ -1057,7 +1063,9 @@ pub(crate) fn obj(input: Input<'_>, assets: &dyn Assets) -> Result<Document<'sta
             s.color = s.color.map(srgb_to_linear);
         }
     }
-    super::guess_texture(&mut out_materials, &mut images, &textured, input.path, assets);
+    if textures {
+        super::guess_texture(&mut out_materials, &mut images, &textured, input.path, assets);
+    }
 
     // A mesh per part, in the order the parts turn up.
     let mut prims_of: Vec<Vec<Value>> = vec![Vec::new(); parts.len()];

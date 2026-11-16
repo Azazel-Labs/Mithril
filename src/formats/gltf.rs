@@ -24,7 +24,7 @@ use super::{Input, gltf1};
 use crate::assets::Assets;
 #[cfg(feature = "fs")]
 use crate::document::FileSpan;
-use crate::document::{Blob, Document};
+use crate::document::{Blob, Document, Keep};
 use crate::gltf as container;
 use crate::num::usize_of;
 use crate::{Context as _, Result};
@@ -34,7 +34,7 @@ use crate::{Context as _, Result};
 const HEAD: usize = 64 * 1024;
 
 /// Reads the glTF or GLB `input`.
-pub(crate) fn load<'a>(input: Input<'a>, assets: &'a dyn Assets) -> Result<Document<'a>> {
+pub(crate) fn load<'a>(input: Input<'a>, assets: &'a dyn Assets, keep: Keep) -> Result<Document<'a>> {
     let (json, mut bin) = match input.bytes() {
         Some(b) if b.starts_with(b"glTF") => glb_in_memory(Cow::Borrowed(b))?,
         Some(b) => (gltf_json(b)?, None),
@@ -109,7 +109,10 @@ pub(crate) fn load<'a>(input: Input<'a>, assets: &'a dyn Assets) -> Result<Docum
     if let Some(fix) = fix {
         gltf1::finish(&mut doc, &fix)?;
     }
-    embed_images(&mut doc, input, assets);
+    // Images that would only be dropped aren't read.
+    if keep.materials && keep.textures {
+        embed_images(&mut doc, input, assets);
+    }
     Ok(doc)
 }
 

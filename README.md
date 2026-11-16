@@ -100,8 +100,8 @@ Rust 1.88, with any features but `usd`. The `usd` feature, and so the default bu
   animations, cameras and lights, and its source's units, axes and raw values in extras.
   Materials are written in full: the core model plus `KHR_materials_*` (ior, specular,
   transmission, volume, clearcoat, sheen, anisotropy, emissive strength, unlit) and
-  `KHR_texture_transform`, from each format's own values.
-  Still to come: readers that skip more of what `Keep` drops.
+  `KHR_texture_transform`, from each format's own values. Readers skip what the `Keep`
+  drops: texture files, material libraries and shaders, animation, skins and morphs.
 - **Typed views** over the document's meshes, accessors, nodes, skins and animations.
 - **Accessors**: typed access through the document (the mesh reader already reads every
   component type, normalized and sparse).

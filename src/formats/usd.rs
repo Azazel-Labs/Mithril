@@ -1535,6 +1535,8 @@ impl Reader<'_> {
             return i;
         }
         let material = match bound {
+            // Without materials kept, the shader isn't read; the plain one goes in the prune.
+            Some(path) if !self.keep.materials => Material::plain(leaf(path.as_str()), display).into(),
             Some(path) => self.preview_surface(&path),
             None => Material::plain("default", display).into(),
         };
@@ -2191,6 +2193,9 @@ const UV_NAMES: &[&str] = &["st", "st0", "st_0", "UVMap", "uv", "uv0", "map1", "
 impl Reader<'_> {
     /// A texture by its asset path: inside the `.usdz`, beside the file, or anywhere in the pack by name.
     fn image(&mut self, asset: &str) -> Option<usize> {
+        if !(self.keep.materials && self.keep.textures) {
+            return None;
+        }
         if let Some(&i) = self.image_of.get(asset) {
             return i;
         }

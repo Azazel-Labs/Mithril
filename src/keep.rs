@@ -9,8 +9,14 @@ use crate::document::Document;
 /// Which parts of a model a load keeps. Meshes and the node hierarchy are always kept; each
 /// switch here drops one kind of data on top of that. [`Keep::default`] keeps everything.
 ///
-/// A reader may skip reading what isn't kept, so a narrow `Keep` can also make a load faster.
-/// Only the data itself goes; buffer views and accessors it used stay (unreferenced).
+/// Readers skip reading what isn't kept, so a narrow `Keep` also makes a load faster: no
+/// texture files, embedded images or (without materials) material libraries and shaders are
+/// read, nor animations, skins, morph targets, cameras or lights where the format keeps them
+/// apart. What a reader did read and [`Document::prune`] then dropped leaves its buffer views
+/// and accessors behind, unreferenced.
+///
+/// Without textures, a material's factors are its own: a reader that would have found a color
+/// texture doesn't turn the base color white for it.
 ///
 /// ```
 /// use polysmelt::document::Keep;
