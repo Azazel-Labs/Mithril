@@ -285,10 +285,33 @@ fn color_texture(path: &Path, assets: &dyn Assets, images: &mut crate::images::I
     images.file(assets, p, &name)
 }
 
+/// Whether the colors of the materials a texture found by name would paint are plain enough to
+/// be painted over: no color but grays, and no more than one besides white. A model colored by
+/// its materials (a white body with orange trim, a dark tire on a lighter rim) keeps its colors.
+#[cfg(any(feature = "obj", feature = "3ds", feature = "fbx"))]
+fn plain_colors(colors: impl IntoIterator<Item = [f32; 4]>) -> bool {
+    let mut other: Option<[f32; 3]> = None;
+    for [r, g, b, _] in colors {
+        if r.max(g).max(b) - r.min(g).min(b) > 0.05 {
+            return false;
+        }
+        if [r, g, b].iter().all(|c| *c >= 0.999) {
+            continue;
+        }
+        match other {
+            Some(o) if o.iter().zip([r, g, b]).any(|(a, c)| (a - c).abs() > 0.01) => return false,
+            _ => other = Some([r, g, b]),
+        }
+    }
+    true
+}
+
 #[cfg(any(feature = "obj", feature = "3ds"))]
 /// A model that names no color texture takes one by name: `Barrel.png` or
-/// `Barrel_Albedo.png` for `Barrel.obj`, from anywhere in the pack, for the `materials` that
-/// `textured` says draw triangles with texture coordinates. Their color then shows as painted.
+/// `Barrel_Albedo.png` for `Barrel.obj`, from the model's part of the pack (see
+/// [`Assets::color_texture_for`]), for the `materials` that `textured` says draw triangles with
+/// texture coordinates, unless their own colors say the model is colored already (see
+/// [`plain_colors`]). Their color then shows as painted.
 fn guess_texture(
     materials: &mut [crate::mesh::Material],
     images: &mut crate::images::Images,
@@ -297,6 +320,14 @@ fn guess_texture(
     assets: &dyn Assets,
 ) {
     if !textured.contains(&true) || materials.iter().any(|m| m.color_image.is_some()) {
+        return;
+    }
+    let painted = materials
+        .iter()
+        .zip(textured)
+        .filter(|(_, t)| **t)
+        .map(|(m, _)| m.color);
+    if !plain_colors(painted) {
         return;
     }
     let Some(i) = color_texture(path, assets, images) else {
@@ -581,6 +612,75 @@ end_header
         assert_eq!(m.materials[0].color, [1.0, 1.0, 1.0, 1.0]);
         let px = image::load_from_memory(&m.images[0].bytes).unwrap().to_rgb8();
         assert_eq!(px.get_pixel(0, 0).0, [200, 100, 50]);
+    }
+
+    #[test]
+    #[cfg(feature = "obj")]
+    fn a_texture_by_name_comes_from_the_models_part_of_the_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        for d in ["Kit3D/Models", "Kit3D/Textures", "Kit2D"] {
+            std::fs::create_dir_all(dir.path().join(d)).unwrap();
+        }
+        std::fs::write(dir.path().join("Kit2D/Stairs.png"), png([0, 0, 0])).unwrap();
+        let model = dir.path().join("Kit3D/Models/Stairs.obj");
+        std::fs::write(
+            &model,
+            format!(
+                "{QUAD}f 1/1 2/2 3/3 4/4
+"
+            ),
+        )
+        .unwrap();
+        let (m, _) = load_in(&model, "obj", dir.path());
+        assert_eq!(m.unwrap().images.len(), 0, "a sprite from another kit isn't taken");
+
+        std::fs::write(dir.path().join("Kit3D/Textures/Stairs.png"), png([200, 100, 50])).unwrap();
+        let (m, _) = load_in(&model, "obj", dir.path());
+        let m = m.unwrap();
+        let px = image::load_from_memory(&m.images[0].bytes).unwrap().to_rgb8();
+        assert_eq!(px.get_pixel(0, 0).0, [200, 100, 50]);
+    }
+
+    #[test]
+    #[cfg(feature = "obj")]
+    fn a_model_colored_by_its_materials_takes_no_texture_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Stairs.png"), png([0, 0, 0])).unwrap();
+        std::fs::write(
+            dir.path().join("Stairs.mtl"),
+            "newmtl Wood
+Kd 0.6 0.3 0.1
+newmtl Carpet
+Kd 0.7 0.05 0.05
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("Stairs.obj"),
+            format!(
+                "mtllib Stairs.mtl
+{QUAD}usemtl Wood
+f 1/1 2/2 3/3
+usemtl Carpet
+f 1/1 3/3 4/4
+"
+            ),
+        )
+        .unwrap();
+        let (m, _) = load_in(&dir.path().join("Stairs.obj"), "obj", dir.path());
+        let m = m.unwrap();
+        assert_eq!(m.images.len(), 0);
+        assert!(m.materials.iter().all(|x| x.color_image.is_none()));
+    }
+
+    #[test]
+    #[cfg(feature = "obj")]
+    fn plain_colors_are_grays_and_one_besides_white() {
+        let white = [1.0, 1.0, 1.0, 1.0];
+        assert!(plain_colors([]));
+        assert!(plain_colors([GRAY, white, GRAY]));
+        assert!(!plain_colors([[0.8, 0.4, 0.1, 1.0]]));
+        assert!(!plain_colors([[0.2, 0.2, 0.2, 1.0], [0.6, 0.6, 0.6, 1.0]]));
     }
 
     #[test]

@@ -40,7 +40,9 @@ pub trait Assets {
         self.image(&self.read(path)?, path)
     }
 
-    /// A color texture for a model at `model` that names none, by naming convention. `None` by
+    /// A color texture for a model at `model` that names none, by naming convention, from the
+    /// model's part of the pack: its folder's parent and below (`Models/` and `Textures/` side by
+    /// side), so a sprite of the same name in another kit of a bundle isn't taken. `None` by
     /// default.
     fn color_texture_for(&self, model: &Path) -> Option<PathBuf> {
         let _ = model;
@@ -50,8 +52,8 @@ pub trait Assets {
 
 /// Assets in a folder tree laid out like the pack a model came in: references are tried next to
 /// the model, then found anywhere under `root` by file name (or the same name in another image
-/// format). A model naming no color texture takes one by name: `Barrel.png` or
-/// `Barrel_Albedo.png` for `Barrel.obj`.
+/// format). A model naming no color texture takes one by name from its part of the pack:
+/// `Barrel.png` or `Barrel_Albedo.png` for `Barrel.obj`.
 #[cfg(feature = "fs")]
 #[derive(Debug, Clone)]
 pub struct Folder {
@@ -74,7 +76,13 @@ impl Assets for Folder {
     }
 
     fn color_texture_for(&self, model: &Path) -> Option<PathBuf> {
-        color_texture_by_name(model, |visit| walk_images(&self.root, visit))
+        // The model's folder's parent, when that's still inside the pack.
+        let home = model
+            .parent()
+            .and_then(Path::parent)
+            .filter(|h| h.starts_with(&self.root))
+            .unwrap_or(&self.root);
+        color_texture_by_name(model, |visit| walk_images(home, visit))
     }
 }
 
@@ -160,7 +168,12 @@ impl Assets for Memory {
     }
 
     fn color_texture_for(&self, model: &Path) -> Option<PathBuf> {
-        color_texture_by_name(model, |visit| self.images(visit))
+        // The model's folder's parent: `a/b` for `a/b/Models/Barrel.obj`.
+        let key = memory_key(&model.to_string_lossy());
+        let home = key.rsplitn(3, '/').nth(2).map(|h| format!("{h}/")).unwrap_or_default();
+        color_texture_by_name(model, |visit| {
+            self.images(&mut |p, stem| p.to_string_lossy().starts_with(&home) && visit(p, stem));
+        })
     }
 }
 
@@ -392,6 +405,24 @@ mod tests {
         assert_eq!(
             m.color_texture_for(Path::new("Barrel.obj")),
             Some(PathBuf::from("Barrel_Albedo.png"))
+        );
+    }
+
+    #[test]
+    fn color_textures_by_name_come_from_the_models_part_of_the_pack() {
+        let m = Memory::new()
+            .with("Bundle/Kit2D/Sprites/Stairs.png", "2d")
+            .with("Bundle/Kit3D/Textures/Crate.png", "3d");
+        let guess = |model: &str| m.color_texture_for(Path::new(model));
+        assert_eq!(guess("Bundle/Kit3D/Models/Stairs.fbx"), None);
+        assert_eq!(
+            guess("Bundle/Kit3D/Models/Crate.fbx"),
+            Some(PathBuf::from("Bundle/Kit3D/Textures/Crate.png"))
+        );
+        assert_eq!(
+            guess("Models/Stairs.fbx"),
+            Some(PathBuf::from("Bundle/Kit2D/Sprites/Stairs.png")),
+            "a model near the top searches the whole pack"
         );
     }
 }

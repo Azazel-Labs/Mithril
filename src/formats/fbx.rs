@@ -363,6 +363,7 @@ pub(crate) fn load(input: super::Input<'_>, assets: &dyn Assets, keep: Keep) -> 
         && r.keep.textures
         && !r.textured.is_empty()
         && !r.materials.iter().any(|m| m.base_color_tex.is_some())
+        && super::plain_colors(r.textured.iter().map(|&m| r.materials[m].base_color))
         && let Some(i) = super::color_texture(input.path, assets, &mut r.images)
     {
         // A model that names no color texture takes one by name (see `guess_color_texture`).
