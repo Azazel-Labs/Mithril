@@ -28,10 +28,11 @@ pub trait Assets {
     fn read(&self, path: &Path) -> Option<Cow<'_, [u8]>>;
 
     /// Texture bytes as an embeddable image; `name` is the file's name or path, for its format.
-    /// By default only PNG and JPEG pass. Override to convert others (TGA, BMP, DDS, PSD, ...).
+    /// By default PNG and JPEG pass, and WebP is re-encoded as PNG with the `webp` feature.
+    /// Override to convert others (TGA, BMP, DDS, PSD, ...).
     fn image(&self, bytes: &[u8], name: &Path) -> Option<Image> {
         let _ = name;
-        Image::png_or_jpeg(bytes)
+        Image::png_or_jpeg(bytes).or_else(|| Image::webp(bytes))
     }
 
     /// A texture file read as an embeddable image.

@@ -18,7 +18,7 @@ include = ["/src", "/examples", "/README.md", "/LICENSE", "/Cargo.toml"]
 all-features = true
 
 [features]
-default = ["minimal", "fbx", "3mf", "usd", "draco"]
+default = ["minimal", "fbx", "3mf", "usd", "draco", "webp"]
 # The readers with no dependencies, and file access: `default-features = false, features = ["minimal"]`.
 minimal = ["fs", "stl", "ply", "vox", "obj", "3ds", "gltf"]
 # Reading from the file system: `formats::load`, `assets::Folder` and `gltf::files_in`. Without
@@ -35,6 +35,9 @@ fbx = ["dep:fbxcel", "dep:base64"]
 usd = ["dep:openusd", "dep:openusd-schemas", "dep:zip"]
 # Draco-compressed glTF meshes (KHR_draco_mesh_compression).
 draco = ["gltf", "dep:draco-core"]
+# WebP textures (`EXT_texture_webp`, or a `.webp` file a model names) re-encoded as PNG for
+# the flat mesh, which embeds only PNG and JPEG.
+webp = ["dep:image-webp", "dep:flate2"]
 
 [dependencies]
 serde_json = "1"
@@ -47,6 +50,9 @@ zip = { version = "9", default-features = false, features = ["deflate"], optiona
 quick-xml = { version = "0.41", optional = true }
 openusd = { version = "0.8", optional = true }
 openusd-schemas = { version = "0.8", features = ["geom", "shade"], optional = true }
+image-webp = { version = "0.2", optional = true }
+# zip already brings flate2 on the zlib-rs backend; the PNG writer shares it.
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"], optional = true }
 draco-core = { version = "2.3", default-features = false, features = ["decoder", "edgebreaker_valence_decode", "legacy_bitstream_decode"], optional = true }
 
 [dev-dependencies]

@@ -17,7 +17,8 @@
 //! - Materials: base color, metallic and roughness factors, emissive (with
 //!   `KHR_materials_emissive_strength`), double-sidedness, and
 //!   the color and normal textures (`KHR_materials_pbrSpecularGlossiness` as its diffuse), when
-//!   their images are PNG or JPEG.
+//!   their images are PNG or JPEG, or WebP (`EXT_texture_webp`) with the `webp` feature, which
+//!   re-encodes it as PNG.
 //! - Meshopt-compressed views are decoded as they are read; Draco
 //!   (`KHR_draco_mesh_compression`) needs the `draco` feature.
 //! - A required extension it can't honour is an error, unless it only changes how surfaces look.
@@ -1369,7 +1370,8 @@ impl Reader<'_> {
         sources.into_iter().find_map(|s| self.image(s, mesh))
     }
 
-    /// The mesh image for glTF image `s`, when it's PNG or JPEG.
+    /// The mesh image for glTF image `s`, when it's PNG or JPEG (or WebP, with the `webp`
+    /// feature).
     fn image(&mut self, s: usize, mesh: &mut Mesh) -> Option<usize> {
         if let Some(done) = *self.images.get(s)? {
             return done;
@@ -1385,7 +1387,7 @@ impl Reader<'_> {
                 .and_then(|u| container::data_uri(u).ok())
                 .map(|(_, b)| b)
         };
-        let out = bytes.and_then(Image::from_png_or_jpeg).map(|i| {
+        let out = bytes.and_then(Image::decode).map(|i| {
             mesh.images.push(i);
             mesh.images.len() - 1
         });

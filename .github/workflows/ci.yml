@@ -38,6 +38,7 @@ jobs:
           - --no-default-features --features stl
           - --no-default-features --features gltf
           - --no-default-features --features draco
+          - --no-default-features --features webp
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install && rustup component add clippy
@@ -66,7 +67,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install && rustup target add wasm32-unknown-unknown && rustup component add clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --target wasm32-unknown-unknown --no-default-features --features stl,ply,obj,gltf,draco,vox,3ds -- -D warnings
+      - run: cargo clippy --target wasm32-unknown-unknown --no-default-features --features stl,ply,obj,gltf,draco,vox,3ds,webp -- -D warnings
 
   msrv:
     runs-on: ubuntu-latest
@@ -75,7 +76,7 @@ jobs:
       matrix:
         include:
           - rust: "1.88"
-            features: --no-default-features --features minimal,fbx,3mf,draco
+            features: --no-default-features --features minimal,fbx,3mf,draco,webp
           - rust: "1.96"
             features: ""
     steps:

@@ -30,7 +30,7 @@ Early. What exists today:
   attributes turned into floats, the scene graph, animation and materials untouched. A
   `Keep` passed to the load says what to keep: everything by default, or for instance
   `Keep { animations: false, ..Keep::ALL }` for static meshes that still carry their skins.
-- **Conformance corpus**: 539 cases under `tests/corpus`, each a file and the GLB it must
+- **Conformance corpus**: 541 cases under `tests/corpus`, each a file and the GLB it must
   become. They cover every format above and the variants exporters really write: OBJ's face
   forms and MTL dialects, both PLY byte orders, every FBX version and axis system, and USD's
   three encodings and its composition, and glTF's accessor types, node hierarchy, skins and
@@ -63,9 +63,10 @@ Early. What exists today:
 | `3mf` | 3MF | `zip`, `quick-xml` |
 | `usd` | USD | `openusd`, `openusd-schemas`, `zip` |
 | `draco` | Draco-compressed glTF (KHR_draco_mesh_compression) | `draco-core` |
+| `webp` | WebP textures (EXT_texture_webp, `.webp` files), re-encoded as PNG for the flat mesh | `image-webp`, `flate2` |
 | `fs` | Reading files: `formats::load`, `assets::Folder`, `gltf::files_in` | none |
 
-Every reader is on by default, and so is `fs`. `minimal` is the six readers with no
+Every reader is on by default, and so are `fs` and `webp`. `minimal` is the six readers with no
 dependencies, plus `fs`, for `default-features = false, features = ["minimal"]`. Asking
 `formats::load` for a format whose feature is off returns an error that names the feature.
 

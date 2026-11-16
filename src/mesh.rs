@@ -99,6 +99,31 @@ impl Image {
         Some(Self { bytes, mime })
     }
 
+    /// `bytes` as an image: PNG and JPEG as they are, and with the `webp` feature, WebP
+    /// re-encoded as PNG.
+    #[must_use]
+    pub fn decode(bytes: Vec<u8>) -> Option<Self> {
+        if Self::mime_of(&bytes).is_some() {
+            Self::from_png_or_jpeg(bytes)
+        } else {
+            Self::webp(&bytes)
+        }
+    }
+
+    /// WebP `bytes` re-encoded as PNG, with the `webp` feature.
+    pub(crate) fn webp(bytes: &[u8]) -> Option<Self> {
+        if !(bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP") {
+            return None;
+        }
+        #[cfg(feature = "webp")]
+        return Some(Self {
+            bytes: crate::webp::to_png(bytes)?,
+            mime: "image/png",
+        });
+        #[cfg(not(feature = "webp"))]
+        None
+    }
+
     fn mime_of(bytes: &[u8]) -> Option<&'static str> {
         if bytes.starts_with(b"\x89PNG") {
             Some("image/png")

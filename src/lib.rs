@@ -49,6 +49,8 @@ mod num;
 
 #[cfg(test)]
 mod test_rng;
+#[cfg(feature = "webp")]
+mod webp;
 
 /// What can go wrong reading or writing an asset.
 #[derive(Debug, thiserror::Error)]

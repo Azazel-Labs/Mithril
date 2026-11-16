@@ -59,6 +59,16 @@ def png(rgb, size=2):
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
 
 
+def webp(rgb, size=2):
+    """A solid-color lossless WebP (needs Pillow)."""
+    import io
+
+    from PIL import Image
+    out = io.BytesIO()
+    Image.new("RGB", (size, size), tuple(rgb)).save(out, "WEBP", lossless=True)
+    return out.getvalue()
+
+
 def srgb_to_linear(c):
     return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
 

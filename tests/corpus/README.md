@@ -32,12 +32,12 @@ cases.
 | STL | 29 | 27 | 2 |
 | PLY | 36 | 32 | 4 |
 | VOX | 27 | 27 | none |
-| OBJ | 51 | 42 | 9 |
+| OBJ | 52 | 43 | 9 |
 | 3DS | 43 | 43 | none |
 | 3MF | 43 | 43 | none |
 | FBX | 115 | 101 | 14 |
 | USD | 134 | 114 | 20 |
-| glTF | 61 | 48 | 13 |
+| glTF | 62 | 49 | 13 |
 
 - **Generated** cases are written byte by byte by `tools/corpus/<format>.py` (3DS is
   `tds.py`, 3MF is `threemf.py`). Each one targets one clause of the format's specification,
