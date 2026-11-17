@@ -2,11 +2,12 @@
 name = "polysmelt"
 version = "0.12.0"
 edition = "2024"
-license = "MIT-0"
+# MIT-0, except the SketchUp reader (src/formats/skp), which is MIT: see its LICENSE-openskp.
+license = "MIT-0 AND MIT"
 # 1.88 for edition 2024's let chains (and `zip` 9). The `usd` feature, on by default, needs
 # 1.96 because `openusd` 0.8 does; CI checks both.
 rust-version = "1.88"
-description = "Pure-Rust 3D asset interchange: glTF/GLB reading and writing, meshopt compression, and readers for common mesh formats"
+description = "Pure-Rust 3D asset interchange: glTF/GLB reading and writing, meshopt compression, and readers for common mesh formats, SketchUp included"
 keywords = ["gltf", "glb", "meshopt", "3d", "mesh"]
 categories = ["graphics", "game-development", "parser-implementations", "encoding"]
 repository = "https://github.com/Azazel-Labs/polysmelt"
@@ -18,7 +19,7 @@ include = ["/src", "/examples", "/README.md", "/LICENSE", "/Cargo.toml"]
 all-features = true
 
 [features]
-default = ["minimal", "fbx", "3mf", "usd", "draco", "webp"]
+default = ["minimal", "fbx", "3mf", "usd", "draco", "webp", "skp"]
 # The readers with no dependencies, and file access: `default-features = false, features = ["minimal"]`.
 minimal = ["fs", "stl", "ply", "vox", "obj", "3ds", "gltf"]
 # Reading from the file system: `formats::load`, `assets::Folder` and `gltf::files_in`. Without
@@ -38,6 +39,8 @@ draco = ["gltf", "dep:draco-core"]
 # WebP textures (`EXT_texture_webp`, or a `.webp` file a model names) re-encoded as PNG for
 # the flat mesh, which embeds only PNG and JPEG.
 webp = ["dep:image-webp", "dep:flate2"]
+# SketchUp `.skp`, from SketchUp 3 to the latest, converted through glTF.
+skp = ["gltf", "dep:flate2"]
 
 [dependencies]
 serde_json = "1"

@@ -17,8 +17,9 @@ Early. What exists today:
   model's folder. `cargo run --example meshopt -- sample out.glb` writes a small test file.
 - **`formats`**: readers for STL (binary and ASCII), PLY, MagicaVoxel `.vox`, OBJ with MTL
   materials and textures, FBX (binary and ASCII), 3DS, 3MF, USD (`.usda`, `.usdc`,
-  `.usdz`) and glTF 2.0 (`.gltf`, `.glb`, meshopt- or Draco-compressed or not), and glTF 1.0
-  (with `KHR_binary_glTF` and `KHR_materials_common`), upgraded to 2.0 as it's read.
+  `.usdz`), SketchUp `.skp` (SketchUp 3 to the latest, without the SketchUp SDK) and glTF 2.0
+  (`.gltf`, `.glb`, meshopt- or Draco-compressed or not), and glTF 1.0 (with
+  `KHR_binary_glTF` and `KHR_materials_common`), upgraded to 2.0 as it's read.
   `formats::load` reads a file and `formats::load_bytes` a model already in memory; both
   dispatch on the extension and return a `document::Document`.
 - **`document`**: the common form, a glTF 2.0 document (its JSON and its buffers' bytes).
@@ -35,12 +36,12 @@ Early. What exists today:
   `Document::images` gives a handle on each image that says where it is (a file, an archive
   entry, inside the model) and loads it on request, and `Document::embed_images` reads
   them all.
-- **Conformance corpus**: 549 cases under `tests/corpus`, each a file and the GLB it must
+- **Conformance corpus**: 577 cases under `tests/corpus`, each a file and the GLB it must
   become. They cover every format above and the variants exporters really write: OBJ's face
   forms and MTL dialects, both PLY byte orders, every FBX version and axis system, and USD's
-  three encodings and its composition, and glTF's accessor types, node hierarchy, skins and
-  extensions. Most are generated against the specifications; the
-  rest are Blender 5.2 exports. See [tests/corpus/README.md](tests/corpus/README.md). Every
+  three encodings and its composition, glTF's accessor types, node hierarchy, skins and extensions, and files SketchUp itself
+  saved, from SketchUp 3 to 2026. Most are generated against the specifications; the rest
+  are Blender 5.2 exports and SketchUp's own files. See [tests/corpus/README.md](tests/corpus/README.md). Every
   GLB the conformance tests write passes the Khronos glTF validator (`tools/validate`), which
   CI runs.
 - **Benchmarks**: `bench/` races Polysmelt's readers against tobj, stl_io, ply-rs and gltf on load
@@ -67,6 +68,7 @@ Early. What exists today:
 | `fbx` | FBX | `fbxcel`, `base64` |
 | `3mf` | 3MF | `zip`, `quick-xml` |
 | `usd` | USD | `openusd`, `openusd-schemas`, `zip` |
+| `skp` | SketchUp `.skp` (through glTF, so it turns on `gltf`) | `flate2` |
 | `draco` | Draco-compressed glTF (KHR_draco_mesh_compression) | `draco-core` |
 | `webp` | WebP textures (EXT_texture_webp, `.webp` files), re-encoded as PNG for the flat mesh | `image-webp`, `flate2` |
 | `fs` | Reading files: `formats::load`, `assets::Folder`, `gltf::files_in` | none |
@@ -124,4 +126,6 @@ Blender.
 
 ## License
 
-MIT-0. See [LICENSE](LICENSE).
+MIT-0. See [LICENSE](LICENSE). The SketchUp reader (`src/formats/skp`) is ported from
+[openskp](https://github.com/iamahsanmehmood/openskp) and is MIT: see
+[its license](src/formats/skp/LICENSE-openskp).

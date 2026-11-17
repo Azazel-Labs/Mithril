@@ -1,0 +1,22 @@
+{
+  "spec": "SketchUp .skp (closed; as openskp reads it): an instance scaled through the transform's last value (1/w), in a SketchUp 6 file",
+  "source": "saved by SketchUp, from openskp's test fixtures (packages/cpp/tests/fixtures)",
+  "facts": {
+    "application": "SketchUp 6"
+  },
+  "triangles": 24,
+  "area": 0.0077419199999999985,
+  "bounds": {
+    "min": [
+      0.0,
+      0.0,
+      -0.0254
+    ],
+    "max": [
+      0.5334,
+      0.0254,
+      0.0
+    ]
+  },
+  "uvs": false
+}

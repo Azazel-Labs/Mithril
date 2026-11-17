@@ -1,6 +1,6 @@
 //! Model formats read natively: STL (binary and ASCII), PLY (ASCII and binary), `MagicaVoxel`
-//! `.vox`, OBJ (with its MTL materials and textures), FBX (binary and ASCII), 3DS, 3MF, USD and
-//! glTF (`.gltf` and `.glb`).
+//! `.vox`, OBJ (with its MTL materials and textures), FBX (binary and ASCII), 3DS, 3MF, USD,
+//! glTF (`.gltf` and `.glb`) and `SketchUp` (`.skp`).
 //! Each becomes a [`Document`]: glTF as it is, the others converted; textures are embedded so the
 //! document stands on its own. Each format is behind a cargo feature of its name (`3ds` and
 //! `3mf` for those two). A [`Keep`] says what to keep; by default, everything.
@@ -31,6 +31,8 @@ mod gltf1;
 mod obj;
 #[cfg(feature = "ply")]
 mod ply;
+#[cfg(feature = "skp")]
+mod skp;
 #[cfg(feature = "stl")]
 mod stl;
 #[cfg(any(feature = "stl", feature = "ply", feature = "obj"))]
@@ -52,7 +54,7 @@ mod xform;
 
 /// The extensions [`load`] handles, whether or not this build has their feature.
 pub const EXTENSIONS: &[&str] = &[
-    "stl", "ply", "vox", "obj", "fbx", "3ds", "3mf", "usd", "usda", "usdc", "usdz", "gltf", "glb",
+    "stl", "ply", "vox", "obj", "fbx", "3ds", "3mf", "usd", "usda", "usdc", "usdz", "gltf", "glb", "skp",
 ];
 
 /// Reads the model at `path`, whose format is named by `ext` (lowercase, without the dot),
@@ -212,7 +214,10 @@ impl<'a> Input<'a> {
 fn read<'a>(input: Input<'a>, ext: &str, assets: &'a dyn Assets, keep: Keep) -> Result<Document<'a>> {
     let mut doc = convert(input, ext, assets, keep)?;
     doc.prune(keep);
-    if matches!(ext, "gltf" | "glb" | "fbx" | "3ds" | "usd" | "usda" | "usdc" | "usdz") {
+    if matches!(
+        ext,
+        "gltf" | "glb" | "fbx" | "3ds" | "usd" | "usda" | "usdc" | "usdz" | "skp"
+    ) {
         let c = doc.counts();
         for (key, n) in [("triangles", c.triangles), ("points", c.points), ("lines", c.lines)] {
             if n > 0 || key == "triangles" {
@@ -244,6 +249,8 @@ fn convert<'a>(input: Input<'a>, ext: &str, assets: &'a dyn Assets, keep: Keep) 
         "fbx" => fbx::load(input, assets, keep),
         #[cfg(feature = "gltf")]
         "gltf" | "glb" => gltf::load(input, assets, keep),
+        #[cfg(feature = "skp")]
+        "skp" => skp::load(input, keep),
         e if EXTENSIONS.contains(&e) => bail!("built without the `{}` feature", feature_for(e)),
         _ => bail!("not a model format handled here: .{ext}"),
     }

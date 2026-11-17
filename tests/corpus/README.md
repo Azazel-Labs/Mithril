@@ -38,6 +38,7 @@ cases.
 | FBX | 115 | 101 | 14 |
 | USD | 134 | 114 | 20 |
 | glTF | 70 | 57 | 13 |
+| SketchUp | 28 | 7 | none |
 
 - **Generated** cases are written byte by byte by `tools/corpus/<format>.py` (3DS is
   `tds.py`, 3MF is `threemf.py`). Each one targets one clause of the format's specification,
@@ -46,6 +47,10 @@ cases.
   the standard rather than against itself.
 - **USD** expectations are computed with Pixar's `usd-core` (the `pxr` module). It composes
   the stage and measures it: triangles, bounds, visibility, purpose and transforms.
+- **SketchUp**'s format is closed, so its other 21 cases are files SketchUp saved, taken from
+  openskp's test fixtures (MIT, `skp/LICENSE-openskp`). `tools/corpus/skp.py` copies them and
+  writes their expectations from what openskp's tests assert about each file and what was
+  drawn in it, and the application fact from each file's header.
 - **Blender** cases (`blender_*` folders) are real exporter output, from
   `tools/corpus/blender_export.py`.
 
@@ -106,6 +111,12 @@ python tools/corpus/obj.py
   several meshes, skins found by joint name with a bind shape matrix, animation parameters,
   cameras and lights. Errors: Draco, truncation, buffers outside the model's folder, and
   accessors that overrun their views.
+- **SketchUp**: every layout from SketchUp 3 to 2026: the legacy object stream (3 to 6,
+  2013 to 2020) and the ZIP container of 2021 on. Covers faces bounded by arcs beside a loose
+  arc with no face, textured materials stored inline, groups and components nested inside
+  each other, an instance scaled through its transform's last value, and
+  files with nothing to draw (empty, guides only, materials only). Also annotations, scenes
+  and an SDK-saved file beside what is drawn, and truncated, foreign and too-old files.
 
 ## `expect.json`
 

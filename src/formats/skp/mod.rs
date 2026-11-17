@@ -1,0 +1,155 @@
+//! `SketchUp` `.skp`, read without the `SketchUp` SDK and converted to glTF.
+//!
+//! Ported from openskp (<https://github.com/iamahsanmehmood/openskp>, MIT, see `LICENSE-openskp`
+//! beside this file): its C++ read path, face triangulation and glTF building, without its writer
+//! or other exporters.
+//!
+//! - Files from `SketchUp` 3 to 2020 are an MFC object stream ([`legacy`]); 2021 and later are a
+//!   ZIP holding tagged records ([`vff`]).
+//! - Component instances become glTF nodes with their transforms; each definition's faces become
+//!   one mesh per inherited material, shared by every placement.
+//! - Hidden entities and entities on hidden tags (layers) are left out.
+//! - Lengths are turned from inches to metres, and Z up to glTF's Y up.
+
+mod glb;
+mod legacy;
+mod model;
+mod reader;
+mod triangulate;
+mod vff;
+mod zip;
+
+use serde_json::{Map, json};
+
+use super::Input;
+use crate::assets::Memory;
+use crate::document::{Document, Keep};
+use crate::{Context, Result};
+
+/// Reads the `SketchUp` model `input`, with what it holds in a glTF document.
+pub(crate) fn load(input: Input<'_>, keep: Keep) -> Result<Document<'static>> {
+    let bytes = input.read()?;
+    let (glb, major) = convert(&bytes)?;
+    let mut facts = Map::new();
+    facts.insert("application".into(), json!(format!("SketchUp {}", version_name(major))));
+    // An empty model, or one of only edges, guides and text, has nothing to draw.
+    let Some(glb) = glb else {
+        return Ok(Document::empty(facts));
+    };
+    let name = input.path.to_string_lossy();
+    let mut doc = super::gltf::load(Input::memory(&glb, &name), &Memory::new(), keep)?.into_owned();
+    doc.facts = facts;
+    Ok(doc)
+}
+
+/// Every `SketchUp` file opens with a string record (`FF FE FF`) holding the 14 characters `SketchUp Model`.
+const MAGIC: [u8; 4] = [0xff, 0xfe, 0xff, 0x0e];
+/// The last major version written as an MFC object stream; 2021 (21) moved to the ZIP container.
+const LAST_LEGACY: u32 = 20;
+
+/// Whether `bytes` look like a `SketchUp` file, from its header alone.
+fn is_skp(bytes: &[u8]) -> bool {
+    bytes.starts_with(&MAGIC)
+}
+
+/// Converts a `SketchUp` file to a GLB file in metres with Y up (`None` when nothing in it is
+/// visible), with the file's major version.
+///
+/// # Errors
+/// When the bytes are not a `SketchUp` file, come from a version this reader doesn't know, or
+/// are damaged.
+fn convert(bytes: &[u8]) -> Result<(Option<Vec<u8>>, u32)> {
+    if !is_skp(bytes) {
+        bail!("not a SketchUp file");
+    }
+    let Some(major) = major_version(bytes) else {
+        bail!("SketchUp file has no version in its header")
+    };
+    let reading = || format!("reading a SketchUp {} file", version_name(major));
+    let model = if major <= LAST_LEGACY {
+        if major < 3 {
+            bail!("SketchUp {major} files are not supported (SketchUp 3 is the oldest this reader knows)");
+        }
+        legacy::parse(bytes, major).with_context(reading)?
+    } else {
+        vff::parse(bytes).with_context(reading)?
+    };
+    Ok((glb::write(&model)?, major))
+}
+
+/// `SketchUp`'s marketing name for a major version: 3 to 8 kept the number, 13 to 2020 became years.
+fn version_name(major: u32) -> String {
+    if major >= 13 {
+        (2000 + major).to_string()
+    } else {
+        major.to_string()
+    }
+}
+
+/// The major version from the header's `{major.minor.build}` string, which follows `SketchUp Model` in UTF-16.
+fn major_version(bytes: &[u8]) -> Option<u32> {
+    let ascii: Vec<u8> = bytes.iter().take(96).copied().filter(|&b| b != 0).collect();
+    let open = ascii.iter().position(|&b| b == b'{')?;
+    let digits: Vec<u8> = ascii[open + 1..]
+        .iter()
+        .copied()
+        .take_while(u8::is_ascii_digit)
+        .collect();
+    if digits.is_empty() || ascii.get(open + 1 + digits.len()) != Some(&b'.') {
+        return None;
+    }
+    std::str::from_utf8(&digits).ok()?.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header(version: &str) -> Vec<u8> {
+        let mut out = MAGIC.to_vec();
+        out.extend("SketchUp Model".encode_utf16().flat_map(u16::to_le_bytes));
+        out.extend([0xff, 0xfe, 0xff, 12]);
+        out.extend(version.encode_utf16().flat_map(u16::to_le_bytes));
+        out
+    }
+
+    #[test]
+    fn reads_the_header_version() {
+        assert!(is_skp(&header("{15.0.9350}")));
+        assert!(!is_skp(b"PK\x03\x04"));
+        assert_eq!(major_version(&header("{15.0.9350}")), Some(15));
+        assert_eq!(major_version(&header("{23.1.340}")), Some(23));
+        assert_eq!(major_version(&header("{x}")), None);
+    }
+
+    #[test]
+    fn rejects_what_it_cannot_read() {
+        assert!(convert(b"hello").is_err());
+        assert!(convert(&header("{2.0.1}")).is_err());
+        assert!(convert(&header("{15.0.9350}")).is_err());
+        assert!(convert(&header("{23.0.1}")).is_err());
+        assert!(convert(&MAGIC).is_err());
+    }
+
+    #[test]
+    fn truncated_files_never_panic() {
+        // A crate built from crates.io has no corpus to read.
+        let Ok(data) = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/corpus/skp/legacy_v5_textured/legacy_v5_textured.skp"
+        )) else {
+            return;
+        };
+        let vff = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/corpus/skp/nesting_2021/nesting_2021.skp"
+        ))
+        .unwrap();
+        for len in (0..data.len()).step_by(7) {
+            let _ = convert(&data[..len]);
+        }
+        for len in (0..vff.len()).step_by(7) {
+            let _ = convert(&vff[..len]);
+        }
+    }
+}

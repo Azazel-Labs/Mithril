@@ -1,0 +1,7 @@
+{
+  "spec": "SketchUp .skp (closed; as openskp reads it): dimensions, guides and texts on tags, some hidden, in a 2021+ (ZIP) file",
+  "source": "saved by SketchUp, from openskp's test fixtures (packages/cpp/tests/fixtures)",
+  "facts": {
+    "application": "SketchUp 2026"
+  }
+}
