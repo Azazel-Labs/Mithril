@@ -1,13 +1,17 @@
 //! Meshopt-compresses or decompresses a GLB.
 //!
 //! ```text
-//! cargo run --example meshopt -- compress   in.glb out.glb
-//! cargo run --example meshopt -- decompress in.glb out.glb
-//! cargo run --example meshopt -- pack       in.gltf out.glb
-//! cargo run --example meshopt -- sample     out.glb
+//! cargo run --example meshopt -- compress     in.glb out.glb
+//! cargo run --example meshopt -- compress-khr in.glb out.glb
+//! cargo run --example meshopt -- decompress   in.glb out.glb
+//! cargo run --example meshopt -- pack         in.gltf out.glb
+//! cargo run --example meshopt -- sample       out.glb
 //! ```
 //!
-//! `sample` writes a small compressed test file (a textured, wavy grid) without any input.
+//! `compress` writes `EXT_meshopt_compression`, losslessly; `compress-khr` writes
+//! `KHR_meshopt_compression` at level 3 with vertex colors `COLOR`-filtered (gltfpack's `-cz`
+//! codec settings). `sample` writes a small compressed test file (a textured, wavy grid) without
+//! any input.
 
 use std::path::Path;
 
@@ -48,6 +52,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let data = std::fs::read(input)?;
             let glb = match cmd.as_str() {
                 "compress" => gltf::compress(&data)?,
+                "compress-khr" => {
+                    let options = gltf::CompressOptions {
+                        level: 3,
+                        color_filter: true,
+                        ..gltf::CompressOptions::KHR
+                    };
+                    gltf::compress_with(&data, options)?
+                }
                 "decompress" => gltf::decompress(&data)?,
                 "pack" => {
                     let dir = Path::new(input).parent().unwrap_or(Path::new("."));
@@ -59,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         [cmd, out] if cmd == "sample" => (out, sample()?),
         _ => {
-            return Err("usage: meshopt compress|decompress|pack <in> <out> | sample <out>".into());
+            return Err("usage: meshopt compress|compress-khr|decompress|pack <in> <out> | sample <out>".into());
         }
     };
     std::fs::write(out, &glb)?;

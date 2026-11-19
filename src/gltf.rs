@@ -5,7 +5,9 @@
 //! - [`pack_glb`]: a `.gltf` and its external buffers and images to one GLB, compression kept,
 //!   with the meshopt extensions' buffer references rewritten.
 //! - [`pack_glb_decompressed`]: both at once, without fetching meshopt fallback buffers.
-//! - [`compress`]: the reverse, lossless: meshopt-encodes a GLB's index and vertex views.
+//! - [`compress`]: the reverse, lossless: meshopt-encodes a GLB's index and vertex views with
+//!   `EXT_meshopt_compression`. [`compress_with`] takes [`CompressOptions`], for
+//!   `KHR_meshopt_compression` with its stronger attribute codec and `COLOR` filter.
 //! - [`files_in`]: a `fetch` for the packers that reads files next to the `.gltf`, safely.
 //!
 //! Only buffer views change: accessors, their component types and every other extension stay
@@ -78,20 +80,101 @@ pub fn pack_glb_decompressed(gltf: &[u8], mut fetch: impl FnMut(&str) -> Result<
 /// Meshopt-compresses a GLB (or a self-contained `.gltf`) losslessly with
 /// `EXT_meshopt_compression`: triangle-list index views use the triangle codec, other index
 /// views the index codec, and vertex attribute views whose stride is a multiple of 4 the
-/// attribute codec, unfiltered. Triangles may come back starting at another corner (winding is
-/// kept); every other byte decodes exactly. Already-compressed input is decompressed first.
+/// attribute codec (version 0), unfiltered. Triangles may come back starting at another corner
+/// (winding is kept); every other byte decodes exactly. Already-compressed input is
+/// decompressed first. The same as [`compress_with`] and [`CompressOptions::EXT`].
 ///
 /// # Errors
 ///
 /// When `input` isn't glTF that parses, or already-compressed data doesn't decode.
 pub fn compress(input: &[u8]) -> Result<Vec<u8>> {
+    compress_with(input, CompressOptions::EXT)
+}
+
+/// Which meshopt extension [`compress_with`] writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MeshoptExtension {
+    /// `EXT_meshopt_compression`: attribute codec version 0 and no `COLOR` filter, so every
+    /// meshopt-aware reader takes it.
+    #[default]
+    Ext,
+    /// `KHR_meshopt_compression`: attribute codec version 1, which compresses attributes
+    /// better, and the `COLOR` filter. Only newer readers take it.
+    Khr,
+}
+
+impl MeshoptExtension {
+    /// The extension's name, as it appears in the glTF.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            MeshoptExtension::Ext => MESHOPT_EXTENSIONS[0],
+            MeshoptExtension::Khr => MESHOPT_EXTENSIONS[1],
+        }
+    }
+}
+
+/// How [`compress_with`] compresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompressOptions {
+    /// The extension written, and with it the attribute codec version.
+    pub extension: MeshoptExtension,
+    /// The attribute codec's level, 0 (fastest) to 3 (smallest), as in
+    /// [`meshopt::encode_vertex_buffer_level`]; levels above 3 encode as 3. Only the
+    /// `KHR_meshopt_compression` codec (version 1) has levels; `EXT_meshopt_compression`'s ignores
+    /// it.
+    pub level: u8,
+    /// Whether to store vertex colors with the `COLOR` filter (`KHR_meshopt_compression` only):
+    /// views read only as `COLOR_n` attributes that are normalized `VEC4` unsigned bytes or
+    /// shorts, tightly packed. The filter's `YCoCg` form compresses better than RGBA but is
+    /// lossy: each channel decodes within 1 of its original value (out of 255 or 65535).
+    pub color_filter: bool,
+}
+
+impl CompressOptions {
+    /// `EXT_meshopt_compression`, lossless: what [`compress`] writes.
+    pub const EXT: CompressOptions = CompressOptions {
+        extension: MeshoptExtension::Ext,
+        level: 2,
+        color_filter: false,
+    };
+    /// `KHR_meshopt_compression` at meshoptimizer's default level, 2, lossless (gltfpack's
+    /// `-ce khr` codec settings). Level 3 and `color_filter` are gltfpack's `-cz` ones.
+    pub const KHR: CompressOptions = CompressOptions {
+        extension: MeshoptExtension::Khr,
+        level: 2,
+        color_filter: false,
+    };
+}
+
+impl Default for CompressOptions {
+    /// [`CompressOptions::EXT`].
+    fn default() -> Self {
+        CompressOptions::EXT
+    }
+}
+
+/// [`compress`] with a choice of extension, attribute codec level and the `COLOR` filter. With
+/// `KHR_meshopt_compression`, attribute views use the version 1 codec at `options.level`, and
+/// with `options.color_filter` qualifying color views are filtered, the one lossy step (see
+/// [`CompressOptions::color_filter`]).
+///
+/// # Errors
+///
+/// When `input` isn't glTF that parses, already-compressed data doesn't decode, or
+/// `options.color_filter` is set with `EXT_meshopt_compression`, which has no `COLOR` filter.
+pub fn compress_with(input: &[u8], options: CompressOptions) -> Result<Vec<u8>> {
+    ensure!(
+        !options.color_filter || options.extension == MeshoptExtension::Khr,
+        "the meshopt COLOR filter needs KHR_meshopt_compression"
+    );
     let plain;
     let mut doc = Doc::parse(input)?;
     if doc.uses_meshopt() || doc.glb_len.is_none() {
         plain = decompress(input)?;
         doc = Doc::parse(&plain)?;
     }
-    doc.compress()
+    doc.compress(options)
 }
 
 /// A `fetch` for [`pack_glb`] and [`pack_glb_decompressed`] that reads URIs as paths relative
@@ -373,9 +456,12 @@ impl<'a> Doc<'a> {
     }
 
     /// Meshopt-encodes the index and vertex views of a plain GLB.
-    fn compress(mut self) -> Result<Vec<u8>> {
+    fn compress(mut self, options: CompressOptions) -> Result<Vec<u8>> {
         let bin = self.bin.unwrap_or_default();
-        let plans = plan_compression(&self)?;
+        let plans = plan_compression(&self, options.color_filter)?;
+        let name = options.extension.name();
+        let version = u8::from(options.extension == MeshoptExtension::Khr);
+        let level = options.level.min(3);
         let views = self.list("bufferViews").to_vec();
         let mut out = Vec::with_capacity(bin.len() / 2);
         let mut fallback_len = 0usize;
@@ -393,11 +479,13 @@ impl<'a> Doc<'a> {
                     v.insert("buffer".into(), json!(0));
                     v.insert("byteOffset".into(), json!(at));
                 }
-                Plan::Encode { mode, stride } => {
+                Plan::Encode { mode, stride, color } => {
                     let stride = *stride;
                     let count = len / stride;
-                    let encoded = if *mode == "ATTRIBUTES" {
-                        meshopt::encode_vertex_buffer(src, stride)
+                    let encoded = if *color {
+                        meshopt::encode_vertex_buffer_level(&color_filtered(src, stride), stride, level, version)
+                    } else if *mode == "ATTRIBUTES" {
+                        meshopt::encode_vertex_buffer_level(src, stride, level, version)
                     } else {
                         let idx: Vec<u32> = if stride == 2 {
                             src.chunks_exact(2)
@@ -419,7 +507,7 @@ impl<'a> Doc<'a> {
                     v.insert("buffer".into(), json!(1));
                     v.insert("byteOffset".into(), json!(fallback_len));
                     fallback_len += len;
-                    let ext = json!({
+                    let mut ext = json!({
                         "buffer": 0,
                         "byteOffset": at,
                         "byteLength": encoded.len(),
@@ -427,11 +515,14 @@ impl<'a> Doc<'a> {
                         "count": count,
                         "mode": mode,
                     });
+                    if *color {
+                        ext["filter"] = json!("COLOR");
+                    }
                     v.entry("extensions")
                         .or_insert_with(|| json!({}))
                         .as_object_mut()
                         .context("bad buffer view extensions")?
-                        .insert(MESHOPT_EXTENSIONS[0].into(), ext);
+                        .insert(name.into(), ext);
                 }
             }
             new_views.push(Value::Object(v));
@@ -440,9 +531,9 @@ impl<'a> Doc<'a> {
         if plans.iter().any(|p| !matches!(p, Plan::Keep)) {
             placeholders.push(json!({
                 "byteLength": fallback_len,
-                "extensions": { MESHOPT_EXTENSIONS[0]: { "fallback": true } },
+                "extensions": { name: { "fallback": true } },
             }));
-            require_extension(&mut self.json, MESHOPT_EXTENSIONS[0]);
+            require_extension(&mut self.json, name);
         }
         self.json.insert("bufferViews".into(), Value::Array(new_views));
         self.finish(&out, placeholders)
@@ -465,18 +556,40 @@ impl<'a> Doc<'a> {
 /// What [`Doc::compress`] does with a buffer view.
 enum Plan {
     Keep,
-    Encode { mode: &'static str, stride: usize },
+    /// Encode in `mode`, elements of `stride` bytes, with the `COLOR` filter first if `color`.
+    Encode {
+        mode: &'static str,
+        stride: usize,
+        color: bool,
+    },
 }
 
-/// How each buffer view of a plain glTF can be compressed, from what reads it.
-fn plan_compression(doc: &Doc) -> Result<Vec<Plan>> {
+/// A view of normalized RGBA colors (unsigned bytes at stride 4, unsigned shorts at 8) as the
+/// `COLOR` filter's input at full width.
+fn color_filtered(src: &[u8], stride: usize) -> Vec<u8> {
+    let colors: Vec<[f32; 4]> = if stride == 4 {
+        src.chunks_exact(4)
+            .map(|c| [c[0], c[1], c[2], c[3]].map(|v| f32::from(v) / 255.0))
+            .collect()
+    } else {
+        src.chunks_exact(8)
+            .map(|c| [0, 1, 2, 3].map(|i| f32::from(u16::from_le_bytes([c[2 * i], c[2 * i + 1]])) / 65535.0))
+            .collect()
+    };
+    meshopt::encode_filter_color(&colors, stride, if stride == 4 { 8 } else { 16 })
+}
+
+/// How each buffer view of a plain glTF can be compressed, from what reads it; with `colors`,
+/// which views the `COLOR` filter takes.
+fn plan_compression(doc: &Doc, colors: bool) -> Result<Vec<Plan>> {
     #[derive(Clone, Copy, PartialEq)]
     enum Use {
         None,
         /// Primitive indices: element size, and whether every reader is a triangle list.
         Index(usize, bool),
-        /// Vertex attributes: element size.
-        Vertex(usize),
+        /// Vertex attributes: element size, and whether every reader is a color the `COLOR`
+        /// filter takes (a `COLOR_n` attribute, normalized unsigned `VEC4`, at offset 0).
+        Vertex(usize, bool),
         Other,
     }
     let accessors = doc.list("accessors");
@@ -487,7 +600,7 @@ fn plan_compression(doc: &Doc) -> Result<Vec<Plan>> {
             *r = match (*r, u) {
                 (Use::None, u) => u,
                 (Use::Index(s, t), Use::Index(_, t2)) => Use::Index(s, t && t2),
-                (r, u) if r == u => r,
+                (Use::Vertex(s, c), Use::Vertex(_, c2)) => Use::Vertex(s, c && c2),
                 _ => Use::Other,
             };
         }
@@ -498,9 +611,10 @@ fn plan_compression(doc: &Doc) -> Result<Vec<Plan>> {
             mark(p.get("indices"), Use::Index(0, triangles));
             let targets = p.get("targets").and_then(Value::as_array);
             let sets = std::iter::once(p.get("attributes")).chain(targets.into_iter().flatten().map(Some));
-            for set in sets.flatten().filter_map(Value::as_object) {
-                for a in set.values() {
-                    mark(Some(a), Use::Vertex(0));
+            // Morph target colors are deltas, not colors.
+            for (i, set) in sets.enumerate() {
+                for (name, a) in set.and_then(Value::as_object).into_iter().flatten() {
+                    mark(Some(a), Use::Vertex(0, i == 0 && name.starts_with("COLOR_")));
                 }
             }
         }
@@ -523,14 +637,19 @@ fn plan_compression(doc: &Doc) -> Result<Vec<Plan>> {
                 let aligned = off.is_multiple_of(3 * s) && count.is_multiple_of(3);
                 Use::Index(s, tri && aligned)
             }
-            (Use::Vertex(_), Some(s)) => Use::Vertex(s),
+            (Use::Vertex(_, color), Some(s)) => {
+                let normalized = acc.get("normalized").and_then(Value::as_bool) == Some(true);
+                let unsigned = matches!(acc.get("componentType").and_then(Value::as_u64), Some(5121 | 5123));
+                let vec4 = acc.get("type").and_then(Value::as_str) == Some("VEC4");
+                Use::Vertex(s, color && normalized && unsigned && vec4 && off == 0)
+            }
             _ => Use::Other,
         };
         *slot = Some(match (*slot, u) {
             (None, u) => u,
             (Some(Use::Index(s, t)), Use::Index(s2, t2)) if s == s2 => Use::Index(s, t && t2),
-            (Some(Use::Vertex(s)), Use::Vertex(s2)) if s == s2 => Use::Vertex(s),
-            (Some(Use::Vertex(_)), Use::Vertex(_)) if views[v].get("byteStride").is_some() => Use::Vertex(0),
+            (Some(Use::Vertex(s, c)), Use::Vertex(s2, c2)) if s == s2 => Use::Vertex(s, c && c2),
+            (Some(Use::Vertex(..)), Use::Vertex(..)) if views[v].get("byteStride").is_some() => Use::Vertex(0, false),
             _ => Use::Other,
         });
     }
@@ -561,12 +680,15 @@ fn plan_compression(doc: &Doc) -> Result<Vec<Plan>> {
                     Plan::Encode {
                         mode: if tri { "TRIANGLES" } else { "INDICES" },
                         stride: s,
+                        color: false,
                     }
                 }
-                Some(Use::Vertex(s)) => match stride.unwrap_or(s) {
+                Some(Use::Vertex(size, color)) => match stride.unwrap_or(size) {
                     s if s > 0 && s <= 256 && s.is_multiple_of(4) && len.is_multiple_of(s) => Plan::Encode {
                         mode: "ATTRIBUTES",
                         stride: s,
+                        // Tightly packed, so every byte of the view is a color channel.
+                        color: colors && color && s == size,
                     },
                     _ => Plan::Keep,
                 },
@@ -1017,6 +1139,146 @@ mod tests {
         same_data(&plain, &back);
         // Compressing twice is the same as compressing once.
         assert_eq!(compress(&packed).unwrap(), packed);
+    }
+
+    #[test]
+    fn khr_compression_roundtrips() {
+        let plain = grid_glb(40);
+        let ext = compress(&plain).unwrap();
+        for level in [0, 2, 3] {
+            let options = CompressOptions {
+                level,
+                ..CompressOptions::KHR
+            };
+            let packed = compress_with(&plain, options).unwrap();
+            let j = json_of(&packed);
+            assert_eq!(j["extensionsUsed"], json!(["KHR_meshopt_compression"]));
+            assert_eq!(j["extensionsRequired"], json!(["KHR_meshopt_compression"]));
+            assert_eq!(
+                j["buffers"][1]["extensions"]["KHR_meshopt_compression"]["fallback"],
+                true
+            );
+            assert!(!serde_json::to_string(&j).unwrap().contains("EXT_meshopt"));
+            // Attribute views use codec version 1.
+            let bin = Doc::parse(&packed).unwrap().bin.unwrap();
+            for v in j["bufferViews"].as_array().unwrap() {
+                if let Some(e) = v.pointer("/extensions/KHR_meshopt_compression")
+                    && e["mode"] == "ATTRIBUTES"
+                {
+                    assert_eq!(bin[u(&e["byteOffset"])], 0xa1);
+                }
+            }
+            if level >= 2 {
+                assert!(
+                    packed.len() <= ext.len(),
+                    "level {level}: {} vs {}",
+                    packed.len(),
+                    ext.len()
+                );
+            }
+            same_data(&plain, &decompress(&packed).unwrap());
+            // Recompressing EXT as KHR goes through the plain file.
+            assert_eq!(compress_with(&ext, options).unwrap(), packed);
+        }
+        let colors = CompressOptions {
+            color_filter: true,
+            ..CompressOptions::EXT
+        };
+        assert!(compress_with(&plain, colors).is_err());
+        assert_eq!(MeshoptExtension::Khr.name(), "KHR_meshopt_compression");
+        assert_eq!(CompressOptions::default(), CompressOptions::EXT);
+    }
+
+    /// Triangles with 8- and 16-bit colors, float colors, and an 8-bit custom attribute.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "colors in 0 to 1 scaled to their integer range, and bytes that wrap on purpose"
+    )]
+    fn colored_glb(n: usize) -> Vec<u8> {
+        let mut bin = Vec::new();
+        let mut views = Vec::new();
+        let mut view = |bytes: Vec<u8>| {
+            views.push(json!({ "buffer": 0, "byteOffset": bin.len(), "byteLength": bytes.len() }));
+            bin.extend(bytes);
+            views.len() - 1
+        };
+        let wave = |i: usize, k: usize| (i as f32 * 0.05 + k as f32).sin() * 0.5 + 0.5;
+        let pos = view((0..n * 3).flat_map(|i| (i as f32).to_le_bytes()).collect());
+        let c8 = view((0..n * 4).map(|i| (wave(i / 4, i % 4) * 255.0) as u8).collect());
+        let c16 = view(
+            (0..n * 4)
+                .flat_map(|i| ((wave(i / 4, i % 4) * 65535.0) as u16).to_le_bytes())
+                .collect(),
+        );
+        let cf = view((0..n * 4).flat_map(|i| wave(i / 4, i % 4).to_le_bytes()).collect());
+        let custom = view((0..n * 4).map(|i| (i * 7) as u8).collect());
+        let acc = |view: usize, ty: u32, kind: &str, normalized: bool| json!({ "bufferView": view, "componentType": ty, "type": kind, "count": n, "normalized": normalized });
+        let json = json!({
+            "asset": { "version": "2.0" },
+            "buffers": [{ "byteLength": bin.len() }],
+            "bufferViews": views,
+            "accessors": [
+                acc(pos, 5126, "VEC3", false),
+                acc(c8, 5121, "VEC4", true),
+                acc(c16, 5123, "VEC4", true),
+                acc(cf, 5126, "VEC4", false),
+                acc(custom, 5121, "VEC4", true),
+            ],
+            "meshes": [{ "primitives": [{ "attributes": {
+                "POSITION": 0, "COLOR_0": 1, "COLOR_1": 2, "COLOR_2": 3, "_CUSTOM": 4,
+            } }] }],
+        });
+        write_glb(&json, Some(&bin)).unwrap()
+    }
+
+    #[test]
+    fn color_filter_is_close() {
+        let plain = colored_glb(300);
+        let options = CompressOptions {
+            level: 3,
+            color_filter: true,
+            ..CompressOptions::KHR
+        };
+        let packed = compress_with(&plain, options).unwrap();
+        let j = json_of(&packed);
+        let filters: Vec<&str> = j["bufferViews"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| {
+                v.pointer("/extensions/KHR_meshopt_compression/filter")
+                    .map_or("NONE", |f| f.as_str().unwrap())
+            })
+            .collect();
+        assert_eq!(filters, ["NONE", "COLOR", "COLOR", "NONE", "NONE"]);
+        let back = decompress(&packed).unwrap();
+        assert_eq!(json_of(&back)["accessors"], json_of(&plain)["accessors"]);
+        for a in [0, 3, 4] {
+            assert_eq!(accessor(&back, a), accessor(&plain, a), "accessor {a}");
+        }
+        let (want, got) = (accessor(&plain, 1), accessor(&back, 1));
+        assert!(want.iter().zip(&got).all(|(a, b)| a.abs_diff(*b) <= 1));
+        assert_ne!(want, got);
+        let (want, got) = (halves(&accessor(&plain, 2)), halves(&accessor(&back, 2)));
+        assert!(want.iter().zip(&got).all(|(a, b)| a.abs_diff(*b) <= 1));
+        // Without the filter, the same options are lossless.
+        let lossless = compress_with(
+            &plain,
+            CompressOptions {
+                color_filter: false,
+                ..options
+            },
+        )
+        .unwrap();
+        let back = decompress(&lossless).unwrap();
+        for a in 0..5 {
+            assert_eq!(accessor(&back, a), accessor(&plain, a), "accessor {a}");
+        }
+    }
+
+    fn halves(b: &[u8]) -> Vec<u16> {
+        b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
     }
 
     #[test]

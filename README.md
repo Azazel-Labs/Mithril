@@ -7,14 +7,18 @@ you don't understand, and write compact or plain files back out.
 
 Early. What exists today:
 
-- **`meshopt`**: the `EXT_meshopt_compression` and `KHR_meshopt_compression` bitstreams. It
-  has meshoptimizer's attribute (v0), triangle and index-sequence encoders, the octahedral
-  filter's encoder, and decoders for every mode (attributes v0 and v1, triangles, indices)
-  and filter (octahedral, quaternion, exponential, color).
+- **`meshopt`**: the `EXT_meshopt_compression` and `KHR_meshopt_compression` bitstreams,
+  ported from meshoptimizer and byte for byte its output on its own test vectors: the
+  attribute encoder (codec versions 0 and 1, levels 0 to 3), the triangle and index-sequence
+  encoders, their size bounds, the filter encoders (octahedral, quaternion, exponential in all
+  four exponent modes, color), and decoders for every mode and filter.
 - **`gltf`**: `decompress` turns a meshopt-compressed GLB into a plain one (quantization is
-  kept); `compress` does the reverse, losslessly; `pack_glb` and `pack_glb_decompressed` turn
-  a `.gltf` and its files into one GLB, with `files_in` as a fetch that stays inside the
-  model's folder. `cargo run --example meshopt -- sample out.glb` writes a small test file.
+  kept); `compress` does the reverse, losslessly, with `EXT_meshopt_compression`, and
+  `compress_with` writes `KHR_meshopt_compression` instead (the version 1 attribute codec at a
+  chosen level, and optionally the `COLOR` filter for 8- and 16-bit vertex colors, within 1
+  per channel); `pack_glb` and `pack_glb_decompressed` turn a `.gltf` and its files into one
+  GLB, with `files_in` as a fetch that stays inside the model's folder.
+  `cargo run --example meshopt -- sample out.glb` writes a small test file.
 - **`formats`**: readers for STL (binary and ASCII), PLY, MagicaVoxel `.vox`, OBJ with MTL
   materials and textures, FBX (binary and ASCII), 3DS, 3MF, USD (`.usda`, `.usdc`,
   `.usdz`), SketchUp `.skp` (SketchUp 3 to the latest, without the SketchUp SDK) and glTF 2.0
@@ -112,8 +116,8 @@ Rust 1.88, with any features but `usd`. The `usd` feature, and so the default bu
 - **Typed views** over the document's meshes, accessors, nodes, skins and animations.
 - **Accessors**: typed access through the document (the mesh reader already reads every
   component type, normalized and sparse).
-- **Compression**: meshopt v1 encoding and filter encoders beyond octahedral, and
-  writing `KHR_mesh_quantization`.
+- **Compression**: writing `KHR_mesh_quantization`, with the filtered streams it enables
+  (octahedral normals, quaternion rotations, exponential floats).
 - **Scene**: animations read and written, and instancing kept rather than baked.
 - **Writer**: a builder with plain output (any viewer, Blender) or compact output
   (quantized and meshopt-compressed).

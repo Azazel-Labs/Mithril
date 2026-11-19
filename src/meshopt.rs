@@ -1,5 +1,7 @@
-//! The `EXT_meshopt_compression` bitstreams: meshoptimizer's attribute (v0) and triangle (v1)
-//! encoders, the octahedral filter's encoder, and decoders for every mode and filter.
+//! The `EXT_meshopt_compression` and `KHR_meshopt_compression` bitstreams, ported from
+//! meshoptimizer: the attribute encoder (codec versions 0 and 1, levels 0 to 3), the triangle and
+//! index sequence encoders, their bounds, the octahedral, quaternion, exponential and color filter
+//! encoders, and decoders for every mode and filter.
 //!
 //! Casts here are the codec's own: bytes and nibbles packed into and out of wider integers,
 //! zigzag and two's-complement reinterpretation, and quantizing floats to fixed point, all as
@@ -42,82 +44,312 @@ fn block_elements(stride: usize) -> usize {
     ((8192 / stride) & !15).min(256)
 }
 
-/// Mode 0 (`ATTRIBUTES`): `data` holds elements of `stride` bytes (a multiple of 4, at most
-/// 256). Each byte position is delta coded against the previous element in groups of 16.
+/// Mode 0 (`ATTRIBUTES`) at attribute codec version 0, the version `EXT_meshopt_compression`
+/// allows: `data` holds elements of `stride` bytes (a multiple of 4, at most 256), each byte
+/// position delta coded against the previous element in groups of 16. The same bytes as
+/// [`encode_vertex_buffer_level`] at level 2, version 0. (meshoptimizer's own
+/// `meshopt_encodeVertexBuffer` writes version 1 since its 1.0 release.)
 ///
 /// # Panics
 ///
 /// When `stride` isn't a multiple of 4 from 4 to 256, or `data` isn't whole elements.
 #[must_use]
 pub fn encode_vertex_buffer(data: &[u8], stride: usize) -> Vec<u8> {
-    assert!(stride > 0 && stride <= 256 && stride.is_multiple_of(4));
-    assert!(data.len().is_multiple_of(stride));
+    encode_vertex_buffer_level(data, stride, 2, 0)
+}
+
+/// Mode 0 (`ATTRIBUTES`) at a compression `level` and attribute codec `version`, byte for byte
+/// meshoptimizer's `meshopt_encodeVertexBufferLevel`. `data` holds elements of `stride` bytes (a
+/// multiple of 4, at most 256).
+///
+/// Version 0 (header `0xa0`) is what `EXT_meshopt_compression` allows; it ignores `level`.
+/// Version 1 (header `0xa1`, `KHR_meshopt_compression` only) adds per-block control modes and
+/// per-channel delta modes, and `level` picks how hard the encoder looks for them: 0 is fastest,
+/// 1 picks each byte plane's control mode, 2 (meshoptimizer's default) also picks byte or 16-bit
+/// deltas per 4-byte channel, and 3 also tries rotated 32-bit XOR deltas, which suit floats.
+/// Levels above 3, up to 9, encode as 3.
+///
+/// # Panics
+///
+/// When `stride` isn't a multiple of 4 from 4 to 256, `data` isn't whole elements, `level` is
+/// above 9 or `version` above 1.
+#[must_use]
+pub fn encode_vertex_buffer_level(data: &[u8], stride: usize, level: u8, version: u8) -> Vec<u8> {
+    assert!(
+        stride > 0 && stride <= 256 && stride.is_multiple_of(4),
+        "attribute stride"
+    );
+    assert!(data.len().is_multiple_of(stride), "attribute data isn't whole elements");
+    assert!(level <= 9, "attribute codec level above 9");
+    assert!(version <= 1, "attribute codec version above 1");
     let count = data.len() / stride;
-    let first = if count > 0 {
-        data[..stride].to_vec()
-    } else {
-        vec![0; stride]
-    };
-    let mut out = vec![0xa0];
-    let mut last = first.clone();
-    let mut deltas = [0u8; 256];
-    let mut start = 0;
-    while start < count {
-        let n = (count - start).min(block_elements(stride));
-        let padded = n.div_ceil(GROUP) * GROUP;
-        for (k, prev) in last.iter_mut().enumerate() {
-            for (i, d) in deltas[..n].iter_mut().enumerate() {
-                let v = data[(start + i) * stride + k];
-                *d = zigzag8(v.wrapping_sub(*prev));
-                *prev = v;
-            }
-            deltas[n..padded].fill(0);
-            encode_bytes(&mut out, &deltas[..padded]);
-        }
-        start += n;
+    let v1 = version == 1;
+    let block = block_elements(stride);
+    let mut first = [0u8; 256];
+    if count > 0 {
+        first[..stride].copy_from_slice(&data[..stride]);
     }
-    // Tail: the baseline element, padded in front to 32 bytes.
-    out.resize(out.len() + 32usize.saturating_sub(stride), 0);
-    out.extend_from_slice(&first);
+    // Delta mode per 4-byte channel: 0 bytes, 1 16-bit halves, 2 | rotation << 4 a 32-bit XOR.
+    let mut channels = [0u8; 64];
+    if v1 && level > 1 && count > 1 {
+        for k in (0..stride).step_by(4) {
+            let rot = if level >= 3 {
+                estimate_rotate(data, stride, k)
+            } else {
+                0
+            };
+            channels[k / 4] = estimate_channel(data, stride, k, block, if level >= 3 { 3 } else { 2 }, rot);
+        }
+    }
+    let mut out = Vec::with_capacity(encode_vertex_buffer_bound(count, stride));
+    out.push(0xa0 | version);
+    let mut last = first;
+    for rows in data.chunks(block * stride) {
+        encode_vertex_block(&mut out, rows, stride, &mut last, &channels, v1, level);
+    }
+    // Tail: the baseline element (and in version 1 the channel modes), padded in front.
+    let tail = stride + if v1 { stride / 4 } else { 0 };
+    out.resize(out.len() + (if v1 { 24usize } else { 32 }).saturating_sub(tail), 0);
+    out.extend_from_slice(&first[..stride]);
+    if v1 {
+        out.extend_from_slice(&channels[..stride / 4]);
+    }
     out
 }
 
-/// One data block: 2 header bits per group, then each group in the smallest of its modes.
-fn encode_bytes(out: &mut Vec<u8>, deltas: &[u8]) {
+/// The most bytes [`encode_vertex_buffer_level`] writes for `count` elements of `stride` bytes,
+/// at any level and version: meshoptimizer's `meshopt_encodeVertexBufferBound`.
+///
+/// # Panics
+///
+/// When `stride` isn't a multiple of 4 from 4 to 256.
+#[must_use]
+pub fn encode_vertex_buffer_bound(count: usize, stride: usize) -> usize {
+    assert!(
+        stride > 0 && stride <= 256 && stride.is_multiple_of(4),
+        "attribute stride"
+    );
+    let block = block_elements(stride);
+    let header = (block / GROUP).div_ceil(4);
+    1 + count.div_ceil(block) * (stride / 4 + stride * (header + block)) + (stride + stride / 4).max(32)
+}
+
+/// One block of up to [`block_elements`] elements (`rows`), each byte plane of each channel
+/// delta coded against the block before (`last`, which then becomes this block's last element).
+fn encode_vertex_block(
+    out: &mut Vec<u8>,
+    rows: &[u8],
+    stride: usize,
+    last: &mut [u8; 256],
+    channels: &[u8; 64],
+    v1: bool,
+    level: u8,
+) {
+    let n = rows.len() / stride;
+    let padded = n.next_multiple_of(GROUP);
+    let control = out.len();
+    if v1 {
+        out.resize(control + stride / 4, 0);
+    }
+    // Deltas past `n`, up to the whole group, stay zero.
+    let mut planes = [[0u8; 256]; 4];
+    for k in (0..stride).step_by(4) {
+        let channel = if v1 { channels[k / 4] } else { 0 };
+        encode_deltas(&mut planes, rows, stride, &last[k..k + 4], k, channel);
+        for (j, plane) in planes.iter().enumerate() {
+            let plane = &plane[..padded];
+            let ctrl = if v1 { estimate_control(plane, n, level) } else { 0 };
+            if v1 {
+                out[control + k / 4] |= ctrl << (j * 2);
+            }
+            match ctrl {
+                // Literal bytes, unpadded.
+                3 => out.extend_from_slice(&plane[..n]),
+                // All zero: nothing to write.
+                2 => {}
+                c => encode_bytes(out, plane, if v1 { BITS_V1[usize::from(c)] } else { BITS_V0 }),
+            }
+        }
+    }
+    last[..stride].copy_from_slice(&rows[rows.len() - stride..]);
+}
+
+/// The deltas of channel `k..k + 4` of `rows` against `prev` and then each previous element, one
+/// byte plane per byte, in `channel`'s mode: zigzag bytes, zigzag 16-bit halves (little endian),
+/// or a 32-bit XOR rotated left by `channel >> 4`.
+fn encode_deltas(planes: &mut [[u8; 256]; 4], rows: &[u8], stride: usize, prev: &[u8], k: usize, channel: u8) {
+    let mut p: [u8; 4] = prev.try_into().unwrap();
+    for (i, row) in rows.chunks_exact(stride).enumerate() {
+        let v: [u8; 4] = row[k..k + 4].try_into().unwrap();
+        let d = match channel & 3 {
+            0 => [0, 1, 2, 3].map(|j| zigzag8(v[j].wrapping_sub(p[j]))),
+            1 => {
+                let half = |h: usize| {
+                    let d = u16::from_le_bytes([v[2 * h], v[2 * h + 1]])
+                        .wrapping_sub(u16::from_le_bytes([p[2 * h], p[2 * h + 1]]));
+                    (d << 1) ^ (d >> 15).wrapping_neg()
+                };
+                let [a, b] = [half(0).to_le_bytes(), half(1).to_le_bytes()];
+                [a[0], a[1], b[0], b[1]]
+            }
+            _ => (u32::from_le_bytes(v) ^ u32::from_le_bytes(p))
+                .rotate_left(u32::from(channel >> 4))
+                .to_le_bytes(),
+        };
+        for (plane, d) in planes.iter_mut().zip(d) {
+            plane[i] = d;
+        }
+        p = v;
+    }
+}
+
+/// Bytes one group of 16 takes packed `bits` wide (0, 1, 2, 4 or 8), out-of-range values
+/// included; `usize::MAX` when 0 bits can't hold it.
+fn group_size(d: &[u8], bits: u8) -> usize {
+    match bits {
+        0 if d.iter().all(|&x| x == 0) => 0,
+        0 => usize::MAX,
+        8 => GROUP,
+        b => {
+            let sentinel = (1u8 << b) - 1;
+            GROUP * usize::from(b) / 8 + d.iter().filter(|&&x| x >= sentinel).count()
+        }
+    }
+}
+
+/// One byte plane (`deltas`, whole groups): 2 header bits per group, then each group in the
+/// smallest of the 4 widths `bits` offers. Ties go to the previous group's width, unless the
+/// smallest so far is the 8-bit literal, then to the widest.
+fn encode_bytes(out: &mut Vec<u8>, deltas: &[u8], bits: [u8; 4]) {
     let header = out.len();
     out.resize(header + (deltas.len() / GROUP).div_ceil(4), 0);
+    let mut last_bits = None;
     for (g, d) in deltas.chunks_exact(GROUP).enumerate() {
-        let size = |bits: usize| match bits {
-            0 if d.iter().all(|&x| x == 0) => 0,
-            0 => usize::MAX,
-            8 => GROUP,
-            b => {
-                let sentinel = (1u8 << b) - 1;
-                GROUP * b / 8 + d.iter().filter(|&&x| x >= sentinel).count()
+        let mut best = 3;
+        let mut best_size = group_size(d, bits[3]);
+        for k in 0..3 {
+            let size = group_size(d, bits[k]);
+            if size < best_size || (size == best_size && last_bits == Some(bits[k]) && bits[best] != 8) {
+                best = k;
+                best_size = size;
             }
-        };
-        let (mode, bits) = [(0u8, 0usize), (1, 2), (2, 4), (3, 8)]
-            .into_iter()
-            .min_by_key(|&(_, b)| size(b))
-            .unwrap();
-        out[header + g / 4] |= mode << ((g % 4) * 2);
-        match bits {
+        }
+        out[header + g / 4] |= (best as u8) << ((g % 4) * 2);
+        last_bits = Some(bits[best]);
+        match bits[best] {
             0 => {}
             8 => out.extend_from_slice(d),
             b => {
                 let sentinel = (1u8 << b) - 1;
-                let per = 8 / b;
-                for chunk in d.chunks_exact(per) {
+                for chunk in d.chunks_exact(usize::from(8 / b)) {
                     let mut byte = 0u8;
                     for &x in chunk {
                         byte = (byte << b) | x.min(sentinel);
                     }
-                    out.push(byte);
+                    // 1-bit groups hold their first element in the lowest bit.
+                    out.push(if b == 1 { byte.reverse_bits() } else { byte });
                 }
                 out.extend(d.iter().filter(|&&x| x >= sentinel));
             }
         }
     }
+}
+
+/// A version 1 byte plane's control mode (`plane` padded to whole groups, `n` elements): 2 when
+/// all zero, 3 (literal) when neither packed mode beats `n` bytes, else 0 or 1, whichever packs
+/// smaller by estimate. Level 0 skips the estimate and takes 1.
+fn estimate_control(plane: &[u8], n: usize, level: u8) -> u8 {
+    if plane.iter().all(|&x| x == 0) {
+        return 2;
+    }
+    if level == 0 {
+        return 1;
+    }
+    let header = (plane.len() / GROUP).div_ceil(4);
+    let (mut est0, mut est1) = (header, header);
+    for d in plane.chunks_exact(GROUP) {
+        let size124 = group_size(d, 1).min(group_size(d, 2)).min(group_size(d, 4));
+        est0 += size124.min(group_size(d, 0));
+        est1 += size124.min(group_size(d, 8));
+    }
+    if est0 < n || est1 < n {
+        u8::from(est0 >= est1)
+    } else {
+        3
+    }
+}
+
+/// Packed bits a byte of XOR deltas costs, by estimate.
+fn estimate_bits(v: u8) -> usize {
+    match v {
+        0 => 0,
+        1..=3 => 2,
+        4..=15 => 4,
+        _ => 8,
+    }
+}
+
+/// The left rotation (0 to 7) that packs channel `k..k + 4`'s XOR deltas smallest by estimate,
+/// judged on the bits that change within each group of 16 elements.
+fn estimate_rotate(data: &[u8], stride: usize, k: usize) -> u8 {
+    let word = |row: &[u8]| u32::from_le_bytes(row[k..k + 4].try_into().unwrap());
+    let mut last = word(data);
+    let mut sizes = [0usize; 8];
+    for group in data.chunks(stride * GROUP) {
+        let mut changed = 0;
+        for row in group.chunks_exact(stride) {
+            let v = word(row);
+            changed |= v ^ last;
+            last = v;
+        }
+        for (rot, size) in (0u32..).zip(&mut sizes) {
+            *size += changed
+                .rotate_left(rot)
+                .to_le_bytes()
+                .map(estimate_bits)
+                .iter()
+                .sum::<usize>();
+        }
+    }
+    let mut best = 0;
+    for (rot, &size) in sizes.iter().enumerate().skip(1) {
+        if size < sizes[best] {
+            best = rot;
+        }
+    }
+    best as u8
+}
+
+/// The delta mode for channel `k..k + 4`, of the first `max_channel` (bytes, 16-bit halves, XOR
+/// rotated by `rot`), that packs every third block of `block` elements smallest by estimate.
+fn estimate_channel(data: &[u8], stride: usize, k: usize, block: usize, max_channel: u8, rot: u8) -> u8 {
+    let count = data.len() / stride;
+    let mut planes = [[0u8; 256]; 4];
+    let mut sizes = [0usize; 3];
+    for start in (0..count).step_by(block * 3) {
+        let n = block.min(count - start);
+        let padded = n.next_multiple_of(GROUP);
+        let prev = &data[start.saturating_sub(1) * stride + k..][..4];
+        for plane in &mut planes {
+            plane[n..padded].fill(0);
+        }
+        let rows = &data[start * stride..(start + n) * stride];
+        for (channel, size) in (0..max_channel).zip(&mut sizes) {
+            encode_deltas(&mut planes, rows, stride, prev, k, channel | rot << 4);
+            for plane in &planes {
+                for d in plane[..padded].chunks_exact(GROUP) {
+                    *size += [1, 2, 4, 8].map(|b| group_size(d, b)).into_iter().min().unwrap();
+                }
+            }
+        }
+    }
+    let mut best = 0;
+    for channel in 1..usize::from(max_channel) {
+        if sizes[channel] < sizes[best] {
+            best = channel;
+        }
+    }
+    if best == 2 { 2 | rot << 4 } else { best as u8 }
 }
 
 /// Group bit widths per header value: version 0, then version 1 under control modes 0 and 1.
@@ -615,20 +847,24 @@ pub fn decode_index_sequence(src: &[u8], count: usize) -> Result<Vec<u32>> {
         .collect()
 }
 
-/// Mode 2 (`INDICES`): any index sequence (strips, lines, points, sparse accessor indices).
-/// Fails only when an index lies more than 2^30 from both of the two running baselines.
+/// Mode 2 (`INDICES`): any index sequence (strips, lines, points, sparse accessor indices),
+/// byte for byte meshoptimizer's `meshopt_encodeIndexSequence`. Each index is a delta from one
+/// of two baselines (the previous index coded against each), switching baselines whenever the
+/// delta from the current one reaches 30.
 ///
 /// # Errors
 ///
-/// When an index is out of reach of both baselines.
+/// When a delta reaches 2^30 either way, which the format can't hold.
 pub fn encode_index_sequence(indices: &[u32]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(indices.len() + 5);
     out.push(0xd1);
     let mut last = [0u32; 2];
+    let mut base = 0;
     for &i in indices {
-        let d = [0, 1].map(|b| i.wrapping_sub(last[b]) as i32);
-        let base = usize::from(d[1].unsigned_abs() < d[0].unsigned_abs());
-        let d = d[base];
+        if (i.wrapping_sub(last[base]) as i32).unsigned_abs() >= 30 {
+            base ^= 1;
+        }
+        let d = i.wrapping_sub(last[base]) as i32;
         if !(-(1 << 30)..1 << 30).contains(&d) {
             return Err(bad("index sequence delta out of range"));
         }
@@ -640,23 +876,234 @@ pub fn encode_index_sequence(indices: &[u32]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Bits an index below `vertex_count` takes, at least 1: the index bounds' measure.
+fn index_bits(vertex_count: usize) -> usize {
+    let mut bits = 1;
+    while bits < 32 && vertex_count > 1 << bits {
+        bits += 1;
+    }
+    bits
+}
+
+/// The most bytes [`encode_index_buffer`] writes for `index_count` indices (whole triangles)
+/// below `vertex_count`: meshoptimizer's `meshopt_encodeIndexBufferBound`.
+///
+/// # Panics
+///
+/// When `index_count` isn't a multiple of 3.
+#[must_use]
+pub fn encode_index_buffer_bound(index_count: usize, vertex_count: usize) -> usize {
+    assert!(index_count.is_multiple_of(3), "index count isn't whole triangles");
+    // At worst 2 code bytes and 3 varint indices per triangle.
+    1 + index_count / 3 * (2 + 3 * (index_bits(vertex_count) + 1).div_ceil(7)) + 16
+}
+
+/// The most bytes [`encode_index_sequence`] writes for `index_count` indices below
+/// `vertex_count`: meshoptimizer's `meshopt_encodeIndexSequenceBound`.
+#[must_use]
+pub fn encode_index_sequence_bound(index_count: usize, vertex_count: usize) -> usize {
+    // At worst one varint per index: the zigzag delta and the baseline bit.
+    1 + index_count * (index_bits(vertex_count) + 2).div_ceil(7) + 4
+}
+
+/// `v` in -1 to 1 as a `bits`-wide signed normalized integer, rounded half away from zero:
+/// meshoptimizer's `meshopt_quantizeSnorm`.
 fn snorm(v: f32, bits: u32) -> i32 {
     let scale = ((1 << (bits - 1)) - 1) as f32;
-    let v = v.clamp(-1.0, 1.0);
-    (v * scale + if v >= 0.0 { 0.5 } else { -0.5 }) as i32
+    let round = if v >= 0.0 { 0.5 } else { -0.5 };
+    let v = if v >= -1.0 { v } else { -1.0 };
+    let v = if v <= 1.0 { v } else { 1.0 };
+    (v * scale + round) as i32
+}
+
+/// `v` in 0 to 1 as a `bits`-wide unsigned normalized integer, rounded half up:
+/// meshoptimizer's `meshopt_quantizeUnorm`.
+fn unorm(v: f32, bits: u32) -> i32 {
+    let scale = ((1 << bits) - 1) as f32;
+    let v = if v >= 0.0 { v } else { 0.0 };
+    let v = if v <= 1.0 { v } else { 1.0 };
+    (v * scale + 0.5) as i32
+}
+
+/// Four integer components as a filter element of `stride` bytes: bytes when 4, little-endian
+/// 16-bit values when 8.
+fn push_components(out: &mut Vec<u8>, c: [i32; 4], stride: usize) {
+    for v in c {
+        if stride == 4 {
+            out.push(v as u8);
+        } else {
+            out.extend_from_slice(&(v as u16).to_le_bytes());
+        }
+    }
 }
 
 /// The octahedral filter's 8-bit input for unit vector `n` and fourth component `w`
-/// (passed through; ±1 for a tangent's handedness).
+/// (passed through; ±1 for a tangent's handedness). The same bytes as
+/// [`encode_filter_oct`] at stride 4, 8 bits.
 #[must_use]
 pub fn encode_oct8(n: [f32; 3], w: f32) -> [u8; 4] {
-    let l = n[0].abs() + n[1].abs() + n[2].abs();
-    let s = if l == 0.0 { 0.0 } else { 1.0 / l };
-    let (x, y, z) = (n[0] * s, n[1] * s, n[2] * s);
-    let sign = |v: f32| if v >= 0.0 { 1.0 } else { -1.0 };
-    let u = if z >= 0.0 { x } else { (1.0 - y.abs()) * sign(x) };
-    let v = if z >= 0.0 { y } else { (1.0 - x.abs()) * sign(y) };
-    [snorm(u, 8), snorm(v, 8), snorm(1.0, 8), snorm(w, 8)].map(|c| c as i8 as u8)
+    let e = encode_filter_oct(&[[n[0], n[1], n[2], w]], 4, 8);
+    [e[0], e[1], e[2], e[3]]
+}
+
+/// The `OCTAHEDRAL` filter's input for unit vectors `data` (x, y, z and a fourth component
+/// passed through, ±1 for a tangent's handedness), byte for byte meshoptimizer's
+/// `meshopt_encodeFilterOct`: elements of `stride` bytes (4: signed bytes, 8: signed 16-bit),
+/// the octahedral coordinates `bits` wide. Vectors needn't be unit length; a zero vector
+/// encodes as +Z.
+///
+/// # Panics
+///
+/// When `stride` isn't 4 or 8, or `bits` isn't from 2 to 8 (stride 4) or 16 (stride 8).
+#[must_use]
+pub fn encode_filter_oct(data: &[[f32; 4]], stride: usize, bits: u32) -> Vec<u8> {
+    assert!(stride == 4 || stride == 8, "octahedral filter stride");
+    assert!(
+        (2..=16).contains(&bits) && (stride == 8 || bits <= 8),
+        "octahedral filter bits"
+    );
+    let mut out = Vec::with_capacity(data.len() * stride);
+    for &[x, y, z, w] in data {
+        let l = x.abs() + y.abs() + z.abs();
+        let s = if l == 0.0 { 0.0 } else { 1.0 / l };
+        let (x, y) = (x * s, y * s);
+        let sign = |v: f32| if v >= 0.0 { 1.0 } else { -1.0 };
+        let u = if z >= 0.0 { x } else { (1.0 - y.abs()) * sign(x) };
+        let v = if z >= 0.0 { y } else { (1.0 - x.abs()) * sign(y) };
+        let c = [
+            snorm(u, bits),
+            snorm(v, bits),
+            snorm(1.0, bits),
+            snorm(w, stride as u32 * 2),
+        ];
+        push_components(&mut out, c, stride);
+    }
+    out
+}
+
+/// The `QUATERNION` filter's input for unit quaternions `data` (x, y, z, w), byte for byte
+/// meshoptimizer's `meshopt_encodeFilterQuat`: elements of 8 bytes, the three smallest
+/// components `bits` wide and the largest one's index in the fourth. A quaternion and its
+/// negation encode alike.
+///
+/// # Panics
+///
+/// When `bits` isn't from 4 to 16.
+#[must_use]
+pub fn encode_filter_quat(data: &[[f32; 4]], bits: u32) -> Vec<u8> {
+    assert!((4..=16).contains(&bits), "quaternion filter bits");
+    let mut out = Vec::with_capacity(data.len() * 8);
+    for q in data {
+        let mut qc = 0;
+        for i in 1..4 {
+            if q[i].abs() > q[qc].abs() {
+                qc = i;
+            }
+        }
+        // Double cover: flip so the largest component is positive.
+        let scale = std::f32::consts::SQRT_2 * if q[qc] < 0.0 { -1.0 } else { 1.0 };
+        let c = |i: usize| snorm(q[(qc + i) & 3] * scale, bits);
+        push_components(&mut out, [c(1), c(2), c(3), (snorm(1.0, bits) & !3) | qc as i32], 8);
+    }
+    out
+}
+
+/// How [`encode_filter_exp`] picks exponents, meshoptimizer's `meshopt_EncodeExpMode`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpMode {
+    /// Each component its own exponent, so the most precision per value. A zero keeps the
+    /// exponent the same component had in the element before, which compresses better.
+    Separate,
+    /// One exponent per element (the largest its components need), so every component of an
+    /// element shares the same absolute error.
+    SharedVector,
+    /// One exponent per component position across all elements (the largest any needs), so the
+    /// stream compresses best.
+    SharedComponent,
+    /// Like `Separate`, but no exponent below 0, so values under 1 lose precision to an
+    /// absolute error of 2^-(bits-1): for values whose small magnitudes needn't be exact.
+    Clamped,
+}
+
+/// The `EXPONENTIAL` filter's input for floats `data` (elements of `stride` bytes, `stride / 4`
+/// components each), byte for byte meshoptimizer's `meshopt_encodeFilterExp`: each component a
+/// little-endian 32-bit value holding an 8-bit exponent and a 24-bit signed mantissa, `bits` of
+/// which carry precision, the exponents picked per `mode`.
+///
+/// # Panics
+///
+/// When `stride` isn't a multiple of 4 from 4 to 256, `data` isn't whole elements, or `bits`
+/// isn't from 1 to 24.
+#[must_use]
+pub fn encode_filter_exp(data: &[f32], stride: usize, bits: u32, mode: ExpMode) -> Vec<u8> {
+    /// The lowest exponent picked: smaller magnitudes round to zero.
+    const MIN_EXP: i32 = -100;
+    assert!(
+        stride > 0 && stride <= 256 && stride.is_multiple_of(4),
+        "exponential filter stride"
+    );
+    assert!((1..=24).contains(&bits), "exponential filter bits");
+    let width = stride / 4;
+    assert!(
+        data.len().is_multiple_of(width),
+        "exponential filter data isn't whole elements"
+    );
+    // The exponent that puts `v` in [0.5, 1); zeros and subnormals land low and get clamped.
+    let log2 = |v: f32| ((v.to_bits() >> 23) & 0xff) as i32 - 126;
+    let exp2 = |e: i32| f32::from_bits(((e + 127) as u32) << 23);
+    let mut component = [if mode == ExpMode::Separate { 0 } else { MIN_EXP }; 64];
+    if mode == ExpMode::SharedComponent {
+        for v in data.chunks_exact(width) {
+            for (c, &x) in component.iter_mut().zip(v) {
+                *c = (*c).max(log2(x));
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(data.len() * 4);
+    for v in data.chunks_exact(width) {
+        let shared = v.iter().fold(MIN_EXP, |e, &x| e.max(log2(x)));
+        for (c, &x) in component.iter_mut().zip(v) {
+            match mode {
+                ExpMode::Separate if x != 0.0 => *c = log2(x).max(MIN_EXP),
+                ExpMode::Clamped => *c = log2(x).max(0),
+                _ => {}
+            }
+            let e = if mode == ExpMode::SharedVector { shared } else { *c } - (bits as i32 - 1);
+            let m = ((x * exp2(-e) + if x >= 0.0 { 0.5 } else { -0.5 }) as i32).min(0x7f_ffff);
+            out.extend_from_slice(&((m as u32 & 0xff_ffff) | (e as u32) << 24).to_le_bytes());
+        }
+    }
+    out
+}
+
+/// The `COLOR` filter's input (`KHR_meshopt_compression` only) for RGBA colors `data` in 0 to 1,
+/// byte for byte meshoptimizer's `meshopt_encodeFilterColor`: elements of `stride` bytes (4:
+/// bytes, 8: little-endian 16-bit), each color quantized to `bits` per channel and stored as
+/// `YCoCg` with Co and Cg truncated (so it decodes with integers, each RGB channel within one
+/// quantization step) and alpha `bits - 1` wide with the top bit marking the width. That costs
+/// up to a step and a half of `bits` per channel, but compresses better than RGBA.
+///
+/// # Panics
+///
+/// When `stride` isn't 4 or 8, or `bits` isn't from 2 to 8 (stride 4) or 16 (stride 8).
+#[must_use]
+pub fn encode_filter_color(data: &[[f32; 4]], stride: usize, bits: u32) -> Vec<u8> {
+    assert!(stride == 4 || stride == 8, "color filter stride");
+    assert!(
+        (2..=16).contains(&bits) && (stride == 8 || bits <= 8),
+        "color filter bits"
+    );
+    let mut out = Vec::with_capacity(data.len() * stride);
+    for &[r, g, b, a] in data {
+        let [r, g, b] = [r, g, b].map(|v| unorm(v, bits));
+        // YCoCg with Co and Cg truncated (not the lossless YCoCg-R), so the decoder needs only integers.
+        let co = (r - b) / 2;
+        let t = b + co;
+        let cg = (g - t) / 2;
+        let alpha = (unorm(a, bits) >> 1) | (1 << (bits - 1));
+        push_components(&mut out, [t + cg, co, cg, alpha], stride);
+    }
+    out
 }
 
 /// Applies the named filter to decoded attribute data in place.
@@ -775,6 +1222,7 @@ mod tests {
         (len > 0.0).then(|| v.map(|c| c / len))
     }
     use crate::test_rng::Pcg32;
+    use std::f32::consts::FRAC_1_SQRT_2;
 
     #[test]
     fn attributes_roundtrip() {
@@ -904,6 +1352,12 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x62,
         ];
         let want = pv_bytes();
+        // meshoptimizer's encoder wrote these two: version 0 (any level) and version 1 at level 3.
+        for level in 0..=3 {
+            assert_eq!(encode_vertex_buffer_level(&want, 12, level, 0), v0, "v0 level {level}");
+        }
+        assert_eq!(encode_vertex_buffer(&want, 12), v0);
+        assert_eq!(encode_vertex_buffer_level(&want, 12, 3, 1), v1);
         for (name, src) in [("v0", v0), ("v1", v1), ("v1 custom", v1_custom)] {
             assert_eq!(decode_vertex_buffer(src, 4, 12).unwrap(), want, "{name}");
             // One byte more or less is a malformed stream.
@@ -933,6 +1387,9 @@ mod tests {
             0x00, 0xf0, 0x00, 0x01, 0x01,
         ];
         let got = decode_vertex_buffer(src, 16, 8).unwrap();
+        // meshoptimizer's level 2 encoding, which level 3 matches.
+        assert_eq!(encode_vertex_buffer_level(&got, 8, 2, 1), src);
+        assert_eq!(encode_vertex_buffer_level(&got, 8, 3, 1), src);
         let got: Vec<u16> = got.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         assert_eq!(got, want);
     }
@@ -974,6 +1431,7 @@ mod tests {
         ];
         let seq = [0, 1, 51, 2, 49, 1000];
         assert_eq!(decode_index_sequence(&reference, 6).unwrap(), seq);
+        assert_eq!(encode_index_sequence(&seq).unwrap(), reference);
         let mut r = Pcg32::new(5);
         let wild: Vec<u32> = (0..500).map(|_| r.next_u32() >> 2).collect();
         let strip: Vec<u32> = (0..300).collect();
@@ -996,6 +1454,365 @@ mod tests {
             let dot: f32 = (0..3).map(|i| d[i] * n[i]).sum();
             assert!(dot > 0.999, "{n:?} -> {d:?}");
             assert_eq!(e[3] as i8, -127);
+        }
+    }
+
+    /// Streams from meshoptimizer's encoder (its JavaScript package's tests) re-encode byte for
+    /// byte from their decoded data, at the levels it used.
+    #[test]
+    fn encoder_reproduces_reference_streams() {
+        let more: &[u8] = &[
+            0xa0, 0x00, 0x01, 0x2a, 0xaa, 0xaa, 0xaa, 0x02, 0x04, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x03, 0x00,
+            0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mode2: &[u8] = &[
+            0xa0, 0x02, 0x08, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x02, 0x0a, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+            0xaa, 0x02, 0x0c, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0x02, 0x0e, 0xee, 0xee, 0xee, 0xee, 0xee, 0xee,
+            0xee, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        // Version 1 at level 3 with 32-bit XOR channels, rotated.
+        let xor: &[u8] = &[
+            0xa1, 0xab, 0xab, 0xfa, 0xff, 0x00, 0x02, 0x02, 0x02, 0x00, 0xa5, 0xc2, 0x3a, 0x00, 0xab, 0xf9, 0x57, 0x00,
+            0x95, 0x42, 0x85, 0x00, 0xdd, 0xca, 0x6d, 0x00, 0xac, 0x1a, 0x50, 0x00, 0x5c, 0x99, 0xfe, 0x00, 0x4d, 0x0c,
+            0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00, 0x00, 0x80, 0x07, 0x0c, 0x22,
+            0x26, 0x3b, 0x86, 0x00, 0x00, 0x12, 0x00,
+        ];
+        let xor_data: [u32; 16] = [
+            0,
+            112,
+            201_818_112,
+            2_252_023_330,
+            1,
+            29,
+            1_188_167_680,
+            1_600_748_723,
+            2,
+            126,
+            1_739_489_280,
+            1_696_368_920,
+            3,
+            155,
+            621_084_672,
+            1_218_163_169,
+        ];
+        let xor_bytes: Vec<u8> = xor_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(decode_vertex_buffer(xor, 4, 16).unwrap(), xor_bytes);
+        assert_eq!(encode_vertex_buffer_level(&xor_bytes, 16, 3, 1), xor);
+        for (name, src) in [("more", more), ("mode2", mode2)] {
+            let data = decode_vertex_buffer(src, 16, 4).unwrap();
+            assert_eq!(encode_vertex_buffer(&data, 4), src, "{name}");
+        }
+        // meshoptimizer's triangle encodings (`kIndexDataV1` and the package's `More` case).
+        let tricky = [0, 1, 2, 2, 1, 3, 0, 1, 2, 2, 1, 5, 2, 1, 4];
+        let tricky_enc: &[u8] = &[
+            0xe1, 0xf0, 0x10, 0xfe, 0x1f, 0x3d, 0x00, 0x0a, 0x00, 0x76, 0x87, 0x56, 0x67, 0x78, 0xa9, 0x86, 0x65, 0x89,
+            0x68, 0x98, 0x01, 0x69, 0x00, 0x00,
+        ];
+        assert_eq!(encode_index_buffer(&tricky), tricky_enc);
+        let more_ib = [0, 1, 2, 2, 1, 3, 4, 6, 5, 7, 8, 9];
+        let more_ib_enc: &[u8] = &[
+            0xe1, 0xf0, 0x10, 0xfe, 0xff, 0xf0, 0x0c, 0xff, 0x02, 0x02, 0x02, 0x00, 0x76, 0x87, 0x56, 0x67, 0x78, 0xa9,
+            0x86, 0x65, 0x89, 0x68, 0x98, 0x01, 0x69, 0x00, 0x00,
+        ];
+        assert_eq!(encode_index_buffer(&more_ib), more_ib_enc);
+    }
+
+    /// Attribute data of assorted shapes, every level and version: decodes back exactly and fits
+    /// the bound.
+    #[test]
+    fn attribute_levels_roundtrip() {
+        let mut r = Pcg32::new(11);
+        for stride in [4, 8, 12, 16, 20, 32, 64, 68, 128, 252, 256] {
+            for kind in 0..6 {
+                for _ in 0..2 {
+                    let count = [0, 1, 2, 15, 16, 17, 100, 257, 600][r.below(9) as usize].min(40_000 / stride);
+                    let mut data = vec![0u8; count * stride];
+                    let constant: Vec<u8> = (0..stride).map(|_| r.below(256) as u8).collect();
+                    for (w, c) in data.chunks_exact_mut(4).enumerate() {
+                        let v: u32 = match kind {
+                            // Random bytes.
+                            0 => r.next_u32(),
+                            // Smooth floats with noise.
+                            1 => ((w as f32 * 0.01).sin() * 10.0 + r.f32() * 1e-3).to_bits(),
+                            // Mostly zero.
+                            2 => u32::from(r.below(13) == 0) * r.next_u32(),
+                            // The same element over and over.
+                            3 => u32::from_le_bytes(constant[w * 4 % stride..][..4].try_into().unwrap()),
+                            // Small increments.
+                            4 => w as u32 * 3 + r.below(4),
+                            // A few bits set high up.
+                            _ => r.below(16) << r.below(29),
+                        };
+                        c.copy_from_slice(&v.to_le_bytes());
+                    }
+                    let bound = encode_vertex_buffer_bound(count, stride);
+                    for version in 0..=1 {
+                        for level in 0..=3 {
+                            let enc = encode_vertex_buffer_level(&data, stride, level, version);
+                            assert_eq!(enc[0], 0xa0 | version);
+                            assert!(enc.len() <= bound, "{count}x{stride} kind {kind} v{version} l{level}");
+                            assert_eq!(
+                                decode_vertex_buffer(&enc, count, stride).unwrap(),
+                                data,
+                                "{count}x{stride} kind {kind} v{version} l{level}"
+                            );
+                        }
+                        assert_eq!(
+                            encode_vertex_buffer_level(&data, stride, 9, version),
+                            encode_vertex_buffer_level(&data, stride, 3, version)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn index_bounds_hold() {
+        let mut r = Pcg32::new(4);
+        for vertex_count in [1usize, 2, 3, 100, 128, 129, 70_000, 1 << 24, 1 << 31] {
+            for _ in 0..20 {
+                let n = r.below(200) as usize * 3;
+                let idx: Vec<u32> = (0..n).map(|_| r.below(vertex_count as u32)).collect();
+                let enc = encode_index_buffer(&idx);
+                assert!(
+                    enc.len() <= encode_index_buffer_bound(n, vertex_count),
+                    "{vertex_count}"
+                );
+                if let Ok(enc) = encode_index_sequence(&idx) {
+                    assert!(
+                        enc.len() <= encode_index_sequence_bound(n, vertex_count),
+                        "{vertex_count}"
+                    );
+                }
+            }
+        }
+        assert_eq!(encode_index_buffer_bound(0, 0), 17);
+        assert_eq!(encode_index_sequence_bound(0, 0), 5);
+        // 2 bits (3 with the edge bit) fit one varint byte; 2 code bytes per triangle.
+        assert_eq!(encode_index_buffer_bound(3, 4), 1 + 5 + 16);
+        assert_eq!(encode_vertex_buffer_bound(0, 4), 33);
+    }
+
+    /// Floats as little-endian 32-bit words.
+    fn words(b: &[u8]) -> Vec<u32> {
+        b.chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    /// Little-endian 16-bit values.
+    fn halves(b: &[u8]) -> Vec<u16> {
+        b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+    }
+
+    /// meshoptimizer's filter encoder vectors (`demo/tests.cpp`).
+    #[test]
+    fn reference_filter_encodings() {
+        let oct = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0, 0.0],
+            [FRAC_1_SQRT_2, 0.0, 0.707_168, 1.0],
+            [-FRAC_1_SQRT_2, 0.0, -0.707_168, 1.0],
+        ];
+        assert_eq!(
+            encode_filter_oct(&oct, 4, 8),
+            [
+                0x7f, 0, 0x7f, 0, 0, 0x81, 0x7f, 0, 0x3f, 0, 0x7f, 0x7f, 0x81, 0x40, 0x7f, 0x7f
+            ]
+        );
+        assert_eq!(
+            halves(&encode_filter_oct(&oct, 8, 12)),
+            [
+                0x7ff, 0, 0x7ff, 0, 0, 0xf801, 0x7ff, 0, 0x3ff, 0, 0x7ff, 0x7fff, 0xf801, 0x400, 0x7ff, 0x7fff
+            ]
+        );
+        let quat = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0, 0.0],
+            [FRAC_1_SQRT_2, 0.0, 0.0, 0.707_168],
+            [-FRAC_1_SQRT_2, 0.0, 0.0, -0.707_168],
+        ];
+        assert_eq!(
+            halves(&encode_filter_quat(&quat, 12)),
+            [0, 0, 0, 0x7fc, 0, 0, 0, 0x7fd, 0x7ff, 0, 0, 0x7ff, 0x7ff, 0, 0, 0x7ff]
+        );
+        let exp = [1.0, -23.4, -0.1, 11.0];
+        for (mode, want) in [
+            (ExpMode::Separate, [0xf300_2000, 0xf7ff_d133, 0xefff_cccd, 0xf600_2c00]),
+            (
+                ExpMode::SharedVector,
+                [0xf700_0200, 0xf7ff_d133, 0xf6ff_ff9a, 0xf600_2c00],
+            ),
+            (
+                ExpMode::SharedComponent,
+                [0xf300_2000, 0xf7ff_d133, 0xf3ff_fccd, 0xf700_1600],
+            ),
+            (ExpMode::Clamped, [0xf300_2000, 0xf7ff_d133, 0xf2ff_f99a, 0xf600_2c00]),
+        ] {
+            let mut enc = encode_filter_exp(&exp, 8, 15, mode);
+            assert_eq!(words(&enc), want, "{mode:?}");
+            apply_filter("EXPONENTIAL", &mut enc, 8).unwrap();
+            for (d, x) in words(&enc).into_iter().map(f32::from_bits).zip(exp) {
+                assert!((d - x).abs() < 1e-3, "{mode:?}: {d} {x}");
+            }
+        }
+        let zero = [0.0, -0.0, 1.175_494_4e-38, -1.175_494_4e-38];
+        let mut enc = encode_filter_exp(&zero, 4, 15, ExpMode::Separate);
+        assert_eq!(words(&enc), [0xf200_0000, 0xf200_0000, 0x8e00_0000, 0x8e00_0000]);
+        apply_filter("EXPONENTIAL", &mut enc, 4).unwrap();
+        assert!(words(&enc).into_iter().all(|w| f32::from_bits(w) == 0.0));
+        // At 24 bits an all-ones mantissa rounds up to 2^23, which clamps.
+        let overflow = [0.999_999_94, -0.999_999_94, 255.999_98, 1.0];
+        let mut enc = encode_filter_exp(&overflow, 4, 24, ExpMode::Separate);
+        assert_eq!(words(&enc), [0xe97f_ffff, 0xe980_0000, 0xf17f_ffff, 0xea40_0000]);
+        apply_filter("EXPONENTIAL", &mut enc, 4).unwrap();
+        let got: Vec<f32> = words(&enc).into_iter().map(f32::from_bits).collect();
+        assert_eq!(got, [0.999_999_9, -1.0, 255.999_97, 1.0]);
+        let shared = [0.0, 0.1, -0.025, -0.0];
+        for (mode, want) in [
+            (
+                ExpMode::SharedVector,
+                [0xef00_0000, 0xef00_3333, 0xedff_cccd, 0xed00_0000],
+            ),
+            (
+                ExpMode::SharedComponent,
+                [0xed00_0000, 0xef00_3333, 0xedff_cccd, 0xef00_0000],
+            ),
+        ] {
+            let mut enc = encode_filter_exp(&shared, 8, 15, mode);
+            assert_eq!(words(&enc), want, "{mode:?}");
+            apply_filter("EXPONENTIAL", &mut enc, 8).unwrap();
+            let got: Vec<f32> = words(&enc).into_iter().map(f32::from_bits).collect();
+            assert!(got[0] == 0.0 && got[3] == 0.0, "{mode:?}");
+        }
+        let color = [
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 0.5],
+            [0.0, 0.0, 1.0, 0.25],
+            [0.4, 0.4, 0.4, 0.75],
+        ];
+        assert_eq!(
+            encode_filter_color(&color, 4, 8),
+            [
+                0x40, 0x7f, 0xc1, 0xff, 0x7f, 0x00, 0x7f, 0xc0, 0x40, 0x81, 0xc0, 0xa0, 0x66, 0x00, 0x00, 0xdf
+            ]
+        );
+        assert_eq!(
+            halves(&encode_filter_color(&color, 8, 12)),
+            [
+                0x0400, 0x07ff, 0xfc01, 0x0fff, 0x07ff, 0x0000, 0x07ff, 0x0c00, 0x0400, 0xf801, 0xfc00, 0x0a00, 0x0666,
+                0x0000, 0x0000, 0x0dff
+            ]
+        );
+        assert_eq!(encode_oct8([0.0, -1.0, 0.0], 0.0), [0, 0x81, 0x7f, 0]);
+    }
+
+    /// A component of a decoded filter element, as -1 to 1 (signed) or 0 to 1.
+    fn component(e: &[u8], i: usize, stride: usize, signed: bool) -> f32 {
+        match (stride, signed) {
+            (4, true) => f32::from(e[i] as i8) / 127.0,
+            (4, false) => f32::from(e[i]) / 255.0,
+            (_, true) => f32::from(i16::from_le_bytes([e[2 * i], e[2 * i + 1]])) / 32767.0,
+            (_, false) => f32::from(u16::from_le_bytes([e[2 * i], e[2 * i + 1]])) / 65535.0,
+        }
+    }
+
+    #[test]
+    fn filters_roundtrip() {
+        let mut r = Pcg32::new(21);
+        let mut unit = |n: usize| -> [f32; 4] {
+            loop {
+                let v = [0; 4].map(|_| r.f32() * 2.0 - 1.0);
+                let len = v[..n].iter().map(|c| c * c).sum::<f32>().sqrt();
+                if len > 0.1 && len <= 1.0 {
+                    return v.map(|c| c / len);
+                }
+            }
+        };
+        let vectors: Vec<[f32; 4]> = (0..500).map(|_| unit(3)).collect();
+        for (stride, bits, min_dot) in [(4, 8, 0.999), (8, 10, 0.9999), (8, 12, 0.999_99), (8, 16, 0.999_999)] {
+            let data: Vec<[f32; 4]> = vectors.iter().map(|v| [v[0], v[1], v[2], -1.0]).collect();
+            let mut enc = encode_filter_oct(&data, stride, bits);
+            apply_filter("OCTAHEDRAL", &mut enc, stride).unwrap();
+            for (e, v) in enc.chunks_exact(stride).zip(&data) {
+                let d = normalize([0, 1, 2].map(|i| component(e, i, stride, true))).unwrap();
+                let dot = (0..3).map(|i| d[i] * v[i]).sum::<f32>();
+                assert!(dot > min_dot, "oct {stride}/{bits}: {v:?} -> {d:?}");
+                // The fourth component passes through, quantized to the full width.
+                assert_eq!(component(e, 3, stride, true), -1.0);
+            }
+        }
+        let quats: Vec<[f32; 4]> = (0..500).map(|_| unit(4)).collect();
+        for (bits, min_dot) in [(8, 0.998), (12, 0.9999), (16, 0.9999)] {
+            let mut enc = encode_filter_quat(&quats, bits);
+            apply_filter("QUATERNION", &mut enc, 8).unwrap();
+            for (e, q) in enc.chunks_exact(8).zip(&quats) {
+                let d = [0, 1, 2, 3].map(|i| component(e, i, 8, true));
+                let dot = (0..4).map(|i| d[i] * q[i]).sum::<f32>().abs();
+                assert!(dot > min_dot, "quat {bits}: {q:?} -> {d:?}");
+            }
+        }
+        for mode in [
+            ExpMode::Separate,
+            ExpMode::SharedVector,
+            ExpMode::SharedComponent,
+            ExpMode::Clamped,
+        ] {
+            for (stride, bits) in [(4, 10), (12, 15), (16, 24), (8, 1)] {
+                let width = stride / 4;
+                let data: Vec<f32> = (0..width * 200)
+                    .map(|_| match r.below(8) {
+                        0 => 0.0,
+                        1 => (r.f32() - 0.5) * 1e6,
+                        2 => (r.f32() - 0.5) * 1e-4,
+                        _ => (r.f32() - 0.5) * 20.0,
+                    })
+                    .collect();
+                let mut enc = encode_filter_exp(&data, stride, bits, mode);
+                apply_filter("EXPONENTIAL", &mut enc, stride).unwrap();
+                let got: Vec<f32> = words(&enc).into_iter().map(f32::from_bits).collect();
+                // The error is half a step of the exponent the value shared, in units of the
+                // largest value sharing it.
+                let column = |k: usize| data.iter().skip(k).step_by(width).fold(0f32, |m, x| m.max(x.abs()));
+                for (i, (&d, &x)) in got.iter().zip(&data).enumerate() {
+                    let scale = match mode {
+                        ExpMode::Separate => x.abs(),
+                        ExpMode::Clamped => x.abs().max(1.0),
+                        ExpMode::SharedVector => data[i / width * width..][..width]
+                            .iter()
+                            .fold(0f32, |m, x| m.max(x.abs())),
+                        ExpMode::SharedComponent => column(i % width),
+                    };
+                    let step = scale * 2f32.powi(2 - bits as i32);
+                    assert!(
+                        (d - x).abs() <= step * 0.5 + 1e-30,
+                        "{mode:?} {stride}/{bits}: {x} -> {d}"
+                    );
+                }
+            }
+        }
+        let colors: Vec<[f32; 4]> = (0..500).map(|_| [0; 4].map(|_| r.f32())).collect();
+        for (stride, bits) in [(4, 8), (4, 5), (8, 10), (8, 12), (8, 16)] {
+            let mut enc = encode_filter_color(&colors, stride, bits);
+            apply_filter("COLOR", &mut enc, stride).unwrap();
+            let step = 1.0 / ((1u32 << bits) - 1) as f32;
+            let output = if stride == 4 { 0.5 / 255.0 } else { 0.5 / 65535.0 };
+            for (e, c) in enc.chunks_exact(stride).zip(&colors) {
+                for i in 0..4 {
+                    // Half a step rounding, a step truncated in YCoCg or alpha's dropped bit, and
+                    // rounding to the output width.
+                    let tolerance = 1.5 * step + output + 1e-6;
+                    let d = component(e, i, stride, false);
+                    assert!(
+                        (d - c[i]).abs() <= tolerance,
+                        "color {stride}/{bits}: {c:?} channel {i} -> {d}"
+                    );
+                }
+            }
         }
     }
 }
