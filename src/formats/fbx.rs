@@ -606,6 +606,34 @@ impl Curve {
         self.values[i - 1] + (self.values[i] - self.values[i - 1]) * f
     }
 
+    /// Euler angles in degrees turned the short way where a curve crosses ±180° between two keys. Exporters
+    /// bake an angle going past 180 as its other side (179 then -179), which read literally is a whole
+    /// turn back in one frame, not two degrees on. A turn over 180° is only a wrap when it dwarfs the
+    /// curve's usual step: a coin keyed 0 then 360 still spins.
+    fn unwrap_degrees(&mut self) {
+        let mut steps: Vec<f64> = self
+            .values
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .filter(|d| *d > 1e-6)
+            .collect();
+        if steps.is_empty() {
+            return;
+        }
+        steps.sort_by(f64::total_cmp);
+        let usual = steps[steps.len() / 2];
+        let mut by = 0.0;
+        for i in 1..self.values.len() {
+            let raw = self.values[i] + by;
+            let d = raw - self.values[i - 1];
+            if d.abs() > 180.0 && d.abs() > usual * 4.0 {
+                let turns = (d / 360.0).round() * 360.0;
+                by -= turns;
+            }
+            self.values[i] += by;
+        }
+    }
+
     /// Times just before each key that follows a constant one, so a linear sampler steps.
     fn steps(&self, out: &mut Vec<f64>) {
         for i in 1..self.times.len() {
@@ -632,6 +660,90 @@ impl Animated {
         for c in self.curves.iter().flatten() {
             out.extend_from_slice(&c.times);
             c.steps(out);
+        }
+    }
+
+    /// Euler rotation keys turned the short way, as Maya's Euler filter turns them. Exporters bake each
+    /// frame's rotation as any of the angles that make it: an angle past 180 as its other side (179 then
+    /// -179), or a limb raised past straight up as the other set of three (two axes half a turn on, the
+    /// middle one mirrored). Read literally, either is a spin in one frame. Where a key jumps more than
+    /// a quarter turn from the one before, and far more than the curve's usual step (so a coin keyed 0 then
+    /// 360 still spins), it's given the angles making the same rotation that lie nearest the last key.
+    fn unwrap_rotation(&mut self, order: i32) {
+        let Some(times) = self.curves.iter().flatten().next().map(|c| c.times.clone()) else {
+            return;
+        };
+        let shared = self
+            .curves
+            .iter()
+            .flatten()
+            .all(|c| c.times.len() == times.len() && c.times.iter().zip(&times).all(|(a, b)| (a - b).abs() < 1e-9));
+        if !shared {
+            // The three can't be read together key by key: each turns the short way on its own.
+            self.curves.iter_mut().flatten().for_each(Curve::unwrap_degrees);
+            return;
+        }
+        let raw: Vec<[f64; 3]> = (0..times.len())
+            .map(|i| std::array::from_fn(|k| self.curves[k].as_ref().map_or(self.fixed[k], |c| c.values[i])))
+            .collect();
+        let apart = |a: &[f64; 3], b: &[f64; 3]| (0..3).map(|k| (a[k] - b[k]).abs()).fold(0.0, f64::max);
+        let mut steps: Vec<f64> = raw
+            .windows(2)
+            .map(|w| apart(&w[0], &w[1]))
+            .filter(|d| *d > 1e-6)
+            .collect();
+        if steps.is_empty() {
+            return;
+        }
+        steps.sort_by(f64::total_cmp);
+        let usual = steps[steps.len() / 2];
+        let mut out = raw.clone();
+        for i in 1..raw.len() {
+            let (prev, key) = (out[i - 1], raw[i]);
+            let jump = apart(&prev, &key);
+            if jump <= 90.0 || jump <= usual * 4.0 {
+                continue;
+            }
+            let nearest = |v: [f64; 3]| -> [f64; 3] {
+                std::array::from_fn(|k| v[k] + 360.0 * ((prev[k] - v[k]) / 360.0).round())
+            };
+            let made = rotate(key, order);
+            let mut best = nearest(key);
+            // The other set of three: whichever axis is the middle one for this order is mirrored.
+            for middle in 0..3 {
+                let other: [f64; 3] =
+                    std::array::from_fn(|k| if k == middle { 180.0 - key[k] } else { key[k] + 180.0 });
+                let m = rotate(other, order);
+                if (0..3).all(|r| (0..3).all(|c| (m[r][c] - made[r][c]).abs() < 1e-6)) {
+                    let other = nearest(other);
+                    if apart(&prev, &other) < apart(&prev, &best) {
+                        best = other;
+                    }
+                }
+            }
+            out[i] = best;
+        }
+        let constant = self
+            .curves
+            .iter()
+            .flatten()
+            .next()
+            .map(|c| c.constant.clone())
+            .unwrap_or_default();
+        for k in 0..3 {
+            let values: Vec<f64> = out.iter().map(|v| v[k]).collect();
+            match &mut self.curves[k] {
+                Some(c) => c.values = values,
+                // An axis with no curve of its own gets one when its angle had to change.
+                None if values.iter().any(|v| (v - self.fixed[k]).abs() > 1e-9) => {
+                    self.curves[k] = Some(Curve {
+                        times: times.clone(),
+                        values,
+                        constant: constant.clone(),
+                    });
+                }
+                None => {}
+            }
         }
     }
 }
@@ -1154,7 +1266,14 @@ impl Reader<'_, '_, '_> {
             for (m, node) in models {
                 let tracks = ["Lcl Translation", "Lcl Rotation", "Lcl Scaling"].map(|prop| {
                     let cn = self.objs.child_at(m, prop).find(in_stack)?;
-                    self.animated(cn, ["d|X", "d|Y", "d|Z"])
+                    let mut a = self.animated(cn, ["d|X", "d|Y", "d|Z"])?;
+                    if prop == "Lcl Rotation" {
+                        let p = self.objs.node(m).map(props).unwrap_or_default();
+                        #[allow(clippy::cast_possible_truncation, reason = "an enum value; `as` saturates bad ones")]
+                        let order = scalar(&p, "RotationOrder").map_or(0, |v| v as i32);
+                        a.unwrap_rotation(order);
+                    }
+                    Some(a)
                 });
                 if tracks.iter().any(Option::is_some) {
                     per_node.push((node, tracks));
@@ -2101,6 +2220,382 @@ Connections:  {{
             "placed by its model"
         );
         assert_eq!(mesh.materials[mesh.prims[0].material].name, "Stone");
+    }
+
+    fn curve(values: &[f64]) -> Curve {
+        #[allow(clippy::cast_precision_loss, reason = "a few keys")]
+        let times = (0..values.len()).map(|i| i as f64 / 30.0).collect();
+        Curve {
+            times,
+            values: values.to_vec(),
+            constant: vec![false; values.len()],
+        }
+    }
+
+    #[test]
+    fn a_turn_past_180_baked_as_its_other_side_goes_the_short_way() {
+        // A sway through 180 (a model turned round), written as -179 after 179, and back.
+        let mut c = curve(&[175.0, 177.0, 179.0, -179.0, -177.0, -179.0, 179.0, 177.0]);
+        c.unwrap_degrees();
+        assert_eq!(c.values, [175.0, 177.0, 179.0, 181.0, 183.0, 181.0, 179.0, 177.0]);
+        // Past 180 twice over, on a curve that steps a degree at a time.
+        let mut c = curve(&[0.0, 1.0, 2.0, 361.0, 362.0, 1.0, 0.0]);
+        c.unwrap_degrees();
+        assert_eq!(c.values, [0.0, 1.0, 2.0, 1.0, 2.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn a_limb_raised_past_straight_up_keeps_turning_the_short_way() {
+        // An arm raised from 70° through straight up to 110° about Y (XYZ order), baked past 90 as the
+        // other set of three: X and Z half a turn on, Y mirrored (Kenney's kicks are written so).
+        let keys = [
+            [10.0, 70.0, 20.0],
+            [10.0, 85.0, 20.0],
+            [-170.0, 80.0, -160.0],
+            [-170.0, 70.0, -160.0],
+        ];
+        let mut a = Animated {
+            curves: std::array::from_fn(|k| Some(curve(&keys.map(|v| v[k])))),
+            fixed: [0.0; 3],
+        };
+        a.unwrap_rotation(0);
+        let got: Vec<[f64; 3]> = (0..4)
+            .map(|i| std::array::from_fn(|k| a.curves[k].as_ref().unwrap().values[i]))
+            .collect();
+        let want = [
+            [10.0, 70.0, 20.0],
+            [10.0, 85.0, 20.0],
+            [10.0, 100.0, 20.0],
+            [10.0, 110.0, 20.0],
+        ];
+        for (g, w) in got.iter().zip(&want) {
+            assert!((0..3).all(|k| (g[k] - w[k]).abs() < 1e-9), "{got:?}");
+        }
+    }
+
+    #[test]
+    fn a_whole_turn_keyed_as_one_still_spins() {
+        // A coin keyed at 0, 360 and 720: each step is the curve's usual one.
+        let mut c = curve(&[0.0, 360.0, 720.0]);
+        c.unwrap_degrees();
+        assert_eq!(c.values, [0.0, 360.0, 720.0]);
+        let mut c = curve(&[0.0, 360.0]);
+        c.unwrap_degrees();
+        assert_eq!(c.values, [0.0, 360.0]);
+        let mut a = rotation(&[[0.0, 0.0, 0.0], [0.0, 360.0, 0.0], [0.0, 720.0, 0.0]]);
+        a.unwrap_rotation(0);
+        assert_eq!(keys(&a), [[0.0, 0.0, 0.0], [0.0, 360.0, 0.0], [0.0, 720.0, 0.0]]);
+    }
+
+    /// An animated rotation with a curve on every axis, one key per row (a thirtieth of a second apart).
+    fn rotation(rows: &[[f64; 3]]) -> Animated {
+        Animated {
+            curves: std::array::from_fn(|k| Some(curve(&rows.iter().map(|v| v[k]).collect::<Vec<_>>()))),
+            fixed: [0.0; 3],
+        }
+    }
+
+    /// The angles at each key: an axis without a curve holds its fixed value.
+    fn keys(a: &Animated) -> Vec<[f64; 3]> {
+        let n = a.curves.iter().flatten().map(|c| c.values.len()).max().unwrap_or(0);
+        (0..n)
+            .map(|i| std::array::from_fn(|k| a.curves[k].as_ref().map_or(a.fixed[k], |c| c.values[i])))
+            .collect()
+    }
+
+    fn same_rotation(a: [f64; 3], b: [f64; 3], order: i32) -> bool {
+        let (m, n) = (rotate(a, order), rotate(b, order));
+        (0..3).all(|r| (0..3).all(|c| (m[r][c] - n[r][c]).abs() < 1e-6))
+    }
+
+    fn near(got: &[[f64; 3]], want: &[[f64; 3]]) -> bool {
+        got.len() == want.len()
+            && got
+                .iter()
+                .zip(want)
+                .all(|(g, w)| (0..3).all(|k| (g[k] - w[k]).abs() < 1e-6))
+    }
+
+    /// An angle as an exporter writes it: in (-180, 180].
+    fn baked(a: f64) -> f64 {
+        let w = (a + 180.0).rem_euclid(360.0) - 180.0;
+        if w <= -180.0 { w + 360.0 } else { w }
+    }
+
+    /// The other angles making the same rotation: the order's middle axis mirrored, the others half a turn on.
+    fn flipped(v: [f64; 3], order: i32) -> [f64; 3] {
+        let middle = middle_axis(order);
+        std::array::from_fn(|k| if k == middle { 180.0 - v[k] } else { v[k] + 180.0 })
+    }
+
+    /// The axis applied second: XYZ and ZYX turn about Y in the middle, XZY and YZX about Z, YXZ and ZXY about X.
+    fn middle_axis(order: i32) -> usize {
+        match order {
+            1 | 2 => 2,
+            3 | 4 => 0,
+            _ => 1,
+        }
+    }
+
+    #[test]
+    fn a_limb_raised_past_straight_up_turns_the_short_way_in_every_rotation_order() {
+        for order in 0..=5 {
+            let middle = middle_axis(order);
+            // The middle axis swings from 60° through straight up to 120°, the others hold; past 90 the
+            // exporter writes the other set of three.
+            let truth: Vec<[f64; 3]> = [60.0, 70.0, 80.0, 95.0, 105.0, 120.0, 105.0, 85.0]
+                .iter()
+                .map(|&m| std::array::from_fn(|k| if k == middle { m } else { [10.0, -30.0, 20.0][k] }))
+                .collect();
+            let written: Vec<[f64; 3]> = truth
+                .iter()
+                .map(|v| {
+                    if v[middle] > 90.0 {
+                        flipped(*v, order).map(baked)
+                    } else {
+                        *v
+                    }
+                })
+                .collect();
+            for (t, w) in truth.iter().zip(&written) {
+                assert!(
+                    same_rotation(*t, *w, order),
+                    "order {order}: the test's flip makes the same rotation"
+                );
+            }
+            let mut a = rotation(&written);
+            a.unwrap_rotation(order);
+            assert!(near(&keys(&a), &truth), "order {order}: {:?}", keys(&a));
+        }
+    }
+
+    #[test]
+    fn a_steady_spin_baked_into_half_turns_either_side_keeps_turning_one_way() {
+        for step in [30.0, -30.0, 45.0, -7.5] {
+            let truth: Vec<[f64; 3]> = (0..40).map(|i| [0.0, 0.0, 15.0 + step * f64::from(i)]).collect();
+            let written: Vec<[f64; 3]> = truth.iter().map(|v| v.map(baked)).collect();
+            // The spin about Z alone, with no curves on X and Y.
+            let mut a = Animated {
+                curves: [
+                    None,
+                    None,
+                    Some(curve(&written.iter().map(|v| v[2]).collect::<Vec<_>>())),
+                ],
+                fixed: [0.0; 3],
+            };
+            a.unwrap_rotation(0);
+            assert!(near(&keys(&a), &truth), "{step}° a key: {:?}", keys(&a));
+            assert!(
+                a.curves[0].is_none() && a.curves[1].is_none(),
+                "axes that keep their angle get no curve"
+            );
+            // Each curve on its own turns the short way too.
+            let mut c = curve(&written.iter().map(|v| v[2]).collect::<Vec<_>>());
+            c.unwrap_degrees();
+            assert!(
+                c.values.iter().zip(&truth).all(|(g, w)| (g - w[2]).abs() < 1e-9),
+                "{step}°: {:?}",
+                c.values
+            );
+        }
+    }
+
+    #[test]
+    fn an_axis_without_a_curve_gets_one_when_a_flip_turns_it() {
+        // Y holds 80 with no curve of its own while X and Z, turning a little each frame, flip half a turn:
+        // the rotation the keys make is Y going on to 100, so Y needs keys.
+        let written = [
+            [10.0, 80.0, 20.0],
+            [12.0, 80.0, 22.0],
+            [-166.0, 80.0, -156.0],
+            [-164.0, 80.0, -154.0],
+        ];
+        let mut a = Animated {
+            curves: [
+                Some(curve(&written.map(|v| v[0]))),
+                None,
+                Some(curve(&written.map(|v| v[2]))),
+            ],
+            fixed: [0.0, 80.0, 0.0],
+        };
+        a.unwrap_rotation(0);
+        let want = [
+            [10.0, 80.0, 20.0],
+            [12.0, 80.0, 22.0],
+            [14.0, 100.0, 24.0],
+            [16.0, 100.0, 26.0],
+        ];
+        assert!(near(&keys(&a), &want), "{:?}", keys(&a));
+        let y = a.curves[1].as_ref().expect("Y has keys now");
+        assert_eq!(y.times, a.curves[0].as_ref().unwrap().times);
+    }
+
+    #[test]
+    fn a_cut_or_a_fast_spin_is_kept_as_keyed() {
+        // A cut: a degree a frame, then a jump to somewhere else entirely. The nearest angles making that
+        // rotation are the ones written.
+        let cut = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [150.0, 0.0, 0.0],
+            [151.0, 0.0, 0.0],
+        ];
+        let mut a = rotation(&cut);
+        a.unwrap_rotation(0);
+        assert_eq!(keys(&a), cut);
+        // A propeller keyed every third of a turn: every step is its usual one.
+        let spin: Vec<[f64; 3]> = (0..6).map(|i| [0.0, 120.0 * f64::from(i), 0.0]).collect();
+        let mut a = rotation(&spin);
+        a.unwrap_rotation(0);
+        assert_eq!(keys(&a), spin);
+        let mut c = curve(&spin.iter().map(|v| v[1]).collect::<Vec<_>>());
+        c.unwrap_degrees();
+        assert_eq!(c.values, spin.iter().map(|v| v[1]).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn curves_keyed_at_different_times_each_turn_the_short_way() {
+        let mut x = curve(&[30.0, 30.0]);
+        x.times = vec![0.0, 0.5];
+        let z = curve(&[150.0, 165.0, 180.0, -165.0, -150.0]);
+        let mut a = Animated {
+            curves: [Some(x), None, Some(z)],
+            fixed: [0.0; 3],
+        };
+        a.unwrap_rotation(0);
+        assert_eq!(a.curves[0].as_ref().unwrap().values, [30.0, 30.0]);
+        assert_eq!(
+            a.curves[2].as_ref().unwrap().values,
+            [150.0, 165.0, 180.0, 195.0, 210.0]
+        );
+    }
+
+    #[test]
+    fn odd_rotation_curves_are_left_alone() {
+        let cases: [&[f64]; 6] = [
+            &[42.0],
+            &[5.0, 5.0, 5.0],
+            &[0.0, f64::NAN, 10.0],
+            &[0.0, f64::INFINITY, 0.0],
+            &[f64::NEG_INFINITY, f64::INFINITY],
+            &[1e300, -1e300, 1e300],
+        ];
+        for values in cases {
+            let mut c = curve(values);
+            c.unwrap_degrees();
+            assert_eq!(format!("{:?}", c.values), format!("{values:?}"));
+            let rows: Vec<[f64; 3]> = values.iter().map(|&v| [v, 0.0, 0.0]).collect();
+            for order in [0, 3, 6, -1, 99] {
+                let mut a = rotation(&rows);
+                a.unwrap_rotation(order);
+                assert_eq!(format!("{:?}", keys(&a)), format!("{rows:?}"), "order {order}");
+            }
+        }
+        let mut none = Animated {
+            curves: [None, None, None],
+            fixed: [1.0, 2.0, 3.0],
+        };
+        none.unwrap_rotation(0);
+        assert!(none.curves.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn turning_keys_the_short_way_never_moves_a_key() {
+        // Whatever angles the filter picks, each key makes the rotation it was written as: random keys in any
+        // order, some wild, some with axes missing or keyed at other times.
+        let mut rng = crate::test_rng::Pcg32::new(11);
+        let angle = |rng: &mut crate::test_rng::Pcg32| f64::from(rng.f32()) * 1440.0 - 720.0;
+        for trial in 0..500 {
+            let order = [0, 1, 2, 3, 4, 5, 6, 42][rng.below(8) as usize];
+            let n = 1 + rng.below(24) as usize;
+            let mut a = Animated {
+                curves: [None, None, None],
+                fixed: std::array::from_fn(|_| angle(&mut rng)),
+            };
+            let mut last = [0.0; 3];
+            for k in 0..3 {
+                if rng.below(4) == 0 {
+                    continue;
+                }
+                let values = (0..n)
+                    .map(|_| {
+                        if rng.below(3) == 0 {
+                            return angle(&mut rng);
+                        }
+                        last[k] += f64::from(rng.f32()) * 20.0 - 10.0;
+                        if rng.below(5) == 0 { baked(last[k]) } else { last[k] }
+                    })
+                    .collect::<Vec<_>>();
+                let mut c = curve(&values);
+                if rng.below(6) == 0 {
+                    c.times.iter_mut().for_each(|t| *t *= 2.0);
+                }
+                a.curves[k] = Some(c);
+            }
+            let before = keys(&a);
+            let shared = a.curves.iter().flatten().all(|c| {
+                let first = a.curves.iter().flatten().next().unwrap();
+                c.times == first.times
+            });
+            a.unwrap_rotation(order);
+            let after = keys(&a);
+            if shared {
+                for (i, (b, g)) in before.iter().zip(&after).enumerate() {
+                    assert!(
+                        same_rotation(*b, *g, order),
+                        "trial {trial}, key {i}: {b:?} became {g:?}"
+                    );
+                }
+            } else {
+                for (b, g) in before.iter().flatten().zip(after.iter().flatten()) {
+                    let turns = (g - b) / 360.0;
+                    assert!((turns - turns.round()).abs() < 1e-9, "trial {trial}: {b} became {g}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_baked_turn_comes_back_as_smooth_as_it_was() {
+        // A limb wandering a few degrees a frame for four seconds, written as an exporter bakes it: each angle
+        // in (-180, 180], and now and then as the other set of three. The filter gives back a path as smooth
+        // as the one wandered, making the same rotation at every key.
+        let mut rng = crate::test_rng::Pcg32::new(3);
+        for trial in 0..200 {
+            let order = rng.below(6).cast_signed();
+            let middle = middle_axis(order);
+            let mut v: [f64; 3] = std::array::from_fn(|_| f64::from(rng.f32()) * 360.0 - 180.0);
+            v[middle] = f64::from(rng.f32()) * 120.0 - 60.0;
+            let mut truth = Vec::new();
+            for _ in 0..120 {
+                truth.push(v);
+                for a in &mut v {
+                    *a += f64::from(rng.f32()) * 8.0 - 4.0;
+                }
+                v[middle] = v[middle].clamp(-60.0, 60.0);
+            }
+            let written: Vec<[f64; 3]> = truth
+                .iter()
+                .map(|t| if rng.below(10) == 0 { flipped(*t, order) } else { *t }.map(baked))
+                .collect();
+            let mut a = rotation(&written);
+            a.unwrap_rotation(order);
+            let got = keys(&a);
+            for (i, w) in got.windows(2).enumerate() {
+                let step = (0..3).map(|k| (w[1][k] - w[0][k]).abs()).fold(0.0, f64::max);
+                assert!(
+                    step <= 4.0 + 1e-6,
+                    "trial {trial} (order {order}), key {}: {:?} to {:?}",
+                    i + 1,
+                    w[0],
+                    w[1]
+                );
+            }
+            for (t, g) in truth.iter().zip(&got) {
+                assert!(same_rotation(*t, *g, order), "trial {trial}: {t:?} became {g:?}");
+            }
+        }
     }
 }
 

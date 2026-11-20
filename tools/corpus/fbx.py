@@ -880,6 +880,90 @@ write("anim_rotate_half_turn", s, "Lcl Rotation turning 180 degrees about Z in o
                  {"animation": 0, "time": 0.5, "bounds": box((-1, 0, 0), (0, 1, 1))},
                  {"animation": 0, "time": 1, "bounds": box((-1, -1, 0), (0, 0, 1))}]})
 
+
+# Euler keys as exporters bake them. A frame's rotation is written as any of the angles that make it: an angle past
+# 180 as its other side, a limb raised past straight up as the other set of three. Importers (Blender's, Maya's Euler
+# filter) turn such keys the short way; read literally, each is a spin within one frame. The expected poses are
+# the rotations the keys were baked from, at times between keys where only one angle turns, so a quaternion
+# player follows the Euler path exactly.
+
+def turned(deg, order=0):
+    """The bounds of the 1 m cube turned by Euler angles `deg` in `order`."""
+    m = m_rotate(deg, order)
+    pts = [apply(m, (x, y, z)) for x in (0, 1) for y in (0, 1) for z in (0, 1)]
+    return box([min(p[k] for p in pts) for k in range(3)], [max(p[k] for p in pts) for k in range(3)])
+
+
+def baked(a):
+    """An angle as exporters write it: in (-180, 180]."""
+    w = (a + 180) % 360 - 180
+    return w + 360 if w <= -180 else w
+
+
+MIDDLE = {0: 1, 1: 2, 2: 2, 3: 0, 4: 0, 5: 1}  # the axis applied second in each rotation order
+
+
+def flipped(v, order):
+    """The other angles making the same rotation: the middle axis mirrored, the others half a turn on."""
+    mid = MIDDLE[order]
+    out = [180 - v[k] if k == mid else v[k] + 180 for k in range(3)]
+    a, b = m_rotate(v, order), m_rotate(out, order)
+    assert all(abs(a[i][j] - b[i][j]) < 1e-9 for i in range(3) for j in range(3)), (v, out, order)
+    return out
+
+
+def rotation_case(name, spec, curves, poses, order=0):
+    """A cube whose Lcl Rotation has `curves` ({"d|X": (times, values)}); `poses` are (time, the angles then)."""
+    s = Scene()
+    s.model(10, "Cube", **({"order": order} if order else {}))
+    s.geometry(cube_geometry(), 10)
+    anim_stack(s)
+    anim_curves(s, 10, "Lcl Rotation", 70, {c: (t, v, False) for c, (t, v) in curves.items()})
+    write(name, s, spec, {"document": {"animations": 1, "channels": 1},
+                          "poses": [{"animation": 0, "time": t, "bounds": turned(deg, order)} for t, deg in poses]})
+
+
+# A turn past 180 about Z, 15° a key, written as -165 after 180.
+turn = [150, 165, 180, 195, 210]
+rotation_case("anim_rotate_wrap", "Lcl Rotation keyed past 180 degrees as its other side (180, then -165): the short way",
+              {"d|Z": (range(5), [baked(a) for a in turn])},
+              [(2.5, (0, 0, 187.5)), (3.5, (0, 0, 202.5)), (4, (0, 0, 210))])
+
+# The same turning the other way about Y.
+turn = [-150, -165, -180, -195, -210]
+rotation_case("anim_rotate_wrap_backwards", "Lcl Rotation keyed past -180 degrees as its other side (180, then 165)",
+              {"d|Y": (range(5), [baked(a) for a in turn])},
+              [(1.5, (0, -172.5, 0)), (2.5, (0, -187.5, 0)), (3.5, (0, -202.5, 0))])
+
+# Two whole turns at 60° a key, every angle written in (-180, 180].
+rotation_case("anim_rotate_spin_baked", "Lcl Rotation spinning twice round Z, 60 degrees a key, written in (-180, 180]",
+              {"d|Z": (range(13), [baked(60 * i) for i in range(13)])},
+              [(3.5, (0, 0, 210)), (9.5, (0, 0, 570)), (12, (0, 0, 720))])
+
+# A coin keyed a whole turn at a time: each step is the usual one, so it spins.
+rotation_case("anim_rotate_whole_turns", "Lcl Rotation keyed a whole turn at a time (0, 360, 720 about Y): it spins",
+              {"d|Y": ([0, 1, 2], [0, 360, 720])},
+              [(0.5, (0, 180, 0)), (1.25, (0, 450, 0))])
+
+# Keyed past 180 on Z while X has keys at other times: each curve turns the short way on its own.
+rotation_case("anim_rotate_wrap_own_times", "Lcl Rotation past 180 degrees on Z, with X keyed at other times",
+              {"d|X": ([0, 0.5, 4], [30, 30, 30]), "d|Z": (range(5), [baked(a) for a in [150, 165, 180, 195, 210]])},
+              [(2.5, (30, 0, 187.5)), (3.5, (30, 0, 202.5))])
+
+# A limb raised from 65° through straight up to 115° about the order's middle axis, the other two holding: past 90
+# it's written as the other set of three.
+for order, label in [(0, "xyz"), (1, "xzy"), (4, "zxy")]:
+    mid = MIDDLE[order]
+    held = [10, -30, 20]
+    truth = [[m if k == mid else held[k] for k in range(3)] for m in (65, 75, 85, 95, 105, 115)]
+    written = [[baked(a) for a in (flipped(v, order) if v[mid] > 90 else v)] for v in truth]
+    at = {t: [m if k == mid else held[k] for k in range(3)] for t, m in ((2.5, 90), (3.5, 100), (5, 115))}
+    rotation_case(f"anim_rotate_flip_{label}",
+                  f"Lcl Rotation ({label.upper()} order) raised past straight up, written past 90 degrees as the other "
+                  "set of three angles: two half a turn on, the middle mirrored",
+                  {c: (range(6), [v[k] for v in written]) for k, c in enumerate(["d|X", "d|Y", "d|Z"])},
+                  sorted(at.items()), order)
+
 # An animated child under a scaled, Z-up, meter file: the root carries the axes and unit.
 s = Scene(up=(2, 1), front=(1, -1), coord=(0, 1), unit=100.0)
 s.model(9, "Base", S=(2, 2, 2))

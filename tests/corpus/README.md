@@ -35,7 +35,7 @@ cases.
 | OBJ | 52 | 43 | 9 |
 | 3DS | 43 | 43 | none |
 | 3MF | 43 | 43 | none |
-| FBX | 115 | 101 | 14 |
+| FBX | 123 | 105 | 18 |
 | USD | 134 | 114 | 20 |
 | glTF | 70 | 57 | 13 |
 | SketchUp | 28 | 7 | none |
@@ -89,7 +89,8 @@ python tools/corpus/obj.py
   Textures, plus the files Bambu and Prusa write. Also packaging variants and broken
   packages.
 - **FBX**: ASCII 6100 and 7300–7500, binary 7400–7700 (zlib-compressed arrays too). Covers
-  axis systems and units, every rotation order, pivots, offsets and geometric transforms.
+  axis systems and units, every rotation order, pivots, offsets and geometric transforms, and
+  animation, including Euler keys baked past ±180° or flipped past straight up.
   Also every normal, UV and color mapping, materials, textures (embedded, external and
   missing), and instancing.
 - **USD**: `.usda`, `.usdc`, `.usd` in either encoding, and `.usdz`. Covers up axis and
