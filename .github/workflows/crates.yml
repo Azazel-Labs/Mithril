@@ -1,6 +1,6 @@
 name: Publish to crates.io
 
-# Publishes the one polysmelt crate. Auto release dispatches this after tagging a version;
+# Publishes the one polysmelt crate. Auto release calls this after tagging a version;
 # run it by hand (Actions → Publish to crates.io → Run workflow) with an existing tag to retry.
 # The token is the CARGO_REGISTRY_TOKEN repository secret.
 on:
@@ -10,6 +10,12 @@ on:
     inputs:
       tag:
         description: "Existing version tag to publish (for example v0.1.0)"
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        description: "Version tag to publish (Auto release passes the one it made)"
         required: true
         type: string
 
